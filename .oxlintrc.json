@@ -1,0 +1,8 @@
+{
+  "rules": {
+    "no-unused-vars": "error",
+    "no-explicit-any": "error",
+    "prefer-const": "error"
+  },
+  "ignorePatterns": ["dist", "node_modules", "drizzle"]
+}

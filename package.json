@@ -1,0 +1,20 @@
+{
+  "name": "prep-lab",
+  "private": true,
+  "type": "module",
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev": "bun run --filter '*' dev",
+    "build": "bun run --filter '*' build",
+    "typecheck": "bun run --filter '*' typecheck",
+    "lint": "oxlint .",
+    "db:generate": "bun --cwd packages/db run generate",
+    "db:migrate": "bun --cwd packages/db run migrate",
+    "db:seed": "bun --cwd packages/db run seed"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "oxlint": "^1.66.0",
+    "typescript": "^5.6.0"
+  }
+}
