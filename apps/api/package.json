@@ -1,0 +1,18 @@
+{
+  "name": "@prep-lab/api",
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot run src/index.ts",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@prep-lab/contracts": "workspace:*",
+    "@prep-lab/db": "workspace:*",
+    "@prep-lab/content": "workspace:*",
+    "@orpc/server": "^1.14.3",
+    "drizzle-orm": "^0.45.2",
+    "hono": "^4.12.22"
+  }
+}
