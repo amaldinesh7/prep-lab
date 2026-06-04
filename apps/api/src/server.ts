@@ -5,11 +5,15 @@ import { RPCHandler } from "@orpc/server/fetch";
 import { modulesProcedures } from "./procedures/modules";
 import { sectionsProcedures } from "./procedures/sections";
 import { progressProcedures } from "./procedures/progress";
+import { notesProcedures } from "./procedures/notes";
+import { quizProcedures } from "./procedures/quiz";
 
 const router = {
   modules: modulesProcedures,
   sections: sectionsProcedures,
   progress: progressProcedures,
+  notes: notesProcedures,
+  quiz: quizProcedures,
 };
 
 const handler = new RPCHandler(router);
