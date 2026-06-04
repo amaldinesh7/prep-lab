@@ -1,0 +1,11 @@
+{
+  "name": "@prep-lab/content",
+  "version": "0.0.0",
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": { "typecheck": "tsc --noEmit", "test": "bun test" },
+  "dependencies": {
+    "@prep-lab/contracts": "workspace:*",
+    "gray-matter": "^4.0.3"
+  }
+}
