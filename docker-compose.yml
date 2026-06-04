@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: prep_lab_pg
+    environment:
+      POSTGRES_USER: prep
+      POSTGRES_PASSWORD: prep
+      POSTGRES_DB: prep_lab
+    ports:
+      - "5432:5432"
+    volumes:
+      - prep_lab_pg_data:/var/lib/postgresql/data
+
+volumes:
+  prep_lab_pg_data:
