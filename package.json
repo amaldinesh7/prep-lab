@@ -8,9 +8,9 @@
     "build": "bun run --filter '*' build",
     "typecheck": "bun run --filter '*' typecheck",
     "lint": "oxlint .",
-    "db:generate": "bun --cwd packages/db run generate",
-    "db:migrate": "bun --cwd packages/db run migrate",
-    "db:seed": "bun --cwd packages/db run seed"
+    "db:generate": "bun run --filter @prep-lab/db generate",
+    "db:migrate": "bun run --filter @prep-lab/db migrate",
+    "db:seed": "bun run --filter @prep-lab/db seed"
   },
   "devDependencies": {
     "@types/bun": "latest",
