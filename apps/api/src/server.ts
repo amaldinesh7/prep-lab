@@ -4,10 +4,12 @@ import { logger } from "hono/logger";
 import { RPCHandler } from "@orpc/server/fetch";
 import { modulesProcedures } from "./procedures/modules";
 import { sectionsProcedures } from "./procedures/sections";
+import { progressProcedures } from "./procedures/progress";
 
 const router = {
   modules: modulesProcedures,
   sections: sectionsProcedures,
+  progress: progressProcedures,
 };
 
 const handler = new RPCHandler(router);
