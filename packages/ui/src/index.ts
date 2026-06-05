@@ -1,2 +1,2 @@
-// re-exports added per component in subsequent tasks
-export {};
+export { SectionHeader } from "./content/SectionHeader";
+export { sectionTypeStyles, type SectionTypeStyle } from "./lib/sectionType";
