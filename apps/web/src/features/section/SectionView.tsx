@@ -3,9 +3,11 @@ import { Pager, SectionHeader } from "@prep-lab/ui";
 import type { SectionResponse } from "@prep-lab/contracts";
 import { MdxRenderer } from "../content/MdxRenderer";
 import { compileMdx } from "../content/compileMdx";
+import { QuizContext } from "../content/mdxComponents";
 import { useProgress } from "../progress/useProgress";
 import { useRailSlot } from "../../components/layout/RailSlot";
 import { SectionRail } from "./SectionRail";
+import { api } from "../../lib/orpc";
 
 export function SectionView({ moduleSlug, data }: { moduleSlug: string; data: SectionResponse }) {
   const [compiled, setCompiled] = useState<string | null>(null);
@@ -26,7 +28,15 @@ export function SectionView({ moduleSlug, data }: { moduleSlug: string; data: Se
 
       <SectionHeader kind={data.kind} number={data.orderIndex + 1} title={data.title} />
 
-      {compiled ? <MdxRenderer compiled={compiled} /> : <p className="text-[var(--text-faint)]">Loading content…</p>}
+      <QuizContext.Provider
+        value={data.quiz ? {
+          sectionId: data.id,
+          questions: data.quiz.questions,
+          onSubmit: api.quiz.submit,
+        } : null}
+      >
+        {compiled ? <MdxRenderer compiled={compiled} /> : <p className="text-[var(--text-faint)]">Loading content…</p>}
+      </QuizContext.Provider>
 
       <Pager
         moduleSlug={moduleSlug}

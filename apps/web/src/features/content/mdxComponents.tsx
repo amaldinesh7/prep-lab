@@ -1,6 +1,23 @@
+import { createContext, useContext } from "react";
 import {
   Callout, Code, Reading, ProjectCard, Cheatsheet, CodePlayground, SectionHeader,
+  Quiz, type QuizProps,
 } from "@prep-lab/ui";
+
+interface QuizCtx {
+  sectionId: string;
+  questions: { id: string; prompt: string; options: { id: string; label: string }[] }[];
+  onSubmit: QuizProps["onSubmit"];
+}
+export const QuizContext = createContext<QuizCtx | null>(null);
+
+function QuizSlot() {
+  const ctx = useContext(QuizContext);
+  if (!ctx) {
+    return <div className="text-[var(--text-faint)] text-[13px]">(no quiz for this section)</div>;
+  }
+  return <Quiz {...ctx} />;
+}
 
 export const mdxComponents = {
   h1: (props: React.HTMLAttributes<HTMLHeadingElement>) => (
@@ -26,4 +43,5 @@ export const mdxComponents = {
   Cheatsheet,
   CodePlayground,
   SectionHeader,
+  QuizSlot,
 };

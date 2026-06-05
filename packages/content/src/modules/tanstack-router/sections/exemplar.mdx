@@ -2,6 +2,68 @@
 title: Exemplar — every section type
 ---
 
-# Exemplar
+# Exemplar — every section type
 
-Placeholder. Real content arrives in Task 30.
+This page demonstrates every kind of section the platform supports. Each section here would normally live on its own URL — keeping them in one file makes the engine easy to eyeball end-to-end.
+
+<SectionHeader kind="concept" number={1} title="A plain concept" />
+
+This is the default content kind. Prose, code, links. No special chrome beyond the type-coded heading and bar.
+
+<Code lang="ts" file="example.ts">{`function add(a: number, b: number) {
+  return a + b;
+}`}</Code>
+
+<SectionHeader kind="why" number={2} title="Why this exists" />
+
+<Callout kind="why">
+  Section types let you scroll a long page and tell at a glance which parts are concept, which are warning, which are practice. Color carries meaning, not decoration.
+</Callout>
+
+<SectionHeader kind="pattern" number={3} title="A production pattern" />
+
+<Callout kind="pattern">
+  In file-based routing, co-locate route loaders with the component file. It keeps data fetching close to the UI that consumes it and survives refactors better than central route configs.
+</Callout>
+
+<SectionHeader kind="tradeoff" number={4} title="A tradeoff" />
+
+<Callout kind="tradeoff">
+  File-based routing wins on convention but loses on flexibility. Generated route trees can drift if file moves and build orders don't agree — keep generated files out of git or commit them deliberately.
+</Callout>
+
+<SectionHeader kind="gotcha" number={5} title="A gotcha" />
+
+<Callout kind="gotcha">
+  Type-safe `params` only get inferred when `createFileRoute` matches the on-disk filename exactly. Renaming a file without regenerating the route tree silently breaks param types.
+</Callout>
+
+<SectionHeader kind="reading" number={6} title="Curated readings" />
+
+<Reading url="https://tanstack.com/router/latest" title="Tanstack Router — official docs" kind="docs" minutes={20} />
+<Reading url="https://tanstack.com/router/latest/docs/framework/react/guide/file-based-routing" title="File-based routing guide" kind="docs" minutes={12} />
+
+<SectionHeader kind="mini_project" number={7} title="Mini-project" />
+
+<ProjectCard hours="2-3" starter="./starter">
+  Wire a Tanstack Router app with three routes (`/`, `/posts`, `/posts/$postId`). Use `loader` to fetch a JSON placeholder API, and confirm `$postId` is typed `string` automatically.
+
+  - Set up the file-based plugin in `vite.config.ts`
+  - Add a `__root.tsx` with `<Outlet />`
+  - Use `useLoaderData` in the post detail route
+</ProjectCard>
+
+<SectionHeader kind="quiz" number={8} title="Self-check" />
+
+<QuizSlot />
+
+<SectionHeader kind="cheatsheet" number={9} title="Cheatsheet" />
+
+<Cheatsheet rows={[
+  { k: "Plugin", v: "@tanstack/router-plugin/vite" },
+  { k: "Generated tree", v: "src/routeTree.gen.ts" },
+  { k: "Param typing", v: "Inferred from filename" },
+  { k: "Loader", v: "createFileRoute(...).loader" },
+  { k: "Data hook", v: "Route.useLoaderData()" },
+  { k: "Nested layouts", v: "__root.tsx + Outlet" },
+]} />
