@@ -5,6 +5,7 @@
   "exports": { ".": "./src/index.ts" },
   "scripts": { "typecheck": "tsc --noEmit" },
   "dependencies": {
+    "@codesandbox/sandpack-react": "^2.20.0",
     "@prep-lab/contracts": "workspace:*",
     "@tanstack/react-router": "^1.170.8",
     "lucide-react": "^0.460.0"
