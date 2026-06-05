@@ -1,2 +1,33 @@
-/* placeholder — design tokens land in Task 15 */
-body { margin: 0; font-family: "Geist", system-ui, sans-serif; }
+@import "tailwindcss";
+@import "./tokens.css";
+
+@layer base {
+  html, body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Geist", ui-sans-serif, system-ui, sans-serif;
+    font-size: 15px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    letter-spacing: -0.003em;
+    transition: background var(--t-default) var(--ease-out), color var(--t-default) var(--ease-out);
+  }
+  code, pre, .mono { font-family: "Geist Mono", ui-monospace, monospace; }
+  *:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+}
+
+@theme {
+  --color-bg: var(--bg);
+  --color-paper: var(--paper);
+  --color-surface: var(--surface);
+  --color-border: var(--border);
+  --color-text: var(--text);
+  --color-text-muted: var(--text-muted);
+  --color-text-faint: var(--text-faint);
+  --color-teal: var(--teal);
+  --color-amber: var(--amber);
+  --color-rose: var(--rose);
+  --color-emerald: var(--emerald);
+  --color-violet: var(--violet);
+  --color-indigo: var(--indigo);
+}
