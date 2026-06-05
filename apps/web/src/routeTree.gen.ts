@@ -9,12 +9,30 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as NotesRouteImport } from './routes/notes'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as ModulesIndexRouteImport } from './routes/modules.index'
+import { Route as ModulesModuleSlugIndexRouteImport } from './routes/modules.$moduleSlug.index'
 import { Route as ModulesModuleSlugSectionSlugRouteImport } from './routes/modules.$moduleSlug.$sectionSlug'
 
+const NotesRoute = NotesRouteImport.update({
+  id: '/notes',
+  path: '/notes',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ModulesIndexRoute = ModulesIndexRouteImport.update({
+  id: '/modules/',
+  path: '/modules/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ModulesModuleSlugIndexRoute = ModulesModuleSlugIndexRouteImport.update({
+  id: '/modules/$moduleSlug/',
+  path: '/modules/$moduleSlug/',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ModulesModuleSlugSectionSlugRoute =
@@ -26,37 +44,86 @@ const ModulesModuleSlugSectionSlugRoute =
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/notes': typeof NotesRoute
+  '/modules/': typeof ModulesIndexRoute
   '/modules/$moduleSlug/$sectionSlug': typeof ModulesModuleSlugSectionSlugRoute
+  '/modules/$moduleSlug/': typeof ModulesModuleSlugIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/notes': typeof NotesRoute
+  '/modules': typeof ModulesIndexRoute
   '/modules/$moduleSlug/$sectionSlug': typeof ModulesModuleSlugSectionSlugRoute
+  '/modules/$moduleSlug': typeof ModulesModuleSlugIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/notes': typeof NotesRoute
+  '/modules/': typeof ModulesIndexRoute
   '/modules/$moduleSlug/$sectionSlug': typeof ModulesModuleSlugSectionSlugRoute
+  '/modules/$moduleSlug/': typeof ModulesModuleSlugIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/modules/$moduleSlug/$sectionSlug'
+  fullPaths:
+    | '/'
+    | '/notes'
+    | '/modules/'
+    | '/modules/$moduleSlug/$sectionSlug'
+    | '/modules/$moduleSlug/'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/modules/$moduleSlug/$sectionSlug'
-  id: '__root__' | '/' | '/modules/$moduleSlug/$sectionSlug'
+  to:
+    | '/'
+    | '/notes'
+    | '/modules'
+    | '/modules/$moduleSlug/$sectionSlug'
+    | '/modules/$moduleSlug'
+  id:
+    | '__root__'
+    | '/'
+    | '/notes'
+    | '/modules/'
+    | '/modules/$moduleSlug/$sectionSlug'
+    | '/modules/$moduleSlug/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  NotesRoute: typeof NotesRoute
+  ModulesIndexRoute: typeof ModulesIndexRoute
   ModulesModuleSlugSectionSlugRoute: typeof ModulesModuleSlugSectionSlugRoute
+  ModulesModuleSlugIndexRoute: typeof ModulesModuleSlugIndexRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/notes': {
+      id: '/notes'
+      path: '/notes'
+      fullPath: '/notes'
+      preLoaderRoute: typeof NotesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/': {
       id: '/'
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/modules/': {
+      id: '/modules/'
+      path: '/modules'
+      fullPath: '/modules/'
+      preLoaderRoute: typeof ModulesIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/modules/$moduleSlug/': {
+      id: '/modules/$moduleSlug/'
+      path: '/modules/$moduleSlug'
+      fullPath: '/modules/$moduleSlug/'
+      preLoaderRoute: typeof ModulesModuleSlugIndexRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/modules/$moduleSlug/$sectionSlug': {
@@ -71,7 +138,10 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  NotesRoute: NotesRoute,
+  ModulesIndexRoute: ModulesIndexRoute,
   ModulesModuleSlugSectionSlugRoute: ModulesModuleSlugSectionSlugRoute,
+  ModulesModuleSlugIndexRoute: ModulesModuleSlugIndexRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
