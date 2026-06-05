@@ -6,3 +6,5 @@ dist/
 .DS_Store
 bun.lock
 drizzle/meta/
+**/drizzle/meta/
+apps/web/vite.config.js
