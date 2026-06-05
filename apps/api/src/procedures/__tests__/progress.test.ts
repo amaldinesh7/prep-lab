@@ -19,8 +19,8 @@ async function call(path: string, body: unknown) {
 }
 
 async function unwrap(res: Response) {
-  const env = (await res.json()) as { json: any };
-  return env.json;
+  const env = (await res.json()) as { json: unknown };
+  return env.json as { status: string; timeSpentSec: number; completedAt: string | null };
 }
 
 describe("progress/upsert", () => {

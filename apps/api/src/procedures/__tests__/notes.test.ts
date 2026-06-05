@@ -17,8 +17,8 @@ async function call(path: string, body: unknown) {
   });
 }
 async function unwrap(res: Response) {
-  const env = (await res.json()) as { json: any };
-  return env.json;
+  const env = (await res.json()) as { json: unknown };
+  return env.json as { bodyMd: string } & Record<string, unknown>;
 }
 
 describe("notes", () => {
@@ -30,7 +30,7 @@ describe("notes", () => {
   });
   it("search returns notes containing the query", async () => {
     await call("notes/upsert", { scope: "section", refId: sectionId, bodyMd: "needle in haystack" });
-    const res = await unwrap(await call("notes/search", { q: "needle" }));
-    expect(res.some((n: any) => n.bodyMd.includes("needle"))).toBe(true);
+    const res = (await unwrap(await call("notes/search", { q: "needle" }))) as unknown as Array<{ bodyMd: string }>;
+    expect(res.some((n) => n.bodyMd.includes("needle"))).toBe(true);
   });
 });
