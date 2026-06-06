@@ -1,0 +1,104 @@
+---
+title: How RN works — bridge vs new architecture
+---
+
+<SectionHeader kind="concept" number={2} title="How RN works — bridge vs new architecture" />
+
+If you only learn one thing from this module, learn this: there are two architectures in the React Native (RN) world, the old "bridge" and the new architecture, and which one you're on determines what's true about performance, animations, and how native code interacts with JS. The old one is what spawned every "RN is slow" blog post you've read. The new one is why those blog posts are mostly outdated in 2026.
+
+## The old architecture: bridge + JSON messages
+
+Picture three threads.
+
+- **JS thread.** Your React code runs here. Originally on Apple's JavaScript core (JSC); Hermes was added in 2019 and is now default. Your `useState`, your reducers, your business logic — all here.
+- **Native UI thread (main thread).** The platform's UI thread. On iOS this is the one UIKit/SwiftUI require for view updates. On Android, the same — the main looper that owns View invalidation.
+- **Native modules / shadow thread.** Native code (Objective-C, Swift, Java, Kotlin) that exposes APIs to JS, and a layout engine (Yoga) running flexbox calculations.
+
+The bridge connected them with **asynchronous, batched, serialized JSON messages**. When you wrote `setState` and the render produced a new tree of `<View>` and `<Text>` elements, RN didn't call native code directly. It serialized a description of the changes to JSON, put it on a queue, and the native side read the queue and applied the changes.
+
+The implications were everywhere:
+
+- **No synchronous calls between JS and native.** You could not ask native code a question and get an answer in the same tick. Every native call was a round-trip with serialization on both sides.
+- **The bridge was a single chokepoint.** If JS produced messages faster than native could consume them (or vice versa), you got jank. Long lists scrolling fast were the canonical example — the scroll position is owned by the native side, but the JS side had to be told about it asynchronously to render the next batch of rows.
+- **Animations driven from JS dropped frames under load.** A `setInterval` updating a transform 60 times a second would skip frames whenever the JS thread did anything else (a Redux dispatch, a network response, garbage collection). The native UI just stopped getting updates for 100ms at a time.
+- **Type safety stopped at the bridge.** Native modules declared their methods to JS via a runtime registration step. If the native signature changed and the JS call didn't, you got a runtime crash, not a compile error.
+
+This is why people said RN was slow. They were mostly right about the bridge. The interesting question — and the answer to "is RN still slow in 2026" — is what replaced it.
+
+## The new architecture: Fabric + TurboModules + JSI + Hermes
+
+The new architecture is four pieces working together. Stable since RN 0.76 (late 2024), default for new Expo projects since SDK 51. By the time you join a team in 2026, this is what you'll be working on.
+
+**JSI (JavaScript Interface).** The replacement for the bridge. JSI is a C++ abstraction layer that lets JS code hold direct references to native C++ objects, and call methods on them synchronously, in the same thread, without going through JSON serialization. It's the foundation everything else builds on. When you read "RN's new architecture," JSI is the load-bearing piece.
+
+**Fabric.** The new renderer. It uses JSI to talk to native UI primitives directly. The shadow tree (RN's internal representation of your view hierarchy) is now a C++ structure that JS holds a reference to via JSI. Layout still runs on a background thread, but commits to the UI happen synchronously when needed. Concurrent rendering (React 18's `startTransition`, `Suspense`) actually works on RN now, where on the old bridge it was theatre.
+
+**TurboModules.** The replacement for the old "native modules." Native APIs are exposed to JS via JSI, with type information generated from a Codegen step that reads TypeScript or Flow specs. The signature is enforced at build time — change the native method and the JS calling site fails to typecheck. Lazy-loaded by default: a TurboModule isn't initialized until you call it, so cold start improves.
+
+**Hermes.** The default JS engine. Built by Meta specifically for RN. Optimized for fast startup (precompiled bytecode shipped in the bundle, no parse cost at boot), low memory, small binary size on mobile. Not the fastest interpreter in raw throughput (V8 wins steady-state), but the right tradeoffs for mobile: you care about time-to-interactive and memory, not how fast a `for` loop adds numbers. Hermes also has a built-in inspector (Chrome DevTools work directly) and a profiler that the tooling integrates with.
+
+The whole picture: JS and native share memory through JSI, the UI commits are synchronous when they need to be, type signatures are generated and checked at build time, and the JS engine is tuned for mobile boot time.
+
+## Animations: the Reanimated story
+
+The animation story under the old bridge was painful. There was a thing called `Animated` (built-in), and a hack called `useNativeDriver: true` that would let the native side handle a subset of animations (opacity, transform) without round-tripping through JS. But anything driven by a gesture, or any animation that needed to read computed state, was JS-driven and dropped frames.
+
+Reanimated 2 (2020) introduced **worklets**. Reanimated 3 (the version you'll be running) is the production answer. Worklets are JS functions that the library serializes and runs on a separate UI-thread JS runtime — a second instance of Hermes that lives on the UI thread, not the main JS thread.
+
+The mental model: you write JS, but the animation function runs on the UI thread, in its own runtime, with no contention from your main JS thread. A gesture handler can read finger position and update a `useSharedValue` 120 times a second without ever touching the JS thread. Your Redux dispatches don't drop frames. Your network response doesn't stutter a swipe gesture.
+
+```ts
+import Animated, {
+  useSharedValue,
+  useAnimatedStyle,
+  withSpring,
+} from "react-native-reanimated";
+
+function Card() {
+  const x = useSharedValue(0);
+
+  // This runs on the UI thread, every frame, without touching JS.
+  const animatedStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: x.value }],
+  }));
+
+  return (
+    <Animated.View style={animatedStyle}>
+      <Button onPress={() => (x.value = withSpring(100))} />
+    </Animated.View>
+  );
+}
+```
+
+The `useAnimatedStyle` callback is a worklet. It's executed on the UI thread. The spring math runs there. The transform commits to the native view from the same thread that's rendering it. The JS thread never sees the per-frame work.
+
+Combined with `react-native-gesture-handler` (gestures also processed on the UI thread), you can build animations that are indistinguishable from native. Square, Shopify, Coinbase all use this stack.
+
+## "RN is slow" — what's still true in 2026
+
+The new architecture closes the gap dramatically, but it doesn't make RN identical to native. The honest picture:
+
+- **Startup time** is competitive with native for an app of similar size, sometimes better thanks to Hermes precompiled bytecode. Cold start of a real app is 600-900ms on modern hardware, comparable to a Swift app of similar complexity.
+- **Steady-state animations** with Reanimated 3 and `react-native-screens` (native navigation) hit 60-120 fps as long as your code is reasonable. The bottleneck is usually your component count or unnecessary re-renders, same as web.
+- **List performance** is the place RN still leaks. `FlatList` is fine for thousands of items, struggles with tens of thousands. `FlashList` from Shopify (built on top of RN's recycler view APIs) is the production answer for heavy lists.
+- **Bundle parse cost** is much lower with Hermes (precompiled), but the JS bundle still has to be loaded into memory. Big bundles bloat cold start.
+- **Native UI fidelity** — animations match, gestures match, scrolling matches, accessibility matches. The cases where it still feels "not quite native" are when the team didn't use `react-native-screens` (native navigation containers) or when someone implemented a sheet with `Modal` instead of the iOS-native UISheetPresentationController bridging.
+
+The most outdated belief you can have in 2026 is that RN is intrinsically slow. The architecture problem was real, was solved, and shipped stable two years ago. The new question is whether your team uses the new architecture's tools correctly — Reanimated for animation, `react-native-screens` for navigation, `FlashList` for heavy lists, `expo-image` for caching.
+
+## What this means for week-one decisions
+
+When you join a mobile team, the first things to check:
+
+1. **Is the new architecture enabled?** In `app.json`/`app.config.ts` for Expo, look for `newArchEnabled: true`. For bare RN, check `ios/Podfile` and `android/gradle.properties`. If not, ask why — there are still libraries that haven't migrated, and a team on the old arch usually has a reason.
+2. **Which JS engine?** Hermes is the default, but a few legacy apps still run JSC. Check `expo.jsEngine` in `app.json` or the build config. Hermes-only quirks exist (some libraries assume `Function.prototype.toString` works the same as in V8 — Hermes is slightly different).
+3. **Animation stack?** Reanimated 3 + Gesture Handler is the answer. If the team is still using `Animated` (built-in) for anything complex, that's a smell.
+
+The next section gets into how you actually build and ship an RN app in 2026, which is mostly a story about Expo.
+
+<Reading url="https://reactnative.dev/docs/the-new-architecture/landing-page" title="RN Docs — The New Architecture" kind="docs" minutes={12} />
+<Reading url="https://docs.swmansion.com/react-native-reanimated/docs/fundamentals/about" title="Reanimated 3 — Fundamentals" kind="docs" minutes={10} />
+<Reading url="https://hermesengine.dev/" title="Hermes — Design Goals" kind="docs" minutes={6} />
+<Reading url="https://reactnative.dev/blog/2024/10/23/the-new-architecture-is-here" title="The New Architecture is Here (RN 0.76)" kind="blog" minutes={8} />
+
+**Remember this:** New architecture = Fabric (renderer) + TurboModules (native APIs) + JSI (the C++ layer that replaces the bridge) + Hermes (JS engine). Reanimated 3 runs animations on the UI thread via worklets. The "RN is slow" reputation is from the bridge era, which is over.

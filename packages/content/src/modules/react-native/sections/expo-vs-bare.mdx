@@ -1,0 +1,140 @@
+---
+title: Expo vs bare workflow
+---
+
+<SectionHeader kind="pattern" number={3} title="Expo vs bare workflow" />
+
+For most of RN's history there were two ways to start: `npx react-native init` (the bare workflow, full native projects in your repo) or `expo init` (the managed workflow, no native code, Expo's curated SDK). Bare was for "real" apps. Expo was for prototypes. That hasn't been true since around 2022. In 2026, Expo is the default, and `npx react-native init` is the path you take when you have a specific reason to.
+
+## The 2026 reality
+
+The Expo team won. There were three forcing functions:
+
+1. **Expo modules became the package format for native code.** The Expo Modules API is now the recommended way to write native modules for RN — Meta themselves point people there. Most popular native libraries (`expo-camera`, `expo-av`, `expo-notifications`, `react-native-mmkv`, the Stripe RN SDK) either ship as Expo modules or work cleanly inside Expo.
+2. **Expo Application Services (EAS) made native builds tractable.** Provisioning profiles, code signing, certificate rotation, Xcode versions, Gradle JVM heap sizes — the parts of mobile that consume entire engineer-weeks — became a managed service. You push, EAS builds.
+3. **Continuous Native Generation (CNG) eliminated the "I need to eject" anxiety.** Your `ios/` and `android/` directories aren't checked in. They're generated from `app.json` and your installed Expo modules on every build via `npx expo prebuild`. Need to add a native plist entry? Use a config plugin. The whole "Expo locks you out of native" criticism is dead.
+
+Joining a team in 2026, the default expectation is: Expo SDK, EAS for build and submit, Expo Router or React Navigation for navigation, Hermes JS engine, new architecture enabled.
+
+## What Expo gives you
+
+Three things matter at the team level:
+
+**The SDK.** A curated, versioned set of native modules that all work together at a known RN version. `expo-camera`, `expo-location`, `expo-notifications`, `expo-image`, `expo-secure-store`, `expo-file-system`, `expo-haptics`, `expo-linking` — the modules you'd otherwise spend a sprint each integrating. They share a release train, so "upgrading Expo SDK" upgrades all of them together with tested compatibility.
+
+**EAS Build.** Native builds in the cloud. You don't need a Mac to ship iOS. You don't need to maintain a self-hosted CI image with Xcode 16.2. `eas build --platform all` and the binaries land in a few minutes. Provisioning profiles are managed for you (`eas credentials`), so the half-yearly Apple certificate rotation isn't a fire drill.
+
+**EAS Update.** Over-the-air (OTA) updates. You push a JS-only change, EAS Update bundles it, your installed app downloads it on next launch. Bug fixes ship in minutes instead of waiting 24 hours for app review. We'll come back to the OTA constraints later.
+
+There's also EAS Submit (uploads binaries to App Store Connect and Google Play), EAS Hosting (for web targets), and EAS Workflows (a CI surface). They're all consequences of "Expo runs the mobile-specific infra so you don't."
+
+## When you stay managed (almost always)
+
+The managed workflow is `npx create-expo-app`, no native folders, all native code comes from installed modules and config plugins. This is the right default. You stay managed when:
+
+- Every native capability you need has an Expo module or a community library compatible with Expo.
+- You don't need to drop into Xcode or Android Studio to debug.
+- You want the team to deploy without needing local Apple Developer setup.
+
+Real product apps stay managed indefinitely. Bluesky, Brex, Stripe Press, the Coinbase mobile app, BlueOS — these are managed workflow apps. The ceiling is much higher than it was three years ago.
+
+## When you go bare (rare)
+
+The bare workflow keeps `ios/` and `android/` in your repo. You edit native code directly. You use Expo modules as libraries but don't ship the full Expo runtime. You take this path when:
+
+- You're integrating a vendor SDK (a payments processor, an enterprise MDM, a specialized analytics tool) that ships native code and doesn't work with config plugins.
+- You're maintaining a legacy app that predates Expo's prebuild story and migrating would cost more than the friction of staying bare.
+- You need to ship a custom native module that touches platform-specific build configurations the prebuild step doesn't model.
+
+You can also be "expo-bare" — install `expo-modules-core`, use Expo modules as libraries, but keep your `ios/` and `android/` folders checked in. This is the common middle ground for migrating apps.
+
+## EAS Update: the OTA story
+
+OTA updates are the single biggest reason mobile teams choose RN in 2026. Apple takes 24-48 hours to review a release. Google Play is faster but still not instant. Web teams are used to deploying ten times a day; mobile teams couldn't, until OTA.
+
+EAS Update lets you ship the **JS bundle and assets** (images, fonts, JSON) without going through the app stores. Your installed app checks for an update on launch (or on a schedule you configure), downloads the new bundle, and uses it on next launch. Most users get the fix within a day of you pressing deploy.
+
+The hard constraint: **OTA can only ship what's in the JS bundle and assets**. You cannot ship:
+
+- New native code (a new native module, a new Info.plist entry, a new Android permission)
+- Changes to the SDK version
+- New entries in `app.json` that require a new build
+
+That's fine for the 90% of changes that are bug fixes in your TypeScript. It's not fine for "I'm adding push notifications" — that needs a new native build, a new app store submission, and a review cycle.
+
+The team mental model: ship native builds monthly or per-feature; ship OTA updates daily for bug fixes and small product changes. Expo's "fingerprint" system tracks which native code is in which binary, so EAS Update only ships compatible JS bundles to the right native build — you can't accidentally ship a JS bundle that calls a native module the user's installed binary doesn't have.
+
+## Expo Router: file-based routing for mobile
+
+If you know Tanstack Router (TSR) or Next.js App Router, Expo Router is the same idea for mobile. Files in `app/` become routes. Folders become groups. Dynamic segments use `[id]`. Layouts wrap groups via `_layout.tsx`. URLs work — deep links resolve to routes automatically.
+
+The alternative is React Navigation, which is older, imperative (you build a navigator tree in code), and what most existing apps still use. Expo Router actually wraps React Navigation under the hood, so the navigators are the same — Expo Router just gives you the file-based addressing on top. The next section covers navigation in depth.
+
+## Walkthrough: starting a new app
+
+The one-liner:
+
+<Code lang="bash">{`npx create-expo-app@latest my-app --template default`}</Code>
+
+What you get:
+
+- `app/` directory with Expo Router scaffolded, including a tab navigator
+- `app.json` with the project config
+- `package.json` with React, RN, Expo, Expo Router, and a few sensible defaults
+- TypeScript configured
+- No `ios/` or `android/` folders — they're generated when you build
+
+Run it locally:
+
+<Code lang="bash">{`cd my-app
+npx expo start
+
+# Then on your phone: install Expo Go from the App Store / Play Store,
+# scan the QR code, and the app loads. No native build needed for dev.`}</Code>
+
+For a development build (lets you use custom native modules in dev):
+
+<Code lang="bash">{`npx expo install expo-dev-client
+eas build --profile development --platform ios
+# Install the resulting build on your device.
+# Now \`npx expo start\` loads into your custom dev client instead of Expo Go.`}</Code>
+
+For production builds:
+
+<Code lang="bash">{`# One-time: configure EAS for your project
+eas init
+eas build:configure
+
+# Build for the stores
+eas build --platform all --profile production
+
+# Submit to App Store Connect and Google Play
+eas submit --platform all
+
+# Ship a JS-only update to existing installs (no review cycle)
+eas update --branch production --message "fix: corrected timezone offset"`}</Code>
+
+The notable thing: you never opened Xcode. You never opened Android Studio. You shipped to both stores from a CLI. This is the default in 2026.
+
+<Callout kind="pattern">
+  The 2026 default workflow: managed Expo + EAS Build + EAS Submit + EAS Update + Expo Router. Use bare only when a specific vendor SDK forces it. The "managed is for toys" framing is outdated — production apps with millions of users run managed. The right question isn't "managed or bare?" — it's "do I have a specific native integration that breaks the prebuild model?"
+</Callout>
+
+## What this means for the codebase you'll inherit
+
+Reading an existing RN app in 2026, look for:
+
+- `app.json` or `app.config.ts` — the source of truth for the project. Plugins listed here generate native code.
+- `eas.json` — build profiles (development, preview, production) and their environment variables.
+- `app/` directory if it's Expo Router; otherwise look for a top-level `<NavigationContainer>` in `App.tsx`.
+- `ios/` and `android/` checked in? Bare or expo-bare. Not in repo? Managed with prebuild.
+- A `.env.production` or EAS environment variables — don't commit secrets.
+
+The fastest way to onboard: run `npx expo start`, get the dev client on your phone, change a `Text` component, see it hot-reload. The full toolchain works the first day.
+
+<Reading url="https://docs.expo.dev/get-started/introduction/" title="Expo — Introduction" kind="docs" minutes={6} />
+<Reading url="https://docs.expo.dev/eas/" title="EAS — Overview" kind="docs" minutes={8} />
+<Reading url="https://docs.expo.dev/workflow/continuous-native-generation/" title="Continuous Native Generation (CNG)" kind="docs" minutes={6} />
+<Reading url="https://docs.expo.dev/eas-update/introduction/" title="EAS Update — Introduction" kind="docs" minutes={8} />
+
+**Remember this:** `npx create-expo-app` + EAS is the default. Bare workflow is the escape hatch. OTA ships JS and assets only, not native code. Every team you join in 2026 will be on some version of this.

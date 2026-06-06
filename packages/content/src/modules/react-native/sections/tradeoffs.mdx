@@ -1,0 +1,93 @@
+---
+title: Tradeoffs
+---
+
+<SectionHeader kind="tradeoff" number={6} title="Tradeoffs" />
+
+React Native (RN) is one of four credible choices for shipping a mobile app in 2026. Each has a real argument. The mistake teams make is picking based on engineering taste rather than the workload. Here's the honest comparison.
+
+## vs Flutter
+
+Flutter is Google's framework: Dart language, draws its own UI via Skia (now Impeller), one codebase across iOS, Android, web, desktop. It's the most direct competitor to RN, and the one the comparison comes up most often.
+
+**Where Flutter wins:**
+- **Graphics fidelity and animations.** Flutter draws every pixel itself, so it controls the full frame pipeline. Complex animations, custom drawing, intricate transitions are easier to get pixel-perfect.
+- **Cross-platform consistency.** A Flutter UI looks identical on iOS and Android. (Whether that's actually what you want is a separate question.)
+- **Hot reload.** Was notably better than RN's for years. RN's is now comparable but Flutter is still the smoother experience.
+- **Performance ceiling.** AOT-compiled Dart, no JS engine in between. For raw frame-time budget on complex screens, Flutter has more headroom.
+
+**Where RN wins:**
+- **Web code reuse.** Your existing React engineers ship mobile without learning Dart. Your shared TypeScript types, validation schemas, business logic — all reusable across web and mobile. Flutter has no equivalent path; Dart doesn't talk to your TypeScript web app.
+- **The native look-and-feel.** RN renders actual `UIView` and `android.view.View`. iOS users get UIKit/SwiftUI patterns; Android users get Material. Flutter draws everything, so the "feels like a native iOS app" experience requires extra effort (Cupertino widgets).
+- **Hiring pool.** Every web React engineer is a near-RN engineer. Flutter requires Dart, which is one more thing to hire for and one more thing to onboard. For a JS-heavy company, RN is the lower-friction multiplier.
+- **Native module ecosystem.** RN's npm ecosystem of native modules (Expo + community) is broader than Flutter's pub.dev for niche integrations. The big ones (Firebase, Stripe, Sentry) are equivalent on both.
+
+**The summary:** Flutter wins on graphics and pixel-perfect control. RN wins on team economics and ecosystem reuse with web. If your app is a beautifully animated, custom-rendered experience (a meditation app, a financial visualization product), Flutter has a real argument. If your app is product-shaped (lists, forms, feeds, auth), RN with a React-strong team is the cheaper path.
+
+## vs native (Swift + Kotlin)
+
+This is the real comparison. Cross-platform always loses on bleeding-edge OS features and absolute peak performance to handwritten native code. The question is whether the gap matters for your product.
+
+**Where native wins:**
+- **Bleeding-edge OS features.** When Apple ships a new framework at WWDC, native picks it up the same day. RN typically lags 6-12 months — sometimes never if it's something niche (some HealthKit APIs, some CarPlay extensions, certain ARKit features). If your product depends on day-one iOS feature support, native.
+- **Absolute peak performance.** Long-running compute, real-time audio/video processing, frame-accurate graphics — native, every time. RN's new architecture closes the gap for most UI work, not for compute-bound work.
+- **Deep platform integration.** Widgets (Lock Screen widgets, Live Activities), Watch apps, App Clips, App Intents, Shortcuts integration. RN can do some of these via Expo modules, but you're writing native code regardless. At that point you're maintaining native anyway.
+- **Memory and binary size.** A Swift-only app has a smaller binary and lower memory floor than a comparable RN app. Matters for older devices in emerging markets, not much elsewhere.
+
+**Where RN wins:**
+- **One team, two platforms.** The single biggest economic argument. Two native teams is roughly 2x the cost of one RN team; for product-shaped apps the output is comparable.
+- **Web code reuse.** A native team can't share a single line of Swift with your TypeScript web app. An RN team shares a substantial fraction.
+- **Shipping speed.** RN's hot reload, OTA updates, and shared business logic mean smaller PRs and faster iteration than native's compile-build-install cycle.
+- **The talent pool.** "Hire a React engineer" is dramatically easier than "hire an iOS engineer and an Android engineer with matching senior levels."
+
+**The summary:** Native wins on bleeding-edge OS features and absolute performance ceiling. RN wins on team economics and time-to-market. The mature decision: pick RN unless you have a specific reason (your product's differentiator is in a native-only capability, or your scale justifies two teams).
+
+## vs Progressive Web App (PWA)
+
+A PWA is a web app installed to the home screen via the browser. No native build. No app store. Service workers for offline.
+
+**Where PWA wins:**
+- **Zero install friction.** Users tap a button in the browser to add to home screen. No store review. No 40 MB download.
+- **No app store gatekeeping.** No Apple review queue, no 30% revenue share, no policy risk of being kicked off the store.
+- **Same web codebase.** Your existing web app, more or less. Lowest possible engineering investment.
+
+**Where RN wins:**
+- **App store presence.** Users still find apps in the App Store and Play Store. A web-only product is invisible to that funnel.
+- **Native APIs.** Push notifications on iOS Safari are limited; geolocation in background is restricted; Bluetooth, NFC, HealthKit are largely unavailable from the browser. RN gets all of these.
+- **Performance.** A PWA running in WebView is a WebView. RN renders real native views.
+- **Trust and feel.** Users perceive native apps as "real" in a way they don't perceive PWAs. The PWA install banner on iOS Safari is still buried under multiple taps. Conversion to "installed" is much lower than App Store conversion.
+
+**The summary:** PWA wins when install friction matters more than App Store presence, or when your product is fundamentally a webview (a content site, a thin wrapper around a web app). RN wins when you need real native APIs, app store distribution, or perceived legitimacy. Most consumer products want the App Store presence.
+
+## When NOT to use RN
+
+Be honest about these cases. RN is the wrong tool when:
+
+- **Heavy 3D graphics or game engines.** RN can host a native game view, but if your app's core loop is 3D, use Unity or Unreal (cross-platform engines) or native Metal/Vulkan. RN-on-top is not the right abstraction.
+- **AR / VR experiences.** ARKit and ARCore have Expo wrappers, but a serious AR product is doing native frame-level work with custom shaders. RN's UI layer is a distraction at that point.
+- **Low-level audio/video pipelines.** Real-time audio DSP, custom video codecs, frame-accurate processing — native. You'll write the native code anyway; RN doesn't add value.
+- **The product is fundamentally a single-platform widget.** If your entire app is an Apple Watch complication, a CarPlay extension, or an Android home-screen widget, cross-platform is moot. Build native.
+- **Your team is 30+ mobile engineers split iOS/Android with deep platform expertise.** At that scale, the per-engineer productivity argument flips — moving an experienced native team to RN often loses more than it gains. RN's leverage is at startup and mid-stage scale where you don't have two specialists already.
+
+## Tradeoff axes summarized
+
+<Cheatsheet rows={[
+  { k: "Engineering cost (product app)", v: "PWA < RN < Flutter < Native" },
+  { k: "Time-to-market", v: "PWA ≈ RN > Flutter > Native" },
+  { k: "Bleeding-edge OS feature support", v: "Native >> RN ≈ Flutter > PWA" },
+  { k: "Web code reuse", v: "PWA >> RN >> Flutter > Native" },
+  { k: "Graphics / animation ceiling", v: "Native ≈ Flutter > RN > PWA" },
+  { k: "Native API breadth", v: "Native ≈ RN ≈ Flutter >> PWA" },
+  { k: "Hiring (React-heavy company)", v: "RN >> PWA > Native > Flutter" },
+  { k: "App store presence", v: "Native = RN = Flutter >> PWA" },
+]} />
+
+<Callout kind="tradeoff">
+  RN is the right default for product-shaped mobile apps in 2026 — lists, forms, feeds, auth, settings — built by teams with React strength. The cases against it are real but narrow: heavy graphics, deep single-platform features, real-time media processing. Pick the workload first, the framework second. Don't pick RN because you like JavaScript; pick it because your product is product-shaped and your team is React-shaped.
+</Callout>
+
+<Reading url="https://flutter.dev/docs/get-started/flutter-for/react-native-devs" title="Flutter for React Native Devs" kind="docs" minutes={10} />
+<Reading url="https://reactnative.dev/blog/2024/04/22/release-0.74" title="React Native 0.74 — Bridgeless Mode" kind="blog" minutes={6} />
+<Reading url="https://web.dev/articles/installable-pwas" title="Installable PWAs — web.dev" kind="docs" minutes={8} />
+
+**Remember this:** RN wins on team economics for product apps. Native wins on bleeding-edge features. Flutter wins on graphics. PWA wins on install friction. Match the framework to the workload and the team — never the other way around.

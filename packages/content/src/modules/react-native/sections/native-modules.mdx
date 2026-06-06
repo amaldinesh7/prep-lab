@@ -1,0 +1,207 @@
+---
+title: Native modules
+---
+
+<SectionHeader kind="concept" number={5} title="Native modules" />
+
+There's a class of feature that the React Native (RN) JavaScript runtime can't reach. The accelerometer. The camera. Bluetooth Low Energy. Biometric authentication. HealthKit. Apple Pay. CarPlay. The Android `JobScheduler`. These live in the platform SDKs — Objective-C/Swift on iOS, Java/Kotlin on Android — and the only way to get at them from JS is a native module: a piece of native code that exposes a typed surface to JavaScript.
+
+## When RN's built-ins aren't enough
+
+RN ships a small set of core modules — `Image`, `Text`, `View`, `ScrollView`, `Animated`, `AsyncStorage` (deprecated, but historically), `Linking`. That's it. Everything else is a native module.
+
+The list of things that require native code is longer than it sounds:
+
+- **Camera capture** — taking a photo, recording video, accessing the front/back cameras
+- **Geolocation** — GPS, background location, geofencing
+- **Push notifications** — APNs on iOS, FCM on Android, with the OS-level permission flow
+- **Bluetooth** — BLE scanning, GATT services, classic Bluetooth
+- **NFC** — reading tags, writing tags, host card emulation
+- **Health data** — HealthKit on iOS, Health Connect on Android
+- **In-app purchases** — StoreKit on iOS, Play Billing on Android
+- **Biometrics** — Face ID, Touch ID, Android BiometricPrompt
+- **Background tasks** — scheduled work when the app isn't in foreground
+- **File system access** — beyond the sandboxed `AsyncStorage`-style stuff
+- **Native UI components** — a calendar picker, a maps view, a specialized chart library that ships native widgets
+
+You'll touch at least three of these in any real app.
+
+## The "use Expo modules first" rule
+
+For 95% of native-module needs, somebody has already written one. The right reflex when you need a new capability is, in order:
+
+1. **Check Expo's first-party modules.** `expo-camera`, `expo-location`, `expo-notifications`, `expo-haptics`, `expo-image-picker`, `expo-secure-store`, `expo-file-system`, `expo-sensors`, `expo-local-authentication`, `expo-tracking-transparency`, `expo-application`, `expo-device`, `expo-clipboard`, `expo-print`, `expo-sharing`, `expo-linear-gradient`, `expo-blur`. Maintained by the Expo team, versioned with the SDK, work in both managed and bare workflows.
+2. **Check the community Expo modules.** Things like `react-native-mmkv` (Marc Rousavy's fast key-value store), `react-native-vision-camera` (high-performance camera), `react-native-skia` (canvas/graphics), `react-native-reanimated`, `react-native-gesture-handler`. Built as Expo modules; install with `npx expo install` to pick up config plugins automatically.
+3. **Check community React Native modules.** Older `react-native-*` packages — they work, but may not have config plugins for Expo prebuild. Often have a `react-native-*` and a `@react-native-*` (community-maintained) variant. Read the README carefully.
+4. **Write your own.** Last resort. We'll cover the surface below.
+
+The "use Expo modules first" rule isn't dogma — it's economics. A pre-built module has tested both platforms, handles edge cases (permissions, background, app lifecycle), and ships type definitions. Writing one yourself is a 3-day minimum and you'll find platform bugs the community has already fixed.
+
+<Callout kind="pattern">
+  Before writing a native module, search for an existing one in this order: Expo first-party → community Expo modules → community RN modules → write your own. Every team has a "we built our own" story they regret. The Expo modules ecosystem in 2026 covers the long tail well enough that writing your own is rare.
+</Callout>
+
+## Code: using `expo-camera`
+
+A typical Expo module flow looks like this — a permission, then an API:
+
+<Code lang="tsx" file="app/camera.tsx">{`import { useState } from "react";
+import { View, Text, Pressable, StyleSheet } from "react-native";
+import { CameraView, useCameraPermissions } from "expo-camera";
+
+export default function CameraScreen() {
+  const [permission, requestPermission] = useCameraPermissions();
+  const [facing, setFacing] = useState<"front" | "back">("back");
+
+  if (!permission) {
+    // Permissions are loading.
+    return <View />;
+  }
+
+  if (!permission.granted) {
+    return (
+      <View style={styles.center}>
+        <Text>We need your permission to use the camera.</Text>
+        <Pressable onPress={requestPermission}>
+          <Text>Grant</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
+  return (
+    <CameraView style={styles.camera} facing={facing}>
+      <Pressable
+        onPress={() => setFacing((f) => (f === "back" ? "front" : "back"))}
+      >
+        <Text>Flip</Text>
+      </Pressable>
+    </CameraView>
+  );
+}
+
+const styles = StyleSheet.create({
+  camera: { flex: 1 },
+  center: { flex: 1, alignItems: "center", justifyContent: "center" },
+});`}</Code>
+
+What's happening underneath: `expo-camera` ships native Swift and Kotlin code that wraps the platform camera APIs (AVFoundation on iOS, CameraX on Android). The `CameraView` component is a TurboModule-backed native view. The permission flow uses `expo-modules-core`'s permissions API, which calls into the platform permission dialogs.
+
+You wrote ten lines of JSX and got production-grade camera handling — including the permission UI, the lifecycle handling (camera pauses when app backgrounds), and the platform-specific quirks (camera serial init on iOS, runtime permission flow on Android).
+
+## Writing your own native module — the surface
+
+Sometimes you genuinely need to. Maybe you're integrating a vendor SDK that ships an iOS framework and an Android AAR. Maybe you need a specific OS API nothing has wrapped (HomeKit, CarPlay, a new iOS 19 API the community hasn't caught up with). Here's the shape — not a tutorial, just enough to read existing module code.
+
+The Expo Modules API is the recommended path. A module is a directory in your repo (or a published package) with three files:
+
+```
+modules/my-module/
+  expo-module.config.json   # Declares the module to Expo's autolinking
+  src/
+    index.ts                # The JS surface (types, exports)
+    MyModule.ts             # JS implementation that talks to native
+  ios/
+    MyModule.swift          # Swift implementation
+  android/
+    src/main/java/.../MyModule.kt   # Kotlin implementation
+```
+
+The Swift module:
+
+<Code lang="swift" file="modules/my-module/ios/MyModule.swift">{`import ExpoModulesCore
+
+public class MyModule: Module {
+  public func definition() -> ModuleDefinition {
+    Name("MyModule")
+
+    // A function callable from JS. Async returns a promise.
+    AsyncFunction("greet") { (name: String) -> String in
+      return "Hello, \\(name) — from Swift"
+    }
+
+    // An event the module can emit to JS.
+    Events("onTap")
+  }
+}`}</Code>
+
+The Kotlin equivalent:
+
+<Code lang="kotlin" file="modules/my-module/android/.../MyModule.kt">{`package com.example.mymodule
+
+import expo.modules.kotlin.modules.Module
+import expo.modules.kotlin.modules.ModuleDefinition
+
+class MyModule : Module() {
+  override fun definition() = ModuleDefinition {
+    Name("MyModule")
+
+    AsyncFunction("greet") { name: String ->
+      "Hello, $name — from Kotlin"
+    }
+
+    Events("onTap")
+  }
+}`}</Code>
+
+The JS side:
+
+<Code lang="ts" file="modules/my-module/src/index.ts">{`import { requireNativeModule } from "expo-modules-core";
+
+interface MyModuleType {
+  greet(name: string): Promise<string>;
+}
+
+const MyModule = requireNativeModule<MyModuleType>("MyModule");
+
+export async function greet(name: string): Promise<string> {
+  return MyModule.greet(name);
+}`}</Code>
+
+In your app:
+
+<Code lang="tsx">{`import { greet } from "./modules/my-module/src";
+
+const message = await greet("Amal"); // "Hello, Amal — from Swift" on iOS`}</Code>
+
+What you get for free: the function signatures are typed in both directions (Codegen runs at build), the calls are JSI-direct (no JSON serialization round-trip), and the module is lazy-loaded (not initialized until first call).
+
+The skipped complexity, in order of severity:
+
+- **Permissions and platform-specific lifecycle** — you handle these yourself.
+- **Threading model** — Expo Modules' `AsyncFunction` runs on a background queue by default; UI work needs to be dispatched to the main thread explicitly.
+- **Type marshaling for non-primitive types** — Records, dictionaries, custom types need typed mapping declarations.
+- **iOS frameworks and Android dependencies** — you add them via `MyModule.podspec` and `build.gradle`. Config plugins let an Expo module declare native dependencies that prebuild picks up.
+
+The full picture is too long for this section. The Expo docs have a complete tutorial. The short version: if you can describe what you need in 50 lines of Swift and 50 lines of Kotlin, you can ship a real module in a day.
+
+## TurboModules: the new typed bridge
+
+Older React Native modules used the "native modules" registration pattern (`RCTBridgeModule` macros on iOS, `@ReactMethod` annotations on Android). These were registered at runtime, type signatures were inferred from runtime introspection, and all calls went over the bridge.
+
+TurboModules are the new architecture replacement. The key differences:
+
+- **JSI-based.** Calls are direct C++ invocations, not JSON serialization across threads. Synchronous calls are possible for things that need them.
+- **Codegen-driven types.** You write a TypeScript or Flow spec, run Codegen, and you get C++ bindings that enforce the signature at compile time. Mismatched signatures fail the native build, not the runtime call.
+- **Lazy initialization.** The native side instantiates the module on first JS access, not at app startup. Cold start improves.
+
+The Expo Modules API sits on top of TurboModules (in the new architecture). When you write an Expo module, you're getting TurboModule semantics under the hood without writing the C++ binding yourself. This is the load-bearing reason "Expo modules" became the recommended way to write native code for RN.
+
+If you're inheriting a codebase with old-style `react-native-*` modules that haven't been ported, they'll still work via the interop layer, but you should expect them to be slower (especially synchronous-feeling APIs) and harder to type. Migration to Expo modules or TurboModules is usually a refactor worth doing during your first quarter if the team has the bandwidth.
+
+## What this means for your week-one decisions
+
+When you join a mobile team, the first questions about native modules:
+
+1. **What native modules does the app use?** Read `package.json` for `expo-*`, `react-native-*`, and `@react-native-*` packages. That's the surface area.
+2. **Are any custom?** Look for a `modules/` directory in the repo, or `local-podspecs`, or anything weird in the iOS Podfile. Custom modules are technical debt unless you know exactly why they exist.
+3. **Are any deprecated?** `react-native-camera` (deprecated, use `expo-camera` or `react-native-vision-camera`), `@react-native-community/async-storage` (deprecated, use `expo-secure-store` for secrets, MMKV for fast storage), older geolocation libraries. These are easy wins for upgrades.
+
+The native module surface is the most platform-specific part of the codebase. Time spent understanding what each one does, and why it's in the build, pays off the first time a build breaks during an Expo SDK upgrade.
+
+<Reading url="https://docs.expo.dev/modules/overview/" title="Expo — Native Modules Overview" kind="docs" minutes={8} />
+<Reading url="https://docs.expo.dev/modules/module-api/" title="Expo — Module API" kind="docs" minutes={10} />
+<Reading url="https://reactnative.dev/docs/the-new-architecture/pillars-turbomodules" title="RN — TurboModules" kind="docs" minutes={10} />
+<Reading url="https://github.com/mrousavy/react-native-vision-camera" title="VisionCamera — community high-perf camera module" kind="reference" minutes={6} />
+
+**Remember this:** Use Expo modules first, write your own last. TurboModules are the JSI-based replacement for the old native module bridge — typed, synchronous-capable, lazy-loaded. The Expo Modules API is the recommended way to write them, and "use the existing module" is almost always the right answer.

@@ -1,0 +1,55 @@
+---
+title: Why React Native
+---
+
+<SectionHeader kind="why" number={1} title="Why React Native" />
+
+Mobile is the most expensive front end you can ship. Two platforms, two languages, two SDKs, two app store review cycles, two on-call rotations. React Native (RN) is what happens when a JavaScript-first company looks at that bill and says no.
+
+## The native-app cost story
+
+A traditional mobile build looks like this. You hire an iOS engineer who writes Swift against UIKit or SwiftUI. You hire an Android engineer who writes Kotlin against Jetpack Compose. They sit in different repos, ship on different cadences, and re-implement the same product spec twice — list screen, detail screen, settings, auth, push notifications. Every product manager change is two tickets. Every design review is two implementations of the same Figma. Every analytics event has to be wired up in two places, and the inevitable bug where iOS fires the event with a `userId` and Android fires it with a `user_id` lives in your funnel reports forever.
+
+For a startup, the math is brutal. Two specialists, minimum, just to be on both platforms. Three if you want bench depth. Four if either of them takes vacation. You're spending an entire engineering pod on the part of the stack that produces zero product differentiation — your login screen is not going to win the market because it was written in Kotlin.
+
+The version skew compounds it. iOS ships a feature on Tuesday; Android ships it three weeks later because the Kotlin engineer was on a different sprint. Now your support team has two truths to maintain. Now your product analytics show a feature adoption curve that looks like a step function for reasons that have nothing to do with users.
+
+## The RN promise
+
+One codebase. JavaScript and React on top, native UI views underneath. Your existing React engineers become mobile engineers — they already know hooks, components, state, the lifecycle. You write one screen, it renders as a real `UIView` on iOS and a real `android.view.View` on Android. Not a webview. Not a wrapped Cordova mess. Real native widgets the OS knows how to lay out, animate, and accessibility-tree.
+
+The pitch is that you keep ~90% of your codebase shared, drop down to platform-specific files (`Button.ios.tsx`, `Button.android.tsx`) for the 10% that needs it, and ship to both stores from one team. Meta runs Facebook, Instagram, and Messenger on RN. Shopify rebuilt their mobile apps on it. Microsoft uses it for Office mobile and Outlook. Coinbase, Discord, Tesla, Bloomberg — the list is long enough that "is RN production-ready" is a settled question.
+
+The economic value is not subtle. A four-engineer mobile team becomes a two-engineer team, with three of them coming from your existing React org. The product moves at the speed of one codebase instead of two.
+
+## When the promise holds
+
+For most product apps, RN is the correct default in 2026. If your app is a CRUD-shaped product — lists, forms, detail screens, a feed, push notifications, deep links, an auth flow — RN gives you near-native UX with web-team economics. The performance gap that mattered in 2018 has mostly closed (we'll go into why in the next section). Users will not be able to tell your app from a Swift app, because the views _are_ the same Swift views; you just drove them from JavaScript.
+
+The strongest indicator that RN is right for you: your product roadmap is the same as your web roadmap. Same models, same screens, same business logic. RN lets you literally share TypeScript types, Zod schemas, and even some business logic between web and mobile. That's where the leverage lives.
+
+## When it doesn't
+
+RN is a leaky abstraction over native UI. The leaks show up when you push the runtime hard.
+
+- **Heavy 3D and AR.** RN can host a native ARKit/ARCore view, but you're writing native code at that point. If your app's core loop is a 3D scene (a game, a CAD tool, immersive AR), build native. Unity or Unreal if it's a game.
+- **Low-level audio and video pipelines.** Real-time audio DSP, custom video codecs, frame-accurate camera filters — RN can do them through native modules, but the integration cost approaches "we have an iOS engineer anyway."
+- **Apps that are fundamentally one platform-specific feature.** If your entire app is an Apple Watch complication or an Android home-screen widget, the cross-platform story is moot.
+
+The honest framing: RN is a cost-optimization for product apps, not a universal mobile runtime. If 80% of your screens are forms and lists and 20% need a native polish (camera, biometrics, deep OS integration), RN plus a few well-chosen native modules is the cheapest path to a good app. If 50% of your app is below the UI layer, native is probably cheaper end-to-end despite the team cost.
+
+<Callout kind="why">
+  RN's economic argument is that one React team can ship two platforms with one codebase. That holds for the vast majority of product apps in 2026, and Expo (the next section) has made it dramatically easier to start. It doesn't hold for graphics-heavy, hardware-heavy, or single-platform-specialized apps. Match the runtime to the workload.
+</Callout>
+
+## What you should be reading for, in this module
+
+You know React. The skills that transfer cleanly are: components, hooks, state management (Zustand, Tanstack Query), TypeScript, async/await, error boundaries, the testing mindset. The skills you have to build new are: the threading model (JS thread vs UI thread vs native thread), the navigation primitives (no `<a>` tag, no URL bar), the build and submit pipeline (EAS), the over-the-air (OTA) update story, and the production gotchas around app store review.
+
+The rest of this module gets you to the point where you can join a mobile team mid-quarter, read their codebase, and not embarrass yourself in code review by week two.
+
+<Reading url="https://reactnative.dev/docs/the-new-architecture/landing-page" title="React Native — The New Architecture" kind="docs" minutes={10} />
+<Reading url="https://docs.expo.dev/" title="Expo Documentation — Get Started" kind="docs" minutes={8} />
+<Reading url="https://engineering.fb.com/2022/05/11/android/static-analysis-meta-android-apps/" title="Meta Engineering — How Meta uses RN at scale" kind="blog" minutes={12} />
+
+**Remember this:** RN buys you a 2x engineering multiplier on mobile by sharing the React layer across iOS and Android. Pick it when your app is product-shaped (lists, forms, feeds, auth). Pick native when your app is engine-shaped (3D, real-time media, deep OS integration).

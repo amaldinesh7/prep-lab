@@ -1,0 +1,34 @@
+---
+title: Cheatsheet
+---
+
+<SectionHeader kind="cheatsheet" number={9} title="Cheatsheet" />
+
+Keep this open the first month on a React Native team.
+
+<Cheatsheet rows={[
+  { k: "Start a new app", v: "npx create-expo-app@latest my-app --template default" },
+  { k: "JS engine (default)", v: "Hermes — precompiled bytecode, fast cold start, low memory" },
+  { k: "New architecture", v: "Fabric (renderer) + TurboModules (native APIs) + JSI (C++ layer) + Hermes" },
+  { k: "Navigation (file-based)", v: "Expo Router — files in app/ become routes; uses React Navigation under the hood" },
+  { k: "Navigation (imperative)", v: "React Navigation — createNativeStackNavigator + createBottomTabNavigator" },
+  { k: "Build & Submit", v: "eas build --platform all && eas submit --platform all" },
+  { k: "OTA update", v: "eas update --branch production --message \"fix: ...\" (JS + assets only, NEVER native code)" },
+  { k: "Camera / Location", v: "expo-camera, expo-location (or react-native-vision-camera for high-perf)" },
+  { k: "Image (with caching)", v: "expo-image — replaces built-in Image; SDWebImage on iOS, Glide on Android" },
+  { k: "Animations", v: "react-native-reanimated 3 — useSharedValue + useAnimatedStyle worklets on UI thread" },
+  { k: "Gestures", v: "react-native-gesture-handler — runs gesture detection on the UI thread" },
+  { k: "Lists (heavy)", v: "@shopify/flash-list — drop-in FlatList replacement for large or heterogeneous lists" },
+  { k: "Storage (secrets)", v: "expo-secure-store (Keychain on iOS, Keystore on Android)" },
+  { k: "Storage (fast KV)", v: "react-native-mmkv (Marc Rousavy) — synchronous, fastest available" },
+  { k: "Native module (write)", v: "Expo Modules API — Swift + Kotlin + TypeScript spec; Codegen generates typed bindings" },
+  { k: "State management", v: "Zustand + Tanstack Query — same patterns as web; share TS types across web and mobile" },
+  { k: "Styling", v: "StyleSheet.create({}) (built-in) OR NativeWind (Tailwind classes compiled to RN styles)" },
+  { k: "Deep linking", v: "Set \"scheme\" in app.json; Expo Router resolves URL paths to file routes automatically" },
+  { k: "Privacy manifest (iOS)", v: "PrivacyInfo.xcprivacy — required for App Store; Expo modules ship them" },
+  { k: "Target SDK (Android)", v: "Bumps annually; stay on current Expo SDK to keep up; API 35 floor in 2026" },
+  { k: "Runtime version (OTA)", v: "runtimeVersion: { policy: \"appVersion\" } — ensures OTA only ships to compatible binaries" },
+  { k: "Devtools", v: "react-native-devtools (RN 0.76+) OR Flipper (deprecated) OR Chrome DevTools via Hermes inspector" }
+]} />
+
+**Remember this:** Default stack in 2026 is Expo + Expo Router + Reanimated 3 + EAS. Most of what RN got wrong before 2023 has been fixed. The ecosystem now has a clear best-in-class choice for almost every category — when in doubt, pick the Expo first-party answer, then the Software Mansion / Shopify community answer, then write your own.

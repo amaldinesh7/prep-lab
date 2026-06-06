@@ -1,0 +1,184 @@
+---
+title: Production gotchas
+---
+
+<SectionHeader kind="gotcha" number={7} title="Production gotchas" />
+
+The first six months on a React Native (RN) team are mostly about discovering the gotchas. They're not bugs in the framework — they're the consequences of "JavaScript driving two native platforms." Each of these has eaten at least one of an engineer's afternoons at every mobile-shipping team. Knowing them in advance saves you that afternoon.
+
+## 1. iOS submission: privacy manifest + ATT
+
+Apple introduced **Privacy Manifests** as a hard requirement in May 2024. Every app and every third-party SDK ships a `PrivacyInfo.xcprivacy` file declaring what data types it collects, what tracking it does, and which "required reason APIs" it uses (file timestamps, user defaults, system boot time, disk space — each must be justified with a reason code from Apple's enumeration).
+
+What goes wrong:
+
+- A library you depend on doesn't have a privacy manifest. Your submission gets rejected with a vague "missing privacy manifest" error pointing at a transitive dep.
+- You use `UserDefaults` via a community library and didn't realize it needs a "required reason." Submission rejected.
+- The manifest you generated doesn't match the data you actually collect. App Store Review catches the mismatch; rejection.
+
+The fix: Expo handles most of this for first-party Expo modules — they ship manifests. For your own code, run `npx expo-doctor` and `expo-privacy-manifest-aggregator` (community tool) which scans your dependencies and consolidates manifests. Add it to CI.
+
+**App Tracking Transparency (ATT)** is the related prompt — "Allow [App] to track you across apps and websites owned by other companies?" — that you must show before doing any tracking. If you don't intend to track, set `NSUserTrackingUsageDescription` to nothing and don't request the permission. If you do track (most ad SDKs), `expo-tracking-transparency` is the wrapper. About 80% of users decline; build your analytics around that being normal.
+
+## 2. Android: target SDK churn
+
+Google ratchets the minimum target SDK every year. As of 2026, the floor for new submissions and app updates is API level 35 (Android 15), and the floor moves up every August. An app that hasn't been re-released in 18 months can be silently delisted.
+
+Each SDK bump comes with behavior changes that break apps subtly:
+
+- **API 31 (Android 12):** Mandatory `exported` attribute on every activity, service, and receiver. Forgot one in a library? Build fails.
+- **API 33 (Android 13):** New runtime notification permission. Apps that previously sent notifications silently now need to request `POST_NOTIFICATIONS`. Existing users won't see notifications until you re-prompt.
+- **API 34 (Android 14):** Foreground service type declarations required. Restrictions on full-screen intents.
+- **API 35 (Android 15):** Edge-to-edge by default. Predictive back gesture mandatory. Apps that hardcoded status bar insets break visually.
+
+The fix: stay on a current Expo SDK. Expo's SDK release notes call out every breaking platform change with the config plugin updates you need. Schedule a "platform upgrade week" each quarter — it's cheaper than scrambling when a release stops being accepted.
+
+## 3. Hermes-only quirks
+
+Hermes is the default JS engine. JavaScriptCore (JSC) — Apple's, which RN used for years — is still selectable but increasingly rare. The two engines mostly behave the same. The places they don't:
+
+- **`Function.prototype.toString()` returns different output.** Hermes returns a generic `function () { [bytecode] }` instead of the source. Libraries that introspect function source (some older RPC libraries, some test mocks, some serialization tools) break.
+- **`Error.stack` formatting differs.** Crash reporting tools (Sentry, Bugsnag) handle both, but custom parsers can break.
+- **Some Intl APIs are limited.** Hermes supports Intl since version 0.7 but the locale data is more restricted than V8/JSC. Number formatting in obscure locales can differ.
+- **`Proxy` is supported but slower than V8.** Heavy use of `Proxy` (some state libraries) is more expensive on Hermes. MobX's older proxies, some immer paths, were notably slow.
+- **Date parsing of non-standard strings is stricter.** `new Date("2024-01-15 10:00:00")` (space instead of T) works on V8/JSC and fails on Hermes. Use ISO 8601.
+
+If you hit a "works in dev tools but not on device" bug, suspect Hermes parsing differences first. The Hermes team maintains a compatibility doc that calls these out explicitly.
+
+## 4. OTA updates: what you can and can't ship
+
+EAS Update (the OTA mechanism) ships JS bundles and assets. Useful mental model: anything in your `node_modules` JavaScript and anything in `assets/` is in scope. Anything that requires a native rebuild is not.
+
+You **can** ship via OTA:
+
+- TypeScript and JavaScript changes
+- New components, new screens, refactors
+- Asset changes (images, fonts, JSON data files)
+- Changes to logic, copy, styles, business rules
+- Bumps to JS-only dependencies
+
+You **cannot** ship via OTA:
+
+- New native modules (`expo install some-new-native-package` requires a new build)
+- Changes to `app.json` that affect the native shell (new permissions, new URL schemes, new bundle identifiers)
+- New entries in iOS Info.plist or Android Manifest
+- Changes to Expo SDK version
+- Native code changes in your own modules
+
+The trap: a contributor adds `expo-haptics`, ships it via OTA, and users without the new native build crash on first haptic. Expo's "runtime version" / "fingerprint" system prevents this — bundles only ship to compatible binaries — but only if it's configured. Always set `runtimeVersion: { policy: "appVersion" }` (or `"fingerprint"`) in `app.json` so EAS Update enforces compatibility.
+
+The other trap: you can't roll back fast if you ship a broken OTA. EAS Update has a "rollback" mechanism, but the user has to relaunch the app to pick up the rolled-back bundle. Test OTA updates on a preview channel before promoting to production.
+
+## 5. `FlatList` and `key` extractors
+
+`FlatList` is the recycling list view. It's fine for thousands of items if you use it correctly. The single most common production bug:
+
+- Forgetting `keyExtractor`, falling back to index-based keys
+- Keys that aren't stable (random IDs generated in `renderItem`)
+- Items that mutate identity on every render
+
+The symptoms: scrolling jank, memory growth on long sessions, wrong items showing after a refresh, animations playing on the wrong row. The fix:
+
+<Code lang="tsx">{`<FlatList
+  data={items}
+  keyExtractor={(item) => item.id}     // Stable, unique
+  renderItem={({ item }) => <Row item={item} />}
+  // memoize Row so it doesn't re-render when its props are identity-stable
+  removeClippedSubviews                // Native unmount of offscreen rows
+  windowSize={5}                       // Default 21; lower for memory
+  maxToRenderPerBatch={10}
+  initialNumToRender={10}
+/>`}</Code>
+
+For lists over a few thousand items, switch to **FlashList** (from Shopify). It uses a different recycler model that's dramatically faster for heterogeneous content and large lists. Drop-in replacement most of the time.
+
+## 6. Image caching: don't use the default
+
+The built-in `react-native` `Image` component is naive. It caches one resolution per URL, doesn't share decoded bitmaps across mounts, and has no built-in disk-cache controls. Heavy image-driven apps (feeds, marketplaces, image galleries) see real memory pressure.
+
+`expo-image` is the answer. Drop-in replacement, built on SDWebImage (iOS) and Glide (Android). Disk + memory cache, content-fit modes, placeholder support, transitions, decoded bitmap sharing.
+
+<Code lang="tsx">{`import { Image } from "expo-image";
+
+<Image
+  source={{ uri: "https://example.com/avatar.jpg" }}
+  style={{ width: 64, height: 64, borderRadius: 32 }}
+  contentFit="cover"
+  transition={200}
+  placeholder={{ blurhash: "L6PZfSi_.AyE_3t7t7R**0o#DgR4" }}
+  cachePolicy="memory-disk"
+/>`}</Code>
+
+Tactical: when you join a team and the app feels janky on the feed, check whether they're using built-in `Image` or `expo-image`. Migration is usually a find-replace.
+
+## 7. Bundle size: lodash and the no-tree-shaking trap
+
+The JS bundle ships in your binary. Hermes compiles it to bytecode, but the bytecode size scales with the JS source size. Bigger bundle = slower cold start, larger download, more parse time on devices that don't have warm bytecode cache.
+
+The classic offenders:
+
+- **`lodash` (the full import).** `import _ from 'lodash'` pulls 70KB of code. Even with Metro's tree-shaking, default lodash imports don't shake well. Use `lodash-es` and named imports, or just `import debounce from 'lodash/debounce'`. Better: use native ES methods or a single-purpose library.
+- **Moment.js.** Deprecated, but still in old codebases. Pulls all locales by default. Replace with `date-fns` (tree-shakeable) or `dayjs` (smaller, ESM-friendly).
+- **The full Firebase JS SDK.** Use `@react-native-firebase/*` modular imports.
+- **Polyfills.** RN ships with most modern JS built-in. `core-js` polyfills are almost never needed; sometimes a transitive dep pulls them in. Audit.
+
+The fix: run `npx expo-doctor` for warnings, run `npx react-native-bundle-visualizer` (or Expo's `EXPO_PROFILE=1` mode) to see what's in your bundle. Bundle size discipline is a quarterly exercise, not a one-time fix.
+
+## 8. Memory leaks from unsubscribed listeners
+
+Every team has a story about an event listener that wasn't removed. The classic shapes:
+
+- `Keyboard.addListener` without the symmetric `remove()`
+- `AppState.addEventListener` from a component that's unmounted
+- `NetInfo.addEventListener` left dangling
+- `BackHandler.addEventListener` (Android) accumulating handlers on every screen mount
+
+Modern APIs return a subscription object with `.remove()`. Always store the return value in a `useEffect` cleanup:
+
+<Code lang="tsx">{`useEffect(() => {
+  const sub = AppState.addEventListener("change", handleAppStateChange);
+  return () => sub.remove();
+}, []);`}</Code>
+
+The symptoms accumulate slowly: memory creeps up over hours of use, then OS kills the app in the background, push notifications stop arriving until next launch.
+
+## 9. Reanimated worklets: scope is not what you expect
+
+Reanimated worklets run on the UI thread, in a separate JS runtime. They cannot reference values from the main JS thread directly — only through `useSharedValue` or by closing over primitives at worklet creation time.
+
+The common bug:
+
+<Code lang="tsx">{`function Card({ items }) {
+  const x = useSharedValue(0);
+
+  const animatedStyle = useAnimatedStyle(() => {
+    // BUG: \`items\` is captured at worklet creation. Subsequent changes
+    // to \`items\` don't propagate to the worklet without explicit signaling.
+    return { transform: [{ translateX: x.value * items.length }] };
+  });
+  // ...
+}`}</Code>
+
+If `items.length` changes, the worklet still sees the old value. The fix: capture into a shared value, or use `useDerivedValue` to bridge JS state into worklet scope. The Reanimated docs cover this under "JS to UI thread communication."
+
+## 10. Build environments that drift
+
+EAS Build is reproducible because Expo pins the build image. Bare workflows (where `ios/` and `android/` are in your repo) drift faster. Common shapes of "works on my machine":
+
+- iOS: a contributor has Xcode 16.2, the build machine has 16.1. CocoaPods generates a slightly different `Podfile.lock`. Builds fail in CI but pass locally.
+- Android: Gradle JVM args, NDK versions, Java versions. The Gradle wrapper helps but doesn't pin everything.
+- Node version drift between team members.
+
+The fix: pin `node`, `pnpm`/`npm`, `ruby`, `cocoapods`, `java`, `xcode` versions in a `.tool-versions` or equivalent. EAS Build pins them via `eas.json`'s `build.production.node` and friends. Match local to EAS.
+
+<Callout kind="gotcha">
+  The single worst category of gotcha: shipping native changes through OTA. EAS Update only ships JS and assets. If you add a new native module, change a permission, or update Expo SDK, you need a new native build. Configure `runtimeVersion` so EAS Update enforces this for you — without it, you can ship an OTA bundle that calls APIs the installed binary doesn't have, and your users crash on launch.
+</Callout>
+
+<Reading url="https://docs.expo.dev/guides/apple-privacy/" title="Expo — Apple Privacy Manifests" kind="docs" minutes={8} />
+<Reading url="https://docs.expo.dev/eas-update/runtime-versions/" title="EAS Update — Runtime Versions" kind="docs" minutes={6} />
+<Reading url="https://docs.expo.dev/develop/user-interface/images/" title="Expo — Image and expo-image" kind="docs" minutes={6} />
+<Reading url="https://shopify.github.io/flash-list/docs/" title="FlashList — Shopify" kind="docs" minutes={8} />
+<Reading url="https://docs.swmansion.com/react-native-reanimated/docs/guides/worklets/" title="Reanimated — Worklets and JS communication" kind="docs" minutes={8} />
+
+**Remember this:** The gotchas are not bugs — they're the consequences of one JS codebase driving two native platforms. Privacy manifests, Android SDK churn, OTA scope, `keyExtractor`, `expo-image`, lodash, listener cleanup, worklet scope, pinned build envs. Each costs an afternoon the first time and ten minutes thereafter.

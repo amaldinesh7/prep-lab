@@ -1,0 +1,259 @@
+---
+title: Navigation primer
+---
+
+<SectionHeader kind="concept" number={4} title="Navigation primer" />
+
+Web routing is solved: there's a URL, you click a link, the URL changes, the right component renders. Mobile has no URL bar. There's no `<a href>`. The user's mental model is a stack of screens they pushed onto and popped off. Navigation in React Native (RN) is a different primitive, and it's the part of the framework you're most likely to spend a week being mildly confused by.
+
+## The two players
+
+**React Navigation** is the de facto standard. Battle-tested, used in essentially every RN app from 2018 onward. Maintained by the Expo team since 2021. Imperative API — you define navigators as JSX trees, push and pop screens via a `navigation` object.
+
+**Expo Router** is the newer file-based router. Built on top of React Navigation (the navigators are the same), but the surface API is the file system, like Tanstack Router or Next.js App Router. Default for new Expo apps. Compatible with React Navigation primitives — you can use any React Navigation library inside Expo Router.
+
+In a brownfield 2026 codebase: if the app was started after mid-2023, it's probably Expo Router. If older, it's React Navigation directly. The mental model is the same; the addressing scheme differs.
+
+## The three navigator types
+
+Whichever surface you use, you compose the same three primitives.
+
+**Stack navigator.** A LIFO stack of screens. Push a new screen on top, pop it off to go back. This is what you use for drill-downs (list → detail), modals, multi-step flows. The iOS slide-in-from-right and Android shared-axis transitions come from this.
+
+**Tab navigator.** A flat set of sibling screens shown at the bottom (or top) of the screen. Each tab usually contains its own stack — you can drill in within a tab, switch tabs, come back, and your drill-in is preserved. This is the structure of Instagram, Twitter, your bank app, basically every consumer app.
+
+**Drawer navigator.** A side panel that slides in. Less common on mobile (it's an Android pattern more than iOS), but used for top-level navigation in apps with many sections.
+
+These compose. The most common shape: a root tab navigator with three to five tabs, each tab containing a stack navigator, with the root level also containing a modal stack for full-screen flows (auth, onboarding, settings).
+
+## `react-native-screens`: use it
+
+There's a low-level detail that matters. By default, React Navigation renders all screens as plain RN `<View>` components — the stack is a JS-managed list of views. `react-native-screens` swaps in native navigation containers (UINavigationController on iOS, FragmentManager on Android). Suddenly the back gesture is OS-native, the transitions are OS-native, memory is reclaimed when screens leave the stack, and the navigation bar is rendered by the platform.
+
+Expo Router enables `react-native-screens` by default. Plain React Navigation requires you to install and enable it. If you join an app that feels "almost native but not quite," 70% of the time the missing piece is `react-native-screens`. Check first.
+
+## Code: minimal Expo Router setup
+
+The file-based version. Your `app/` directory:
+
+```
+app/
+  _layout.tsx           # Root layout
+  (tabs)/               # Tab group (parens = no URL segment)
+    _layout.tsx         # Tab bar definition
+    index.tsx           # The Home tab → "/"
+    feed.tsx            # The Feed tab → "/feed"
+    profile.tsx         # The Profile tab → "/profile"
+  posts/
+    [id].tsx            # Dynamic route → "/posts/:id"
+  +not-found.tsx        # Fallback for unmatched routes
+```
+
+The root layout:
+
+<Code lang="tsx" file="app/_layout.tsx">{`import { Stack } from "expo-router";
+
+export default function RootLayout() {
+  // Stack at the root level — child routes push onto this stack.
+  // The (tabs) group renders here as the first screen.
+  return (
+    <Stack>
+      <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+      <Stack.Screen name="posts/[id]" options={{ title: "Post" }} />
+    </Stack>
+  );
+}`}</Code>
+
+The tab layout:
+
+<Code lang="tsx" file="app/(tabs)/_layout.tsx">{`import { Tabs } from "expo-router";
+import { Home, Rss, User } from "lucide-react-native";
+
+export default function TabsLayout() {
+  return (
+    <Tabs screenOptions={{ tabBarActiveTintColor: "#0a84ff" }}>
+      <Tabs.Screen
+        name="index"
+        options={{ title: "Home", tabBarIcon: ({ color }) => <Home color={color} /> }}
+      />
+      <Tabs.Screen
+        name="feed"
+        options={{ title: "Feed", tabBarIcon: ({ color }) => <Rss color={color} /> }}
+      />
+      <Tabs.Screen
+        name="profile"
+        options={{ title: "Profile", tabBarIcon: ({ color }) => <User color={color} /> }}
+      />
+    </Tabs>
+  );
+}`}</Code>
+
+A screen that links and pushes:
+
+<Code lang="tsx" file="app/(tabs)/feed.tsx">{`import { View, Text, FlatList, Pressable } from "react-native";
+import { Link, router } from "expo-router";
+
+const posts = [
+  { id: "1", title: "RN's new architecture" },
+  { id: "2", title: "Expo Router intro" },
+];
+
+export default function Feed() {
+  return (
+    <FlatList
+      data={posts}
+      keyExtractor={(p) => p.id}
+      renderItem={({ item }) => (
+        // Declarative: <Link> resolves to a route.
+        <Link href={\`/posts/\${item.id}\`} asChild>
+          <Pressable>
+            <Text>{item.title}</Text>
+          </Pressable>
+        </Link>
+      )}
+    />
+  );
+}
+
+// Imperative navigation:
+// router.push("/posts/123")
+// router.replace("/login")
+// router.back()`}</Code>
+
+A dynamic route reading its params:
+
+<Code lang="tsx" file="app/posts/[id].tsx">{`import { useLocalSearchParams } from "expo-router";
+import { View, Text } from "react-native";
+
+export default function Post() {
+  // \`id\` matches the file name [id].tsx
+  const { id } = useLocalSearchParams<{ id: string }>();
+  return (
+    <View>
+      <Text>Post {id}</Text>
+    </View>
+  );
+}`}</Code>
+
+The whole flow: file system defines routes, `<Link>` and `router.push()` navigate, `useLocalSearchParams` reads params. If you've used Next.js App Router or Tanstack Router with file-based routing, the muscle memory transfers cleanly.
+
+## Code: the React Navigation equivalent
+
+For comparison, the same shape in plain React Navigation (no Expo Router):
+
+<Code lang="tsx" file="App.tsx">{`import { NavigationContainer } from "@react-navigation/native";
+import { createNativeStackNavigator } from "@react-navigation/native-stack";
+import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
+
+// Typed route params — the source of compile-time route safety.
+type TabParamList = {
+  Home: undefined;
+  Feed: undefined;
+  Profile: undefined;
+};
+
+type RootStackParamList = {
+  Tabs: undefined;
+  Post: { id: string };
+};
+
+const Tab = createBottomTabNavigator<TabParamList>();
+const Stack = createNativeStackNavigator<RootStackParamList>();
+
+function Tabs() {
+  return (
+    <Tab.Navigator>
+      <Tab.Screen name="Home" component={HomeScreen} />
+      <Tab.Screen name="Feed" component={FeedScreen} />
+      <Tab.Screen name="Profile" component={ProfileScreen} />
+    </Tab.Navigator>
+  );
+}
+
+export default function App() {
+  return (
+    <NavigationContainer>
+      <Stack.Navigator>
+        <Stack.Screen name="Tabs" component={Tabs} options={{ headerShown: false }} />
+        <Stack.Screen name="Post" component={PostScreen} />
+      </Stack.Navigator>
+    </NavigationContainer>
+  );
+}`}</Code>
+
+To push and read params:
+
+<Code lang="tsx" file="screens/FeedScreen.tsx">{`import type { NativeStackScreenProps } from "@react-navigation/native-stack";
+
+type Props = NativeStackScreenProps<RootStackParamList, "Post">;
+
+function PostScreen({ route, navigation }: Props) {
+  const { id } = route.params;  // typed: string
+  return <Text>Post {id}</Text>;
+}
+
+function FeedScreen({ navigation }: NativeStackScreenProps<RootStackParamList, "Feed">) {
+  return (
+    <Button
+      title="Open post 1"
+      onPress={() => navigation.navigate("Post", { id: "1" })}
+    />
+  );
+}`}</Code>
+
+Imperative, typed via generic parameters on the navigator. Works fine. The Expo Router version is more concise once you have more than five screens.
+
+## Deep linking
+
+A user taps a link in Slack: `myapp://posts/42` or `https://myapp.com/posts/42`. You want them to land on the right screen. This is deep linking.
+
+In Expo Router, **deep linking just works** — the URL path matches the file path. `myapp://posts/42` resolves to `app/posts/[id].tsx` with `id="42"`. You configure the scheme in `app.json`:
+
+<Code lang="json" file="app.json">{`{
+  "expo": {
+    "scheme": "myapp",
+    "ios": {
+      "associatedDomains": ["applinks:myapp.com"]
+    },
+    "android": {
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "data": { "scheme": "https", "host": "myapp.com" },
+          "category": ["BROWSABLE", "DEFAULT"],
+          "autoVerify": true
+        }
+      ]
+    }
+  }
+}`}</Code>
+
+`expo-linking` provides utilities (`Linking.openURL`, `Linking.createURL`) for generating and opening URLs. Universal Links (iOS) and App Links (Android) — the "open in app instead of browser" feature — require server-side files (`apple-app-site-association`, `assetlinks.json`) at well-known URLs on your domain.
+
+In React Navigation without Expo Router, you pass a `linking` config to `NavigationContainer` that maps URLs to navigator paths manually. This is the kind of thing that's easy to get subtly wrong; Expo Router handles it automatically.
+
+## Typed navigation params
+
+Both routers support typed params; the ergonomics differ.
+
+**React Navigation:** declare param types per navigator, pass as generics. Reasonably good, but you maintain the type map by hand. A renamed screen doesn't break typecheck until you've updated every `ParamList` definition that references it.
+
+**Expo Router:** typed routes are an opt-in via the `experiments.typedRoutes: true` flag in `app.json`. With it on, Expo Router generates a `.expo/types/router.d.ts` that gives you autocompletion on `<Link href="/posts/[id]">` and type-checked `router.push()` calls. Renaming a route file produces compile errors at every consumer. Behaves the same way Tanstack Router's codegen does on web.
+
+Turn it on. The compile-time guarantee is worth the small added build step.
+
+## Practical advice
+
+Once you understand stack + tab + drawer, 90% of mobile navigation is composition of those. The things that bite people:
+
+- **Don't put `<NavigationContainer>` inside another `<NavigationContainer>`.** React Navigation will warn you. Expo Router prevents it.
+- **Always specify `headerShown: false` on the outer screen when nesting navigators**, otherwise you get two stacked headers.
+- **Auth gating** — the pattern is to render different navigator trees based on auth state, not to navigate "away" from a protected route. Conditional in `_layout.tsx`.
+- **Modals** are stack screens with `presentation: "modal"`. Don't reach for `<Modal>` (the RN built-in) for routed modals; it doesn't integrate with the back stack.
+
+<Reading url="https://docs.expo.dev/router/introduction/" title="Expo Router — Introduction" kind="docs" minutes={8} />
+<Reading url="https://reactnavigation.org/docs/getting-started/" title="React Navigation — Getting Started" kind="docs" minutes={10} />
+<Reading url="https://docs.expo.dev/linking/overview/" title="Expo — Linking and Deep Linking" kind="docs" minutes={8} />
+<Reading url="https://docs.expo.dev/router/reference/typed-routes/" title="Expo Router — Typed Routes" kind="docs" minutes={6} />
+
+**Remember this:** Stack + Tab + Drawer compose into every mobile app. Expo Router is file-based; React Navigation is imperative; they share the same primitives under the hood. Enable `react-native-screens` (Expo Router does it for you) for native-feeling transitions. Typed routes catch broken links at compile time.

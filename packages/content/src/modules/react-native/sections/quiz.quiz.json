@@ -1,0 +1,64 @@
+{
+  "questions": [
+    {
+      "id": "q1",
+      "prompt": "In React Native's new architecture, what replaces the old asynchronous JSON-message bridge between JavaScript and native code?",
+      "options": [
+        { "id": "a", "label": "WebSockets between the JS and native processes" },
+        { "id": "b", "label": "JSI (JavaScript Interface) — a C++ layer that allows synchronous, typed JS-to-native calls" },
+        { "id": "c", "label": "gRPC over Unix domain sockets" },
+        { "id": "d", "label": "A shared SQLite database used as a message queue" }
+      ],
+      "correct": "b",
+      "explanation": "JSI is the C++ abstraction that replaces the bridge. JS holds direct references to native C++ objects and calls them synchronously, in the same thread, with no JSON serialization. Fabric (renderer) and TurboModules (native APIs) both build on top of JSI."
+    },
+    {
+      "id": "q2",
+      "prompt": "What is the default JavaScript engine in modern React Native?",
+      "options": [
+        { "id": "a", "label": "V8" },
+        { "id": "b", "label": "JavaScriptCore (JSC)" },
+        { "id": "c", "label": "Hermes" },
+        { "id": "d", "label": "SpiderMonkey" }
+      ],
+      "correct": "c",
+      "explanation": "Hermes is the default since RN 0.70. Built by Meta specifically for mobile — precompiled bytecode shipped in the bundle (fast startup), low memory floor, small binary contribution. JSC is still selectable but rare in 2026."
+    },
+    {
+      "id": "q3",
+      "prompt": "What is the default workflow for starting a new React Native app in 2026?",
+      "options": [
+        { "id": "a", "label": "npx react-native init (bare workflow, native folders checked into the repo)" },
+        { "id": "b", "label": "Expo (managed workflow) with EAS Build / Submit / Update" },
+        { "id": "c", "label": "Cordova with the React plugin" },
+        { "id": "d", "label": "Ignite CLI for the Infinite Red template" }
+      ],
+      "correct": "b",
+      "explanation": "`npx create-expo-app` plus EAS is the default in 2026. Managed workflow means no `ios/`/`android/` folders in your repo — they're regenerated from `app.json` and your installed Expo modules. Bare workflow is the escape hatch for specific vendor SDKs."
+    },
+    {
+      "id": "q4",
+      "prompt": "What can you ship to existing installs via EAS Update (over-the-air, OTA) without going through app store review?",
+      "options": [
+        { "id": "a", "label": "Any change — JS, native code, new permissions, new SDK versions" },
+        { "id": "b", "label": "Only the JavaScript bundle and assets (images, fonts, JSON) — never native code changes" },
+        { "id": "c", "label": "Only configuration changes in app.json" },
+        { "id": "d", "label": "Only changes to existing screens, not new screens" }
+      ],
+      "correct": "b",
+      "explanation": "OTA ships only the JS bundle and assets. New native modules, new permissions, new URL schemes, new Info.plist entries, and Expo SDK upgrades all require a new native build and a fresh app store submission. Setting `runtimeVersion` enforces compatibility so users don't get a JS bundle that calls APIs their installed binary lacks."
+    },
+    {
+      "id": "q5",
+      "prompt": "What's the canonical way to run an animation on the native UI thread in modern React Native, without going through the JS thread on every frame?",
+      "options": [
+        { "id": "a", "label": "Use the built-in Animated API with useNativeDriver: true for every animation" },
+        { "id": "b", "label": "Use Reanimated 3 worklets — JS functions that run on a separate UI-thread JS runtime via useSharedValue and useAnimatedStyle" },
+        { "id": "c", "label": "Drop into native and write the animation in Swift / Kotlin directly" },
+        { "id": "d", "label": "Use requestAnimationFrame inside useEffect on the main JS thread" }
+      ],
+      "correct": "b",
+      "explanation": "Reanimated 3 is the production answer. Worklets are JS functions the library serializes and runs on a second Hermes runtime on the UI thread. Gesture handler events and animation updates never touch the main JS thread, so 60-120 fps animations are stable under JS-side load. The old `useNativeDriver: true` only covers a subset of properties; worklets are the general solution."
+    }
+  ]
+}
