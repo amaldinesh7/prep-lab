@@ -1,0 +1,98 @@
+---
+title: Tradeoffs vs alternatives
+---
+
+<SectionHeader kind="tradeoff" number={7} title="Tradeoffs vs the alternatives" />
+
+You don't pick a sync engine in a vacuum. You pick it against four other answers your team will reasonably propose: "just use Tanstack Query with WebSockets," "Firebase," "stick CRDTs in front of a normal API," and "you don't need this." Each is the right answer for some product. Here's how to know which.
+
+## vs Tanstack Query + WebSocket
+
+This is the most common alternative because it's the cheapest. The architecture: Tanstack Query for caching and refetch, a WebSocket that pushes "invalidate key X" messages, optimistic updates with manual rollback.
+
+It gets you about 60% of the way to the look. What you don't get:
+
+- **Offline replay.** Tanstack Query can't queue mutations across a reload. A user closes their laptop mid-edit, opens it on the train, loses the mutation.
+- **Deterministic mutator semantics.** Your optimistic update function and your server mutation function are two different pieces of code. They drift. Bugs show up where they disagree.
+- **Rebase on diff arrival.** When a server invalidation triggers a refetch, the refetch happens in parallel with the user's local edits. If both edit the same record, the refetch overwrites the local optimistic state and the user's edit disappears. There's no rebase loop.
+- **Multi-tab consistency.** Two tabs in the same app each have their own Tanstack Query cache. They don't share state. A mutation in tab A appears in tab B only after a server round-trip — if at all.
+
+Tanstack Query + WebSocket is correct when:
+
+- The product is read-heavy and write-light (admin dashboards, analytics, monitoring).
+- "Eventual consistency in 100ms" is fine; users rarely edit the same thing concurrently.
+- Offline is not a requirement.
+
+It's incorrect when collaboration density is high. Past a certain threshold of "two users will edit the same record," you're rebuilding the rebase loop badly and you should have used a sync engine.
+
+## vs Firebase / Supabase Realtime
+
+Firebase Firestore and Supabase Realtime are managed solutions that share some DNA with sync engines: client SDKs that subscribe to documents, automatic propagation of changes. The differences matter.
+
+**Firestore.** Document-shaped data, server-side rules language for permissions, real offline support in mobile SDKs (less great on web), proprietary protocol, ties you to Google Cloud. Mutator semantics are weak — you write directly to documents, conflicts are last-write-wins per field. Works well for chat-shaped products; struggles with complex relational models.
+
+**Supabase Realtime.** Postgres LISTEN/NOTIFY over WebSocket, basically. You get pushed row changes for tables you subscribe to. There is no mutator + rebase model; it's a notification firehose with a client cache helper. Comparable in spirit to Tanstack Query + WebSocket, with the WebSocket part standardized.
+
+Where these win:
+
+- You want a managed backend with auth + DB + realtime in one bundle.
+- You're at the prototype stage and "good enough" beats "right."
+- You can live with the vendor lock-in.
+
+Where they lose:
+
+- **Migration is painful.** Firestore's data shape is hard to leave; Supabase Realtime's coupling to row events is hard to mock for tests.
+- **No real reconciliation.** Conflicts are last-write-wins. For collaborative editing, that's not a model — that's an absence of one.
+- **Costs scale weirdly.** Firestore charges per document read, per snapshot listener, per write. A sync engine's flat-cost server is dramatically cheaper at scale.
+
+Use Firebase/Supabase when you want managed convenience and you can live with last-write-wins. Use a sync engine when reconciliation is part of the product spec.
+
+## vs CRDTs alone
+
+Conflict-free Replicated Data Types (CRDTs) and Operational Transform (OT) are the **merge algorithms** for collaborative edits — they solve the "two users typed at the same time, now what?" problem mathematically. Yjs and Automerge are the popular libraries.
+
+A common confusion: people think CRDTs are a sync engine. They aren't. CRDTs solve **merge**. They don't solve:
+
+- The transport layer (you still need to ship updates between clients)
+- The persistence layer (you still need to write the CRDT state to disk and load it back)
+- The cache and reactivity layer (CRDT state is a binary doc; your UI wants React-friendly typed state)
+- The auth and permissions layer
+- The mutator + reconciliation contract
+
+You typically use CRDTs **inside** a sync engine for the parts of your model that need fine-grained collab — rich text, freeform documents, whiteboards. Linear, for example, uses CRDTs for issue descriptions but a more conventional mutator model for the rest of the schema. Figma's multiplayer is OT inside a custom sync layer.
+
+The right framing: **CRDTs solve merge; sync engines solve cache + transport + reconciliation.** They're complementary, not alternatives. If your product is "Google Docs," reach for both. If it's "Linear," you mostly want a sync engine and CRDTs only inside text fields.
+
+## When NOT to use a sync engine
+
+Be honest about these. A sync engine is overkill, and possibly actively bad, when:
+
+- **The domain demands server-of-truth at write time.** Banking, payments, anything where "I optimistically transferred $100" cannot be allowed to ever appear true if the server rejected it. The optimistic-by-default contract is a liability here. Use REST with strong server validation and explicit pending states.
+- **Single-user products with no collaboration.** A solo journaling app or a single-player game has no concurrent-write problem to solve. You'd be carrying weight you don't need.
+- **Read-heavy public surfaces.** Marketing pages, blog posts, content sites. Tanstack Query (or even just `fetch`) is correct. Sync engines are pointed at app shells, not content.
+- **Strict regulatory environments.** If audit logs must be the server's narrative — not the client's — the "client cache is truth" mental model creates friction with compliance. You can engineer around it (LiveStore's event log helps), but the simpler answer is often a conventional API.
+- **Team capacity.** A sync engine is a commitment. If your eng team is two people shipping a B2B SaaS to early customers, the time you'll spend on the sync infrastructure is time you're not spending on the product. Default to Tanstack Query + WebSocket until collab becomes the bottleneck.
+
+## Tradeoff axes
+
+<Cheatsheet rows={[
+  { k: "Optimistic UI quality", v: "Sync engine >> TQ+WS >> Firebase >> REST" },
+  { k: "Offline support", v: "Sync engine >> Firebase mobile > Firebase web > TQ+WS = nothing" },
+  { k: "Multi-tab consistency", v: "Sync engine native; others require BroadcastChannel hand-rolling" },
+  { k: "Conflict resolution", v: "Sync engine + CRDT > sync engine alone > Firebase (LWW) > TQ+WS" },
+  { k: "Server engineering effort", v: "Sync engine > Firebase (~0) ~= Supabase > TQ+WS = normal API" },
+  { k: "Vendor lock-in", v: "Firebase ≫ Supabase > Zero managed > Replicache/LiveStore self-host" },
+  { k: "Cost at scale", v: "Self-hosted sync engine << Firebase/Supabase managed" },
+  { k: "Time to first demo", v: "Firebase < TQ+WS < Replicache ~= Zero < custom engine" },
+]} />
+
+<Callout kind="tradeoff">
+  Sync engines beat Tanstack Query + WebSocket on offline, multi-tab, and conflict semantics — at the cost of real server engineering. They beat Firebase on lock-in, cost-at-scale, and reconciliation quality. They compose with CRDTs, not replace them. They are wrong for server-of-truth domains and single-user products. Pick the model that matches the product, not the buzzword.
+</Callout>
+
+<Reading url="https://www.inkandswitch.com/local-first/" title="Local-First Software (Ink & Switch)" kind="blog" minutes={30} />
+<Reading url="https://docs.yjs.dev/" title="Yjs — CRDT for collaborative editing" kind="docs" minutes={10} />
+<Reading url="https://www.figma.com/blog/how-figmas-multiplayer-technology-works/" title="How Figma's multiplayer works" kind="blog" minutes={12} />
+<Reading url="https://firebase.google.com/docs/firestore/data-model" title="Firestore Data Model" kind="docs" minutes={6} />
+
+**Remember this:** Sync engine for collab-heavy app shells. Tanstack Query + WebSocket for read-heavy with light writes. Firebase for managed convenience and prototypes. CRDTs inside a sync engine, not instead. REST for server-of-truth domains.

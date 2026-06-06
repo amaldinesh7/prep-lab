@@ -1,0 +1,99 @@
+---
+title: Linear — the canonical example
+---
+
+<SectionHeader kind="concept" number={3} title="Linear: the canonical example" />
+
+Linear is the product everyone points at when they want to explain what a sync engine feels like. Mutations are instant. Switching workspaces is instant. Issues that exist on someone else's screen appear on yours within milliseconds of being created. The cold start of the web app — from `linear.app` to a populated UI — is under a second on a warm cache.
+
+None of that is JavaScript performance heroics. It's the architecture. Linear's internal sync engine is the reason the product feels the way it does.
+
+## The object model
+
+Every domain entity in Linear — Issue, Project, Workspace, Cycle, Label, Comment — is a row in a typed object graph that lives on the client. The graph is persisted (IndexedDB underneath), reactive (components subscribe to the bits they render), and synchronized with the server over a delta-based protocol.
+
+The shape, roughly:
+
+<Code lang="ts" file="linear-sync-engine.sketch.ts">{`// Sketch — not actual Linear code, but the conceptual shape Artman describes.
+
+class SyncedObject {
+  id: string;
+  __updatedAt: number;
+  __version: number;     // monotonic per-row, set by server
+  __syncState: "clean" | "dirty" | "deleting";
+}
+
+class Issue extends SyncedObject {
+  title: string;
+  state: "backlog" | "todo" | "in_progress" | "done";
+  assigneeId: string | null;
+  projectId: string | null;
+  // ...
+}
+
+// The store is a typed graph of these. Components subscribe to slices.
+const issue = store.get(Issue, issueId);             // reactive
+const projectIssues = store.query(Issue, {
+  where: { projectId },
+  orderBy: { createdAt: "desc" },
+});`}</Code>
+
+A view doesn't render from a query response. It renders from the store, and the store reacts when any of the rows it returned change — locally or via a remote delta.
+
+## Mutations as typed transactions
+
+Linear's mutations are typed transactions that the engine applies optimistically and then ships to the server. The server replays them against the authoritative store. The same TypeScript types describe both sides.
+
+What makes it work in practice:
+
+- **Every row has a version.** The server stamps a monotonic version when it accepts a write. Clients trade in deltas keyed by "everything since version X."
+- **Mutations describe intent, not state diffs.** "Move issue Y to project Z" is one mutation. "Update Y.projectId to Z" would be the diff. The intent version survives concurrent edits better — two clients re-titling the same issue with the same word don't fight over a string.
+- **The model is partially replicated.** You don't get the whole company's issues on your laptop. The engine pulls the slice your active views need (a workspace, a project, a filter), holds it in IndexedDB, and lazy-loads adjacent slices as you navigate.
+
+## The cold-start trick
+
+Linear's "1-second cold start" claim is the part that sounds impossible. Here's how the architecture pays for it.
+
+On first load, the client gets a serialized snapshot of the workspace's recent state — issues, projects, members, labels. The snapshot is compact because it's a binary delta from a baseline the server keeps per-workspace, not a JSON dump. The client deserializes it into the object graph, populates IndexedDB, renders the first view.
+
+On every subsequent load, the client already has the snapshot. It opens IndexedDB, hydrates the store, renders the UI from cache, then opens a WebSocket and asks "what's new since version V?" That's the second-load story: the UI is _already on screen_ before the network speaks.
+
+Most products can't do this because their cache isn't a graph — it's an opportunistic response cache that has nothing useful to hydrate from. Linear's cache is a typed mirror of the server's schema. Hydration is just rebuilding it from disk.
+
+## What the server side looks like
+
+The Linear backend doesn't speak REST or GraphQL in the hot path. It speaks the sync protocol: clients announce "I have version V"; the server returns "here are deltas through version W"; clients send pending mutations; the server applies them, bumps versions, and emits new deltas to every other connected client subscribed to that workspace.
+
+GraphQL exists at Linear (for integrations, the public API), but the in-app data flow goes through the sync engine, not GraphQL. Two different paths for two different jobs.
+
+## Why this is hard to replicate
+
+If Linear's engine is so good, why isn't it open source and why doesn't every team ship something equivalent?
+
+**It's coupled to the schema.** The engine knows about issues, projects, cycles. Migrations require coordinated client + server + protocol changes. The object graph and the database schema are the same thing, expressed in two languages.
+
+**It's coupled to the business logic.** Permissions ("can this user see this issue?") have to evaluate inside the engine, on every delta, because the engine decides what to ship to each client. Spinning that out into a generic library means inventing a permission DSL, which is its own multi-year project.
+
+**It assumes a single product.** Linear can make schema choices that wouldn't work for a generic tool. Their issue model has a fixed shape; that lets them optimize storage, indexing, and protocol framing for it.
+
+The lesson: Linear-grade sync isn't a library you import. It's a multi-year investment in a product whose entire architecture is built around one. Replicache, Zero, and LiveStore exist to give you 80% of the feel without the multi-year part. Most products should reach for those.
+
+## What to steal even if you don't build your own
+
+Even if you never write a custom sync engine, three Linear ideas show up in every good local-first product:
+
+1. **Versioned rows.** Every entity carries a monotonic version. Diffs are cheap because the protocol can ask "what changed since V?"
+2. **Intent-based mutations.** "Move to project" beats "set projectId." Easier to merge, easier to audit.
+3. **Snapshot + delta hydration.** First-load gets a snapshot, every load after is a delta from disk. The cache is allowed to be authoritative on hydration.
+
+You'll see all three in Replicache and Zero, dressed differently.
+
+<Callout kind="pattern">
+  Linear's engine is a typed object graph mirrored client-side, with intent-based mutations and version-keyed deltas. The "instant" feel is what you get when the cache is a complete, reactive, persistent model of the server schema. Don't build your own unless the product's competitive advantage is collaboration speed — but do steal the patterns.
+</Callout>
+
+<Reading url="https://linear.app/blog/scaling-the-linear-sync-engine" title="Scaling the Linear Sync Engine" author="Tuomas Artman" kind="blog" minutes={14} />
+<Reading url="https://www.youtube.com/watch?v=Wo2m3jaJixU" title="Local-First Software: How Linear Is Built" author="Tuomas Artman" kind="video" minutes={45} />
+<Reading url="https://linear.app/blog/how-we-built-linear-issues-on-the-web" title="How We Built Linear" kind="blog" minutes={10} />
+
+**Remember this:** Linear's engine is a typed graph in IndexedDB mirrored via versioned deltas. It's deeply coupled to the schema and the business logic — that's the cost of the feel. For your team, steal the patterns; use Replicache or Zero for the plumbing.

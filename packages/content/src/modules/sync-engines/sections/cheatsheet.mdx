@@ -1,0 +1,32 @@
+---
+title: Cheatsheet
+---
+
+<SectionHeader kind="cheatsheet" number={11} title="Cheatsheet" />
+
+Keep this open the first time you wire up an engine. Half of the gotchas live in this table.
+
+<Cheatsheet rows={[
+  { k: "Mental model", v: "Cache is truth (client), mutators are typed writes, server reconciles" },
+  { k: "Mutator rule", v: "Must be deterministic — no Date.now(), no crypto.randomUUID() inside; pass them in via args" },
+  { k: "Linear approach", v: "In-house typed object graph + versioned deltas; deeply coupled to product schema and permissions" },
+  { k: "Replicache", v: "Client KV store + you implement /push and /pull; mature, BYO server" },
+  { k: "Zero (Rocicorp)", v: "Next-gen Rocicorp engine: query subscriptions on materialized view, permissions in schema" },
+  { k: "LiveStore", v: "Event log as truth + SQLite (WASM) as materialized cache; great for audit/append-only domains" },
+  { k: "Reconciliation algorithm", v: "Pull server diff → apply → drop confirmed pending mutations → replay still-pending on top → push acknowledged" },
+  { k: "Transport pattern", v: "HTTP /pull (payload) + WebSocket 'poke' (doorbell). Don't ship the diff over the WS itself" },
+  { k: "Offline behaviour", v: "Mutations queue locally, UI updates immediately, server flush + rebase on reconnect" },
+  { k: "Multi-tab", v: "All three engines share state via BroadcastChannel or shared worker — don't reimplement" },
+  { k: "Auth on logout", v: "rep.close() + Replicache.dropAllDatabases() (or scoped name change). The cache outlives the session otherwise" },
+  { k: "Schema migration", v: "Bake a version into the cache name (e.g. user-{id}-v{N}); bump on breaking changes; GC old IDBs later" },
+  { k: "Permissions", v: "Replicache: hand-rolled in /pull and mutator validators. Zero: declarative in schema. LiveStore: in sync backend" },
+  { k: "Cold-start payload", v: "Lazy slices + a cached binary snapshot endpoint. Measure; >2s is a UX problem" },
+  { k: "Common failure", v: "Forgot to wipe cache on logout → next user briefly sees previous user's data" },
+  { k: "When NOT to use", v: "Server-of-truth domains (banking, payments), single-user products, public read-heavy surfaces" },
+  { k: "CRDTs vs sync engines", v: "CRDTs solve merge. Sync engines solve cache + transport + reconciliation. Use both for rich text inside a sync app" },
+  { k: "Default in 2026", v: "Replicache for revenue-bearing. Zero if greenfield + query-heavy. LiveStore if event-sourcing earns its keep" },
+  { k: "Don't build your own", v: "Unless collaboration speed IS the product and you have a multi-year sync team (Linear scale)" },
+  { k: "Server effort floor", v: "Plan a senior engineer-week for a solid first version; weeks more for production polish" }
+]} />
+
+**Remember this:** Cache + mutators + reconciliation. Deterministic mutators. Wipe cache on logout. Version your schema in the cache name. Use Replicache today; watch Zero.

@@ -1,0 +1,150 @@
+---
+title: Production gotchas
+---
+
+<SectionHeader kind="gotcha" number={8} title="Production gotchas" />
+
+Every team that ships a sync engine into production hits these. They're not bugs in the engine — they're consequences of the architecture. Knowing them up front saves a sprint each.
+
+## 1. Schema migration when client caches diverge
+
+The hardest problem in this space. The server's schema can be migrated atomically (one ALTER, one deploy). The clients' caches cannot — they're on phones, tablets, browser tabs left open over a weekend, all running whatever version of your app was current when they last loaded.
+
+The two strategies that actually work:
+
+**Schema versioning in the cache name.** Replicache's `name` parameter, Zero's schema versioning, LiveStore's store ID — all let you bake a version into the cache identity. When you ship a breaking change, bump the version. Old clients keep their old cache (and start a new one for the new version); new clients only ever see the new schema.
+
+<Code lang="ts" file="rep.ts">{`export const rep = new Replicache<Mutators>({
+  name: \`user-\${userID}-v\${SCHEMA_VERSION}\`,    // SCHEMA_VERSION bumps on breaking changes
+  licenseKey: import.meta.env.VITE_REPLICACHE_LICENSE,
+  mutators,
+  pushURL: "/api/replicache/push",
+  pullURL: "/api/replicache/pull",
+});`}</Code>
+
+The cost: old cache data is orphaned in IndexedDB until you garbage-collect. A nightly cleanup job in the client that drops old-version stores is worth writing.
+
+**Materializer-replay (LiveStore).** Because events are the source of truth, you can change the schema and re-derive the SQLite tables from the log. Bumps the cold-start cost on the affected clients but keeps history intact.
+
+What does **not** work: trying to migrate a live cache in-place across breaking changes. The race conditions are endless.
+
+## 2. Auth handoff and cache outliving sessions
+
+The local cache survives logout if you don't kill it. Three failure modes:
+
+- **User A logs out, user B logs in on the same device.** B briefly sees A's data before the first pull lands. Worse, if B's tenancy differs, B sees data they should never have access to.
+- **A user's session expires while pending mutations queue up.** The engine retries the push forever, getting 401 every time. Eventually the user notices their writes haven't synced and panics.
+- **Token rotation.** If you rotate JWTs server-side and the client cache holds a stale token in memory, every pull fails until reload.
+
+The fixes:
+
+<Code lang="ts" file="auth-handlers.ts">{`async function logout() {
+  await rep.close();                                   // 1. Stop syncing.
+  const dropped = await Replicache.dropAllDatabases(); // 2. Wipe IDB (or scope by user prefix).
+  // dropped is an object describing what was dropped — log it.
+
+  await fetch("/api/logout", { method: "POST" });      // 3. Kill server session.
+  window.location.assign("/login");                    // 4. Hard reload; new Replicache later.
+}
+
+// On 401 from push/pull:
+rep.pusher = async (req) => {
+  const res = await fetch("/api/replicache/push", { ...req });
+  if (res.status === 401) {
+    // Session expired. Stop, alert user, do NOT silently retry forever.
+    await rep.close();
+    showSessionExpiredModal();
+    throw new Error("Session expired");
+  }
+  return await res.json();
+};`}</Code>
+
+Wire all three before your first real user logs in. After that, every fix is harder.
+
+## 3. Mutator non-determinism (the silent killer)
+
+This is the bug that costs you a weekend. A mutator that calls `Date.now()` or `crypto.randomUUID()` inside its body will produce different output on the client (when the user clicks) vs the server (when it replays seconds later). The cache and the database diverge.
+
+The bug looks innocuous: a record appears in the UI, then disappears, then re-appears with a slightly different timestamp. A 5-minute git blame and you're convinced React is misbehaving. It's the mutator.
+
+The rule: **all randomness, all clocks, all environment lookups happen in the caller, not the mutator.** Pass values in via `args`.
+
+<Code lang="ts" file="mutator-determinism.ts">{`// BAD — non-deterministic.
+async function addTodo(tx, { title }) {
+  await tx.set(\`todo/\${crypto.randomUUID()}\`, {
+    title,
+    createdAt: Date.now(),
+  });
+}
+
+// GOOD — deterministic.
+async function addTodo(tx, { id, title, createdAt }) {
+  await tx.set(\`todo/\${id}\`, { id, title, createdAt, done: false });
+}
+
+// Call site does the non-determinism:
+rep.mutate.addTodo({
+  id: crypto.randomUUID(),
+  title,
+  createdAt: Date.now(),
+});`}</Code>
+
+Add a lint rule if you can. The Replicache docs even ship one as a recommendation.
+
+## 4. The "Linear-grade" engineering investment most teams underestimate
+
+The temptation, after reading Tuomas Artman's writeups: "we could build that." You probably can't, at startup scale, in time, while shipping product. Here's the honest accounting.
+
+What Linear's engine does that you'll re-invent badly:
+
+- **Snapshot + delta hydration.** Compact binary snapshots, delta encoding per-row-version, lazy slice loading.
+- **Permissions enforcement on every delta.** Linear's engine has to decide on every change "should this client receive this delta?" — and the rules are non-trivial.
+- **Multi-region replication.** Linear's backend isn't single-region. The sync engine handles writes routed through different regions and converges.
+- **Multi-tab and multi-device.** Two tabs share a worker; two devices converge through the server. Both have edge cases.
+- **A debugger.** Linear's internal sync engine has tools to inspect state, diff between client and server, replay history. You'd build those second; they're the difference between "it works" and "we can fix it when it breaks."
+
+Estimate honestly: Linear's engine represents 4-6 senior-engineer-years to the level it ships today. If your team has that budget and collaboration speed is the product, great. Otherwise, Replicache or Zero. The engines exist because Rocicorp already paid that cost.
+
+## 5. Cache invalidation across feature flags
+
+You ship a feature behind a flag. The flag is off for user A, on for user B. The shape of the data, or the mutators available, differs.
+
+If both users hit the same cache schema, A's cache might contain rows produced by the on-flag code path that A's UI doesn't know how to render. Or worse, A's UI tries to mutate using a mutator the on-flag code path requires — and the off-flag server rejects it.
+
+Two patterns that work:
+
+- **Treat the flag as part of the schema version.** If the flag changes the mutator set or the data shape, bump the cache name when the flag changes. Costly (a flag flip becomes a full re-pull) but safe.
+- **Make the flag additive only.** New tables, new mutators, never removing or reshaping existing ones. The off-path simply doesn't use them. This is the same discipline event-sourcing demands and it generalizes well.
+
+The failure mode: rolling out an A/B test that changes the mutator semantics for variant B, then having variant-A users' caches break when they're moved to B mid-session. Plan for it.
+
+## 6. Multi-tab consistency
+
+The local store is shared across tabs of the same origin via the engine's coordination layer (BroadcastChannel or a shared worker). When you have it right, mutating in tab A updates the cache and re-renders tab B without a server round-trip.
+
+The thing that breaks it: ephemeral state that lives in a single tab's memory (a React state variable, a Zustand store) but conceptually should be shared. Your modal-open state, your selected-issue state, your draft-comment buffer.
+
+Decision rule: **if the state should survive tab close**, it goes in the sync engine. **If it should survive tab swap**, you need BroadcastChannel or a shared worker. **If it's truly per-tab** (a hover state), keep it in React. Conflating these produces UIs that almost work but feel off.
+
+## 7. Pull payload size on cold start
+
+A returning user with a cold cache (cleared cookies, new device) needs the whole world's worth of their data. If you're naive, the first pull is megabytes, takes seconds, and the loading screen is the user's first impression.
+
+Solutions in production order:
+
+- **Lazy slices.** Don't pull the whole workspace; pull the visible view, then expand. All three engines support this with explicit scope APIs.
+- **Snapshot endpoint.** A separate, cacheable HTTP endpoint that returns a compact binary snapshot to seed the local store before the first incremental pull. CDN-cache it; you'll thank yourself.
+- **Compression on pull.** Gzip your pull responses. Brotli is free on modern Cloudflare/Vercel — turn it on.
+
+Measure your cold start. If it's >2s, the user notices.
+
+<Callout kind="gotcha">
+  The four gotchas that wreck the first production rollout: stale cache after schema change (version the cache name), pending mutations after session expiry (wipe on logout, surface 401s), non-deterministic mutators (push randomness and clocks into args), and underestimating how much engineering Linear-grade sync takes (use Replicache or Zero unless collab _is_ the product). Add a debug overlay early — `rep.debug` style — so you can inspect the queue when something looks weird.
+</Callout>
+
+<Reading url="https://doc.replicache.dev/concepts/offline" title="Replicache — Offline and Sync" kind="docs" minutes={8} />
+<Reading url="https://doc.replicache.dev/howto/migrate-schema" title="Replicache — Schema Migration" kind="docs" minutes={6} />
+<Reading url="https://zero.rocicorp.dev/docs/permissions" title="Zero — Permissions" kind="docs" minutes={10} />
+<Reading url="https://livestore.dev/docs/reference/state/sqlite-schema" title="LiveStore — Schema and Materializers" kind="docs" minutes={8} />
+
+**Remember this:** Version your cache name. Wipe on logout. Mutators must be deterministic. Don't try to be Linear. Plan for cold-start payload size before your first big user lands.

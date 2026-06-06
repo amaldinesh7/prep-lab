@@ -1,0 +1,64 @@
+{
+  "questions": [
+    {
+      "id": "q1",
+      "prompt": "Where does a sync engine mutator run?",
+      "options": [
+        { "id": "a", "label": "Only on the client; the server validates the resulting state" },
+        { "id": "b", "label": "Only on the server; the client reads back the result" },
+        { "id": "c", "label": "Twice — optimistically on the client and authoritatively on the server" },
+        { "id": "d", "label": "Inside the database as a stored procedure" }
+      ],
+      "correct": "c",
+      "explanation": "The mutator is shared code: it runs locally the instant the user triggers it (optimistic UI), and again on the server when the client pushes the queued mutation (authoritative state). That dual-run requirement is why mutators must be deterministic — no Date.now(), no random IDs inside the body."
+    },
+    {
+      "id": "q2",
+      "prompt": "What's the shape of Replicache's client-side store?",
+      "options": [
+        { "id": "a", "label": "Key-value, scanned by prefix, persisted to IndexedDB" },
+        { "id": "b", "label": "Relational tables queried with SQL" },
+        { "id": "c", "label": "An append-only event log" },
+        { "id": "d", "label": "An in-memory normalized graph, no persistence" }
+      ],
+      "correct": "a",
+      "explanation": "Replicache is a KV store. You read with tx.get and tx.scan({ prefix }), write with tx.set and tx.del. Persistence lives in IndexedDB. Zero's model is closer to (b); LiveStore is (a) and (c) combined (SQLite materialized from events)."
+    },
+    {
+      "id": "q3",
+      "prompt": "What technology backs LiveStore's local store?",
+      "options": [
+        { "id": "a", "label": "IndexedDB with a typed wrapper" },
+        { "id": "b", "label": "localStorage + a CRDT library" },
+        { "id": "c", "label": "SQLite compiled to WebAssembly, persisted via OPFS/IndexedDB" },
+        { "id": "d", "label": "DuckDB via the Arrow web bindings" }
+      ],
+      "correct": "c",
+      "explanation": "LiveStore runs a WASM build of SQLite in the browser and persists it through OPFS (or IndexedDB as a fallback). That's what gives it real SQL — joins, indexes, aggregates — on tens of thousands of rows. Events are the source of truth; the SQLite tables are a materialized view derived by materializers."
+    },
+    {
+      "id": "q4",
+      "prompt": "Why does a sync engine beat Tanstack Query + WebSocket for collaborative apps?",
+      "options": [
+        { "id": "a", "label": "Sync engines are faster because they use HTTP/3" },
+        { "id": "b", "label": "They have a mutator + reconciliation model (replay, rebase, deterministic writes), not just a request/response cache" },
+        { "id": "c", "label": "Tanstack Query doesn't support real-time updates at all" },
+        { "id": "d", "label": "Sync engines avoid the network entirely on every interaction" }
+      ],
+      "correct": "b",
+      "explanation": "Tanstack Query is a cache of server responses; mutations are opaque calls that invalidate keys. A sync engine adds typed mutators that run on both sides, a pending-mutation queue, and a rebase loop that reapplies pending writes on top of server diffs. That model — not the transport — is what makes offline replay and multi-tab consistency work."
+    },
+    {
+      "id": "q5",
+      "prompt": "Which domain is the WORST fit for a sync engine?",
+      "options": [
+        { "id": "a", "label": "Collaborative issue tracker (multiple users editing the same issue)" },
+        { "id": "b", "label": "Banking app where the server must definitively accept or reject every transaction before it's considered done" },
+        { "id": "c", "label": "Real-time multiplayer whiteboard" },
+        { "id": "d", "label": "Email client with offline reading and queued sends" }
+      ],
+      "correct": "b",
+      "explanation": "Sync engines are optimistic by default — the client commits the write locally, then reconciles. For server-of-truth domains like banking, payments, or anything regulated, that semantic is a liability: a transfer can't appear true to the user if the server is going to reject it. Use a conventional API with explicit pending states. The other options are exactly what sync engines are for."
+    }
+  ]
+}

@@ -1,0 +1,159 @@
+---
+title: LiveStore and event-sourcing
+---
+
+<SectionHeader kind="concept" number={5} title="LiveStore and the eventsourcing angle" />
+
+LiveStore — Johannes Schickling's local-first engine — comes at the same problem from a different direction. Instead of a KV store mutated by typed functions, LiveStore stores **events** as the source of truth and derives application state by materializing those events into a **SQLite database that lives in the browser**.
+
+If Replicache says "the cache is the truth," LiveStore says "the event log is the truth and the cache is just a materialized view of it." That's a meaningfully different bet.
+
+## The shape
+
+Three pieces:
+
+1. **An event log** — every state change is an immutable event with a type, a payload, and a sequence number.
+2. **A local SQLite database** — runs in the browser via WebAssembly (using a build of SQLite compiled to WASM, persisted to OPFS or IndexedDB).
+3. **Materializers** — pure functions that take an event and apply it to the SQLite database. The DB is derived state; the events are truth.
+
+<Code lang="ts" file="livestore-events.ts">{`import { Events, Schema } from "@livestore/livestore";
+
+export const events = {
+  todoAdded: Events.synced({
+    name: "v1.TodoAdded",
+    schema: Schema.Struct({
+      id: Schema.String,
+      title: Schema.String,
+      createdAt: Schema.Number,
+    }),
+  }),
+  todoToggled: Events.synced({
+    name: "v1.TodoToggled",
+    schema: Schema.Struct({ id: Schema.String }),
+  }),
+  todoDeleted: Events.synced({
+    name: "v1.TodoDeleted",
+    schema: Schema.Struct({ id: Schema.String }),
+  }),
+};`}</Code>
+
+The materializers translate events into SQL against the local SQLite database:
+
+<Code lang="ts" file="livestore-materializers.ts">{`import { State } from "@livestore/livestore";
+
+export const tables = {
+  todos: State.SQLite.table({
+    name: "todos",
+    columns: {
+      id: State.SQLite.text({ primaryKey: true }),
+      title: State.SQLite.text(),
+      done: State.SQLite.boolean({ default: false }),
+      createdAt: State.SQLite.integer(),
+    },
+  }),
+};
+
+export const materializers = State.SQLite.materializers(events, {
+  "v1.TodoAdded": ({ id, title, createdAt }) =>
+    tables.todos.insert({ id, title, done: false, createdAt }),
+
+  "v1.TodoToggled": ({ id }) =>
+    tables.todos.update({ done: sql\`NOT done\` }).where({ id }),
+
+  "v1.TodoDeleted": ({ id }) => tables.todos.delete().where({ id }),
+});`}</Code>
+
+And reading is just SQL queries against the local DB, subscribed reactively:
+
+<Code lang="tsx" file="components/Todos.tsx">{`import { useQuery, queryDb } from "@livestore/react";
+
+const todos$ = queryDb(() => tables.todos.orderBy("createdAt", "desc"));
+
+function Todos() {
+  const todos = useQuery(todos$);
+  return <ul>{todos.map((t) => <li key={t.id}>{t.title}</li>)}</ul>;
+}`}</Code>
+
+Writes don't mutate the DB directly — they emit events:
+
+<Code lang="tsx" file="components/AddTodo.tsx">{`function AddTodo({ store }: { store: Store }) {
+  return (
+    <button
+      onClick={() =>
+        store.commit(
+          events.todoAdded({
+            id: crypto.randomUUID(),
+            title: "New",
+            createdAt: Date.now(),
+          }),
+        )
+      }
+    >
+      Add
+    </button>
+  );
+}`}</Code>
+
+The materializer runs immediately, the SQLite table updates, the `useQuery` subscriber re-renders. In parallel, the event is shipped to the sync backend, which broadcasts it to other clients, who run the same materializer against their local SQLite, who re-render.
+
+## SQLite in the browser is the real innovation
+
+It's worth pausing on this. For years, "browser database" meant IndexedDB — a key-value store with a famously hostile API, no joins, no indexes worth the name. LiveStore (and a wave of contemporaries: SQLocal, Evolu, sqlite-wasm) compile SQLite to WebAssembly and persist it through OPFS (Origin Private File System) or IndexedDB.
+
+What this buys you:
+
+- **Real SQL.** Joins, indexes, aggregations, full-text search. Queries the way you actually write them.
+- **A proven storage engine.** SQLite's reliability story is decades old. Your client cache inherits it.
+- **Big datasets.** Tens of thousands of rows are fine. IndexedDB struggles long before that.
+
+The cost: a one-time WASM blob (a few hundred KB compressed), and async-everywhere semantics because OPFS is async. Both are minor.
+
+## Why event-sourcing buys you something
+
+The KV / mutator model (Replicache, Zero) treats writes as "change this state to that state." Event-sourcing treats writes as "this happened." Two consequences.
+
+**Auditability is free.** The event log _is_ the history. Every change is timestamped, attributed, and replayable. "When did this field change to that value?" is a SQL query against the events table, not a heroic forensic investigation.
+
+**Schema migrations replay through materializers.** When you change how `Todo.done` works — say it becomes a tri-state `"open" | "in_progress" | "done"` — you don't migrate the database; you change the materializer and re-run it across the event log. The events are the source of truth; the materialized DB is a cache you can throw away.
+
+**You can derive multiple views.** The same event log can materialize into different SQLite tables for different consumers: a normalized view for the app, a denormalized one for offline-first reporting, a slim one for an embedded widget.
+
+## When event-sourcing earns its complexity
+
+Event-sourcing is not free. It costs:
+
+- **Discipline around event names and shapes.** You can never delete an event type once it's in production logs; you can only deprecate. Naming events `v1.TodoAdded` from day one is the right reflex.
+- **Materializers have to be deterministic.** Same as mutators in the Replicache world, but more so — they replay across years of history.
+- **Storage grows monotonically.** You can snapshot and compact, but you're paying for "everything that ever happened" by default.
+
+Worth it when:
+
+- The product has a strong **audit / history** story (financial apps, document editors with "see all changes," healthcare).
+- The domain is **append-only by nature** (chat, logs, transactions, calendar events).
+- You need to **re-derive views** without re-fetching from the server (offline analytics, custom report builders).
+
+Less worth it for plain CRUD where "current state" is all the user ever asks for. There, Replicache's KV mutator model is simpler.
+
+## How LiveStore compares to Replicache and Zero
+
+| Axis | Replicache | Zero | LiveStore |
+|---|---|---|---|
+| Local store | KV (IndexedDB) | Materialized query view | SQLite (WASM) |
+| Source of truth | Last-write-wins KV | Materialized DB | Event log |
+| Writes are | Mutator functions | Mutator functions | Events |
+| Server protocol | Push/pull, you implement | Managed `zero-cache` | LiveStore sync backend (Cloudflare Workers, Node, etc.) |
+| Best for | Most apps | Query-heavy apps | Audit-heavy, append-only domains |
+| Maturity (2026) | High | Medium | Medium |
+
+The interesting thing: LiveStore's sync layer is _also_ a rebase loop, the same shape we drew in the mental-model section. It just rebases at the event level — when remote events arrive, they're inserted into the log in their canonical order, materializers re-run from the divergence point, and the SQLite DB ends up consistent. The reconciliation lives in the log, not the store.
+
+<Callout kind="pattern">
+  LiveStore stores events as truth and materializes them into SQLite-in-the-browser via WASM. The KV vs event-log split is the meaningful difference from Replicache/Zero. Pick event-sourcing when audit, history, or replay across schema changes is load-bearing for your product. Otherwise the mutator model is simpler.
+</Callout>
+
+<Reading url="https://livestore.dev/" title="LiveStore Docs" kind="docs" minutes={12} />
+<Reading url="https://livestore.dev/blog/2024-introducing-livestore/" title="Introducing LiveStore" author="Johannes Schickling" kind="blog" minutes={10} />
+<Reading url="https://www.youtube.com/watch?v=zQIhJqYU1Qw" title="LiveStore: Local-First with SQLite (talk)" author="Johannes Schickling" kind="video" minutes={35} />
+<Reading url="https://riffle.systems/essays/prelude/" title="Riffle — Reactive Relational State for Local-First" kind="blog" minutes={20} />
+
+**Remember this:** LiveStore = events as truth + SQLite-in-browser as materialized cache. Event-sourcing wins when you need audit, replay, or schema-migration-via-rematerialize. Otherwise Replicache's mutator model is the simpler default.

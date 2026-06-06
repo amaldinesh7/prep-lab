@@ -1,0 +1,65 @@
+---
+title: Why sync engines
+---
+
+<SectionHeader kind="why" number={1} title="Why sync engines" />
+
+A sync engine is what you build when "refetch on change" stops being a good enough answer. It flips the default: the client cache becomes the source of truth at read time, and the server's job becomes reconciling writes from many clients into a shared canonical state. Linear, Figma, Notion, Superhuman — every product whose UI feels suspiciously fast underneath collaboration has one.
+
+## The REST/GraphQL model and where it cracks
+
+REST and GraphQL share a state model whether they admit it or not. The server is truth, the client is a view, and the client refetches when something changes. Tanstack Query is the cleanest expression of this idea — declarative queries, mutations that invalidate keys, background refetch on focus. It is excellent.
+
+It cracks in three places.
+
+**Latency.** Every interaction costs a round-trip. Optimistic UI helps, but every optimistic write is a hand-rolled local mutation plus a server invalidation plus rollback logic. Multiply by ten mutators and you've written a sync engine, badly.
+
+**Offline.** A request/response cache can't replay mutations after reconnect. It can't even meaningfully render a stale-but-editable view, because the moment the user types, you've forked from the server with no merge plan.
+
+**Collaboration.** When two users edit the same record, the request/response model has no opinion about who wins or how the other client finds out. You bolt on WebSockets, push invalidations, and then realize your "fresh refetch" arrived before the mutation that triggered it.
+
+These aren't bugs in Tanstack Query. They're the ceiling of the model.
+
+## The flip
+
+A sync engine inverts the contract.
+
+- The client has a **persistent local store** (key-value, SQLite, indexed log).
+- Writes are typed **mutators** that run locally first against the store. The UI reads from the store and never blocks on the network.
+- The same mutators run on the **server**, which holds the canonical state and reconciles concurrent writes.
+- The server pushes diffs back; clients **apply the diff** and rebase their local optimistic mutations on top.
+
+The UI doesn't know the network exists. It reads the store. It calls a mutator. The store updates. Everything that's hard — retry, replay, conflict resolution, multi-tab — is the engine's job, not yours.
+
+## Linear is the proof
+
+When Linear shipped, the team made one claim that sounded like marketing: every interaction is instant. No spinners on mutations. No refetch flashes. Issue moves between projects with no perceptible network delay even on dodgy hotel WiFi.
+
+It wasn't marketing. They built an in-house sync engine — an object graph that lives on the client, mutated by typed operations, reconciled by a server that knows the full schema. The "Linear feels faster" reaction is a downstream effect of one architectural choice: the cache _is_ the application state, and the network is a background reconciler.
+
+Tuomas Artman's talks walk through it. Every other "fast" product since has copied the shape, even if they didn't copy the implementation.
+
+## What you give up
+
+This isn't free. You take on:
+
+- A **persistent client store** that has to migrate as your schema changes.
+- **Deterministic mutators** — no `Date.now()`, no `crypto.randomUUID()` inside a mutator unless you pass the value in.
+- A **push/pull protocol** between client and server, plus the server-side logic to apply mutators and emit diffs.
+- Auth invalidation, cache encryption, schema versioning, all the boring infra you used to get for free by reaching for `fetch`.
+
+For most CRUD apps, Tanstack Query is correct. For products where collaboration speed _is_ the product — issue trackers, design tools, docs, agent UIs — sync engines are how you get there.
+
+<Callout kind="why">
+  Sync engines exist because REST/GraphQL caching assumes the server is truth and the client is a view. Below ~100ms round-trips with intermittent connectivity and multi-user collaboration, that assumption breaks. Flipping it — making the client cache the read-time truth and the server a reconciler of writes — is the only way to get Linear-grade feel. Everything else is paying interest on the wrong model.
+</Callout>
+
+## What this module covers
+
+You'll learn the mutator + reconciliation model, then walk through the four engines a startup actually evaluates in 2026: Linear's in-house design, Replicache (the proven KV one), Zero (Rocicorp's next-gen query-based one), and LiveStore (the event-sourced SQLite-in-browser one). You'll end with a real Replicache build so the abstractions are muscle memory.
+
+<Reading url="https://linear.app/blog/scaling-the-linear-sync-engine" title="Scaling the Linear Sync Engine" author="Tuomas Artman" kind="blog" minutes={14} />
+<Reading url="https://www.youtube.com/watch?v=Wo2m3jaJixU" title="Local-First Software (talk)" author="Tuomas Artman" kind="video" minutes={45} />
+<Reading url="https://www.inkandswitch.com/local-first/" title="Local-First Software (Ink & Switch)" kind="blog" minutes={30} />
+
+**Remember this:** REST/GraphQL = server is truth, client is view. Sync engine = cache is truth, server reconciles. Every other property — speed, offline, collab — falls out of that flip.

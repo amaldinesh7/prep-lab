@@ -1,0 +1,253 @@
+---
+title: Replicache and Zero
+---
+
+<SectionHeader kind="concept" number={4} title="Replicache and Zero (Rocicorp)" />
+
+Rocicorp is the team that productized this category. Replicache is their first-generation engine — battle-tested, KV-shaped, opinionated about what the server does. Zero is the second-generation rethink: queries instead of key scans, a server that subscribes to your database, and a much smaller bring-your-own contract.
+
+If you're picking a sync engine in 2026 and you don't have a Linear-grade team, the answer is "one of these two." Here's how to think about which.
+
+## Replicache: the proven one
+
+Replicache's model is a client-side key-value store, push/pull endpoints you implement on your server, and a mutator contract that runs on both sides. The library doesn't care what your database is — it cares that you can answer "what changed since cookie X?" and "apply this mutation."
+
+The architecture, end-to-end:
+
+<Code lang="ts" file="replicache-architecture.ts">{`// 1. CLIENT — define mutators (shared with server).
+export const mutators = {
+  async addTodo(tx: WriteTransaction, args: {
+    id: string; title: string; createdAt: number;
+  }) {
+    await tx.set(\`todo/\${args.id}\`, { ...args, done: false });
+  },
+  async toggleTodo(tx: WriteTransaction, args: { id: string }) {
+    const t = (await tx.get(\`todo/\${args.id}\`)) as Todo | undefined;
+    if (t) await tx.set(\`todo/\${args.id}\`, { ...t, done: !t.done });
+  },
+  async deleteTodo(tx: WriteTransaction, args: { id: string }) {
+    await tx.del(\`todo/\${args.id}\`);
+  },
+};
+export type M = typeof mutators;
+
+// 2. CLIENT — instantiate Replicache.
+import { Replicache } from "replicache";
+
+export const rep = new Replicache<M>({
+  name: \`user-\${userID}\`,                              // per-user store
+  licenseKey: import.meta.env.VITE_REPLICACHE_LICENSE,
+  mutators,
+  pushURL: "/api/replicache/push",
+  pullURL: "/api/replicache/pull",
+  pushDelay: 1_000,                                    // batch mutations
+});`}</Code>
+
+The server-side push and pull endpoints are where your application logic lives. The push endpoint applies mutations to your real database (Postgres, usually). The pull endpoint computes a diff from a `cookie` the client sent back.
+
+<Code lang="ts" file="server/replicache/push.ts">{`import { mutators } from "../shared/mutators";
+
+// Server-side push: re-run client mutations against the canonical DB.
+export async function push(req: PushRequest, userID: string) {
+  await db.transaction(async (tx) => {
+    const clientGroup = await tx.upsertClientGroup(req.clientGroupID, userID);
+
+    for (const m of req.mutations) {
+      const lastMutationID = await tx.getLastMutationID(m.clientID);
+      if (m.id <= lastMutationID) continue;            // already applied
+      if (m.id !== lastMutationID + 1) throw new Error("gap");
+
+      // The shared mutator runs here too. Server tx wraps tx.set/del/get.
+      try {
+        await mutators[m.name](serverTx(tx, userID), m.args as never);
+      } catch (err) {
+        // Mark mutation as "errored" but still bump lastMutationID so we
+        // don't loop. The client surfaces the error to the user.
+        await tx.recordMutationError(m.clientID, m.id, err);
+      }
+
+      await tx.setLastMutationID(m.clientID, m.id);
+    }
+
+    // Bump the per-space version. Subscribers will pull on the next poke.
+    await tx.bumpSpaceVersion(clientGroup.spaceID);
+  });
+
+  await poke(clientGroup.spaceID);                     // WebSocket "doorbell"
+  return {};
+}`}</Code>
+
+The pull endpoint returns a patch (the set of keys to add/change/delete) and a new cookie that anchors the next pull.
+
+<Code lang="ts" file="server/replicache/pull.ts">{`export async function pull(req: PullRequest, userID: string) {
+  const fromVersion = req.cookie?.version ?? 0;
+  const space = await db.getSpace(userID);
+
+  const changes = await db.todoChangesSince(space.id, fromVersion);
+
+  const patch: PatchOperation[] = changes.map((c) =>
+    c.deleted
+      ? { op: "del", key: \`todo/\${c.id}\` }
+      : { op: "put", key: \`todo/\${c.id}\`, value: c.row },
+  );
+
+  // Include the per-client lastMutationID so the client can prune confirmed
+  // mutations from its pending queue.
+  const lastMutationIDChanges = await db.lastMutationIDsForGroup(
+    req.clientGroupID,
+  );
+
+  return {
+    cookie: { version: space.version },
+    lastMutationIDChanges,
+    patch,
+  };
+}`}</Code>
+
+That's the whole contract. Everything else — offline replay, conflict rebase, multi-tab via BroadcastChannel, IndexedDB persistence — is the library's job.
+
+### Reading data in components
+
+<Code lang="tsx" file="components/Todos.tsx">{`import { useSubscribe } from "replicache-react";
+
+function Todos() {
+  const todos = useSubscribe(
+    rep,
+    async (tx) => (await tx.scan({ prefix: "todo/" }).values().toArray()) as Todo[],
+    { default: [], dependencies: [] },
+  );
+
+  return (
+    <ul>
+      {todos.map((t) => (
+        <li key={t.id}>
+          <input
+            type="checkbox"
+            checked={t.done}
+            onChange={() => rep.mutate.toggleTodo({ id: t.id })}
+          />
+          {t.title}
+        </li>
+      ))}
+    </ul>
+  );
+}`}</Code>
+
+### What Replicache gets right
+
+- **Bring-your-own-server.** No managed backend lock-in. Postgres, MySQL, DynamoDB — anything that can do transactions and version rows works.
+- **The KV abstraction scales conceptually.** Indexes are just other key prefixes. Lists are scans.
+- **Mature.** Powers production apps you've heard of. The library has shipped for years.
+
+### Where Replicache gets fiddly
+
+- **You implement push/pull.** Permission filtering, multi-tenant scoping, change capture — all yours. Not hard, but real.
+- **KV scans get expensive when views are complex.** A "show me all todos assigned to me in this project that are not done, sorted by due date" view becomes either many local indexes or a heavier post-scan filter.
+- **Server change-feed is your problem.** Most teams reach for Postgres `LISTEN/NOTIFY` or logical replication. Doable, but moving parts.
+
+## Zero: the next-generation Rocicorp engine
+
+Zero (announced 2024, going steady through 2026) is what happens when Rocicorp redesigns from the ground up knowing what Replicache users actually struggle with.
+
+The pitch: instead of a client KV store you scan, you write **queries** — close to SQL shape — that the engine materializes on the client. The server maintains a view of your database, accepts your query subscriptions, ships incremental updates as the underlying rows change, and handles the mutator + permission story with a lot less boilerplate.
+
+<Code lang="ts" file="zero-client.ts">{`import { Zero } from "@rocicorp/zero";
+import { schema } from "./schema";
+
+export const zero = new Zero({
+  userID,
+  auth: () => getAuthToken(),
+  server: "https://zero.your-app.com",
+  schema,
+});`}</Code>
+
+A query subscription looks like this:
+
+<Code lang="tsx" file="components/Todos.tsx">{`import { useQuery } from "@rocicorp/zero/react";
+
+function Todos({ projectID }: { projectID: string }) {
+  const [todos] = useQuery(
+    zero.query.todo
+      .where("projectID", projectID)
+      .where("done", false)
+      .related("assignee")
+      .orderBy("createdAt", "desc"),
+  );
+
+  return (
+    <ul>
+      {todos.map((t) => (
+        <li key={t.id}>
+          {t.title} — {t.assignee?.name ?? "unassigned"}
+        </li>
+      ))}
+    </ul>
+  );
+}`}</Code>
+
+That `useQuery` returns reactive, locally-materialized rows including the joined `assignee`. When any underlying row that affects the result changes — locally via a mutator, or remotely via another client — the query re-runs against the local view incrementally and the component re-renders. No invalidation key plumbing, no manual subscription scope.
+
+Mutations in Zero are similar in shape to Replicache mutators but typed against the schema:
+
+<Code lang="ts" file="components/AddTodo.tsx">{`function AddTodo({ projectID }: { projectID: string }) {
+  return (
+    <button
+      onClick={() =>
+        zero.mutate.todo.insert({
+          id: crypto.randomUUID(),
+          projectID,
+          title: "New",
+          done: false,
+          createdAt: Date.now(),
+        })
+      }
+    >
+      Add
+    </button>
+  );
+}`}</Code>
+
+For custom server logic (e.g., "moving an issue cascades to update its parent's lastTouchedAt"), Zero supports server-defined "custom mutators" you can call from the client — same shape, but with server-only logic mixed in.
+
+### What Zero gets right
+
+- **Queries are first-class.** No more shaping local data via prefix scans. Joins, ordering, filtering — all on the client, materialized.
+- **Permissions in schema.** You declare row-level read/write rules in the schema. The server enforces them and only ships rows the user can see.
+- **The server is a managed-able piece.** You can self-host `zero-cache`, or use Rocicorp's hosted offering. Either way, less custom push/pull code.
+- **Better story for big datasets.** The client doesn't have to hold the whole table; the engine streams query results based on the live view.
+
+### Where Zero is still maturing
+
+- **Younger.** Smaller community, fewer war-stories on Stack Overflow.
+- **Schema-first.** Adopting Zero means committing to its schema DSL as your contract between client and server. Migrations are more involved than "ship new mutators."
+- **Postgres-leaning.** Zero's change capture is happiest with Postgres. Other databases work but the integration surface is smaller.
+
+## When you'd reach for each
+
+Use **Replicache** when:
+
+- You already have a Postgres-or-similar database and a Node server.
+- Your data model fits KV scans cleanly (todos, kanban, notes).
+- You want maximum control of the push/pull boundary (custom auth flows, multi-region, gnarly permissions).
+- You'd rather not bet on a younger library for the core of a critical product.
+
+Use **Zero** when:
+
+- You're greenfield and want the query model from day one.
+- Your queries are joins-and-filters heavy and the KV scan pattern would be painful.
+- You can run `zero-cache` (or pay Rocicorp to) without it being a deployment headache.
+- You want to write less server code and lean on the engine's permission layer.
+
+The honest 2026 take: Replicache is the safer pick today for revenue-bearing products; Zero is where Rocicorp is investing and where you'd start a new project if your team can absorb being closer to the bleeding edge. Both ship.
+
+<Callout kind="pattern">
+  Replicache: KV store on the client, you implement push/pull on the server, mutators are shared code. Mature, bring-your-own-everything. Zero: query model on the client, server maintains a materialized view, permissions in the schema. Younger, less server code to write. Same Rocicorp DNA, two different bets on what the contract should look like.
+</Callout>
+
+<Reading url="https://doc.replicache.dev/" title="Replicache Docs" kind="docs" minutes={15} />
+<Reading url="https://doc.replicache.dev/byob/intro" title="Replicache — Build Your Own Backend" kind="docs" minutes={20} />
+<Reading url="https://zero.rocicorp.dev/" title="Zero Docs" kind="docs" minutes={12} />
+<Reading url="https://zero.rocicorp.dev/docs/introduction" title="Zero — Introduction" kind="docs" minutes={8} />
+<Reading url="https://rocicorp.dev/blog/introducing-zero" title="Introducing Zero" author="Aaron Boodman" kind="blog" minutes={10} />
+
+**Remember this:** Replicache = KV + push/pull, mature. Zero = queries + materialized view + permission DSL, the future Rocicorp bet. Both share the mutator + rebase model from the previous section — only the shape of the cache differs.

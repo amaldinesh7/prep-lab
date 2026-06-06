@@ -1,0 +1,99 @@
+---
+title: Choosing one
+---
+
+<SectionHeader kind="pattern" number={6} title="Choosing one" />
+
+You've seen four engines. In a real startup decision, you're not picking between all of them in a vacuum — you're picking the one whose tradeoffs your team can swallow over the next two years. Here's the decision tree, the auth/multi-tenant honesty, and the server-side work each one really demands.
+
+## The decision tree
+
+Start at the top, walk down, stop at the first "yes."
+
+1. **Is collaboration speed your product's unique advantage, and do you have a multi-year sync team headcount available?**
+   → Build your own (Linear style). Otherwise, never.
+
+2. **Do you need full audit/history/replay as a product feature, or is your domain naturally append-only (chat, logs, financial events)?**
+   → **LiveStore.**
+
+3. **Are your views query-shaped (joins, filters, aggregates across multiple tables) and would you rather not write push/pull endpoints?**
+   → **Zero.** (Especially if you're greenfield and Postgres-native.)
+
+4. **Everything else — proven team, want maturity, KV scans fit your domain, willing to write a Node push/pull server.**
+   → **Replicache.**
+
+The honest default in 2026: Replicache for revenue-bearing products, Zero for new bets, LiveStore for audit-heavy or event-natured domains, your own engine only if you're literally Linear's competitor.
+
+## Server-side work, ranked
+
+The question that surprises teams: how much server engineering does each engine actually require?
+
+**Linear-style (build your own).**
+You write everything. Schema, version protocol, delta encoding, server-side mutator execution, change capture, WebSocket fanout, permission enforcement, snapshot compaction. Plan in years, not quarters.
+
+**Replicache.**
+You implement two HTTP endpoints (`/push`, `/pull`) and one WebSocket "poke" channel. The push endpoint runs your shared mutators against Postgres in a transaction. The pull endpoint diffs your tables since a cookie. The poke is a per-space WebSocket fanout. Realistic effort: 1–2 weeks for a senior engineer to get the first version solid, ongoing maintenance as you add features. Most of the complexity is "diff this table since version X" queries.
+
+**Zero.**
+You define a schema with `@rocicorp/zero` and write permission rules. You run `zero-cache` (a managed-able service Rocicorp ships) somewhere it can read your Postgres replication slot. You write custom mutators only for logic that doesn't fit pure inserts/updates. The push/pull layer is the engine's problem. Realistic effort: schema + permissions in a week, custom mutators as you need them.
+
+**LiveStore.**
+You define events and materializers (shared code, no separate server-side mutator file). You run a LiveStore sync backend — they ship a Cloudflare Workers adapter, a Node adapter, etc. The backend's job is to broadcast events to subscribed clients and persist the log. Realistic effort: similar to Replicache but the abstractions are events instead of KV ops.
+
+## Auth — the part everyone underestimates
+
+Auth in a sync engine has three jobs the docs gloss over:
+
+**1. Identify the client before any pull.**
+Pulls have to know "who is this so I can scope what they see." Replicache passes auth to your `/pull` endpoint as a header you read; Zero and LiveStore have first-class auth-token hooks. Don't be clever — use the same JWT or session cookie your REST API uses, and verify on every request.
+
+**2. Drop the cache on logout.**
+The local store survives reload. If user A logs out and user B logs in on the same device, user B will briefly see user A's cache if you don't wipe it. The fix in Replicache: `await rep.close()` and instantiate a new `Replicache` with `name: \`user-\${newUserID}\`` — the `name` is the cache key, so a different user gets a different DB. Same idea in Zero (different `userID`) and LiveStore (different `storeId`). Wire this into your logout flow before you ship.
+
+**3. Reject pending mutations on auth change.**
+If a user's session expires while they have unpushed mutations, the engine will retry forever. Decide your policy: either fail loudly and surface to the user (good for billable apps), or queue and replay after re-auth (good for casual products). All three engines let you do either; pick deliberately.
+
+## Multi-tenant scoping
+
+Every B2B app is multi-tenant. The engine needs to know what "tenant" means.
+
+- **Replicache:** scope `name` per user, scope your `/pull` query per workspace. The cookie is per-user-per-workspace. Switching workspaces means closing and reopening the store.
+- **Zero:** workspace becomes a column you filter on in queries; permissions in schema enforce it server-side.
+- **LiveStore:** create one store per workspace. The sync backend routes events by `storeId`.
+
+The general rule: **scope the local store to the user, and the query/event boundary to the tenant.** Don't share a store across tenants — schema migrations and permission changes get nasty.
+
+## Permissions
+
+This is where the engines diverge the most.
+
+- **Replicache:** permissions live in your `/pull` query and your mutator validation. You're filtering rows before sending and rejecting mutations the user shouldn't be allowed to make. Flexible, but every permission is hand-written server code.
+- **Zero:** permissions live in the schema as row-level rules. Declarative, reviewed in one place, automatically applied on pull and push.
+- **LiveStore:** permissions live in your sync backend (the event filter) and event validators. Closer to Replicache's model.
+
+For complex permission models (Linear-style "issue visibility depends on workspace membership, project access, and label filters"), Zero's declarative model pays the most over time. For simple "users see their own data," all three are fine.
+
+## At-a-glance
+
+<Cheatsheet rows={[
+  { k: "Build your own", v: "Only with a multi-year sync team. Linear-grade investment." },
+  { k: "Replicache", v: "Default in 2026. Mature, KV, you write /push and /pull." },
+  { k: "Zero", v: "Greenfield + query-heavy + Postgres. Less server code, schema-first." },
+  { k: "LiveStore", v: "Event-sourced, SQLite-in-browser. Audit or append-only domains." },
+  { k: "Server effort — Replicache", v: "1-2 weeks for push/pull/poke; ongoing per-feature." },
+  { k: "Server effort — Zero", v: "Schema + permissions in days; managed-able zero-cache." },
+  { k: "Server effort — LiveStore", v: "Event broadcast backend; CF Workers adapter exists." },
+  { k: "Auth", v: "Same JWT as REST. Wipe cache on logout. Decide pending-mutation policy." },
+  { k: "Multi-tenant", v: "Store per user, scope queries/events by tenant." },
+  { k: "Permissions story", v: "Replicache: hand-rolled. Zero: declarative. LiveStore: backend filters." },
+]} />
+
+<Callout kind="pattern">
+  The decision: own-engine only if collab is your product, LiveStore if event-sourcing earns its keep, Zero if you're greenfield and query-heavy, Replicache otherwise. Server effort is non-trivial in all of them — budget at least a week of senior engineering before the first end-to-end demo, and several weeks before "production-ready."
+</Callout>
+
+<Reading url="https://doc.replicache.dev/byob/intro" title="Replicache — Build Your Own Backend" kind="docs" minutes={15} />
+<Reading url="https://zero.rocicorp.dev/docs/permissions" title="Zero — Permissions" kind="docs" minutes={10} />
+<Reading url="https://livestore.dev/docs/reference/syncing" title="LiveStore — Sync" kind="docs" minutes={8} />
+
+**Remember this:** Replicache by default, Zero for greenfield + queries, LiveStore for event-sourced domains. None of them are zero-server. Budget the auth + multi-tenant work before the first demo.

@@ -1,0 +1,160 @@
+---
+title: Mental model
+---
+
+<SectionHeader kind="concept" number={2} title="Mental model: client cache + mutators + reconciliation" />
+
+Three pieces. Get them in your head and every engine in this module looks like a variation of the same shape.
+
+1. **A persistent local cache** the UI reads from.
+2. **Mutators** — typed write operations that mutate that cache.
+3. **A server reconciler** that runs the same mutators authoritatively and pushes diffs back.
+
+That's the whole model. Tanstack Query has only the first; that's why it's a cache, not a sync engine.
+
+## The cache is the application state
+
+The UI never calls `fetch`. It subscribes to the local cache and re-renders when keys it cares about change. Render time is the cost of an in-memory lookup.
+
+Concretely, in Replicache:
+
+<Code lang="tsx" file="components/TodoList.tsx">{`import { useSubscribe } from "replicache-react";
+
+export function TodoList({ rep }: { rep: Replicache<Mutators> }) {
+  const todos = useSubscribe(
+    rep,
+    async (tx) => {
+      const list = await tx.scan({ prefix: "todo/" }).values().toArray();
+      return list as Todo[];
+    },
+    { default: [] },
+  );
+
+  return <ul>{todos.map((t) => <li key={t.id}>{t.title}</li>)}</ul>;
+}`}</Code>
+
+That `useSubscribe` does not hit the network. It runs against the local store. The component is reactive to mutations against `todo/*` keys — local or remote. The network is somewhere else, doing its job.
+
+## Mutators run twice
+
+This is the load-bearing idea.
+
+A mutator is a pure function `(tx, args) => void` that writes to a transaction. It runs in two places:
+
+1. **Optimistically on the client**, the moment the user triggers it. The cache updates immediately. The UI re-renders.
+2. **Authoritatively on the server**, when the client pushes its pending mutations. The server runs the same function against the canonical store, decides "yes, this is what happened," and the resulting state diff is what other clients receive.
+
+<Code lang="ts" file="mutators.ts">{`// Defined once. Used on both client and server.
+export const mutators = {
+  async addTodo(
+    tx: WriteTransaction,
+    args: { id: string; title: string; createdAt: number },
+  ) {
+    await tx.set(\`todo/\${args.id}\`, {
+      id: args.id,
+      title: args.title,
+      done: false,
+      createdAt: args.createdAt,
+    });
+  },
+
+  async toggleTodo(tx: WriteTransaction, args: { id: string }) {
+    const t = (await tx.get(\`todo/\${args.id}\`)) as Todo | undefined;
+    if (!t) return;
+    await tx.set(\`todo/\${args.id}\`, { ...t, done: !t.done });
+  },
+};
+
+export type Mutators = typeof mutators;`}</Code>
+
+Notice what's *not* in the mutator: no `Date.now()`, no `crypto.randomUUID()`, no `fetch`. Every input arrives in `args`. That's because the server has to be able to reproduce the same write — possibly hours later, in a different process, with a different clock. **Mutators must be deterministic.** If you generate an ID inside the mutator, the client's ID and the server's ID disagree, and now you have a phantom record.
+
+The discipline: generate randomness and timestamps in the caller, pass them in.
+
+<Code lang="ts" file="components/AddTodo.tsx">{`function AddTodo({ rep }: { rep: Replicache<Mutators> }) {
+  return (
+    <button
+      onClick={() =>
+        rep.mutate.addTodo({
+          id: crypto.randomUUID(),     // generated here, not in the mutator
+          title: "New",
+          createdAt: Date.now(),       // captured here
+        })
+      }
+    >
+      Add
+    </button>
+  );
+}`}</Code>
+
+## Reconciliation: pull, push, rebase
+
+The engine is constantly doing three things in the background.
+
+**Pull.** Ask the server "what's changed since cookie X?" The server returns a diff: a set of key-value patches plus a new cookie. The client applies the patches to its store.
+
+**Push.** Send any locally-applied-but-not-yet-confirmed mutations to the server. The server runs each one, persists the result, and bumps a per-client "last mutation ID."
+
+**Rebase.** When a pull arrives, the engine throws away the client's optimistic state, applies the server diff fresh, then replays any still-pending mutations on top. Mutations the server has confirmed (last mutation ID >= local ID) are dropped from the pending queue.
+
+Pseudo-code of the loop, simplified:
+
+<Code lang="ts" file="engine-pseudocode.ts">{`async function tick(engine: Engine) {
+  // 1. Pull: get authoritative diffs from server.
+  const { patch, cookie, lastMutationID } = await api.pull({
+    cookie: engine.cookie,
+    clientID: engine.clientID,
+  });
+
+  // 2. Apply: server state wins. Local optimistic state is wiped.
+  engine.store.applyPatch(patch);
+  engine.cookie = cookie;
+
+  // 3. Prune: drop pending mutations the server already saw.
+  engine.pending = engine.pending.filter((m) => m.id > lastMutationID);
+
+  // 4. Replay: re-run still-pending mutators on top of fresh server state.
+  for (const m of engine.pending) {
+    await mutators[m.name](engine.store.tx(), m.args);
+  }
+
+  // 5. Push: send any not-yet-acknowledged mutations.
+  if (engine.pending.length > 0) {
+    await api.push({ clientID: engine.clientID, mutations: engine.pending });
+  }
+}`}</Code>
+
+The shape: **server diff wins, then replay your unconfirmed work on top.** That's the reconciliation algorithm, restated. Replicache calls it "rebase," Zero does it with materialized query views, LiveStore does it with event replay — same idea, different storage.
+
+## Pull vs push transport
+
+How does the client know "something changed"? Two options.
+
+**Polling pull.** Client pulls every N seconds. Simple. Works behind any HTTP infra. Cost: latency floor of N/2 for remote updates.
+
+**Push / "poke."** Server opens a WebSocket (or SSE) and emits a tiny "you should pull" message when a client's data changes. The client pulls in response. The payload stays on HTTP; the WebSocket is just a doorbell. This is what production Replicache deployments do, and what Zero handles natively.
+
+The payload-over-HTTP-with-WebSocket-doorbell pattern is worth remembering. It keeps the heavy delivery on a path that's easy to cache, auth, and scale, while still being real-time.
+
+## Why this is not "fancy Tanstack Query"
+
+Tanstack Query is a **cache of server responses**. It knows how to refetch, deduplicate, and invalidate. It does not know what a write _is_. Mutations are opaque functions whose only contract with the cache is "invalidate these keys when done." There is no second execution on the server, no rebase, no offline replay.
+
+A sync engine has:
+
+- A **persistent** store (survives reload, multi-tab via BroadcastChannel or shared worker).
+- **Typed mutators** that run twice with the same code.
+- A **rebase loop** that resolves "what the server confirmed" against "what's still pending locally."
+- A **push/pull protocol** with a cookie/version so the server only sends diffs.
+
+Tanstack Query plus a WebSocket gets you to about 60% of the look. The remaining 40% — the part that makes the product feel like Linear — is the rebase loop and the deterministic mutator contract.
+
+<Callout kind="pattern">
+  Three pieces: local cache (the UI reads from it), typed mutators (run optimistically client-side then authoritatively server-side), reconciler (pull diffs, replay pending mutations on top, push acknowledged ones). Every sync engine you'll see is a variation on this shape. Once you see it, you can read the docs of any of them in fifteen minutes.
+</Callout>
+
+<Reading url="https://doc.replicache.dev/concepts/how-it-works" title="Replicache — How it Works" kind="docs" minutes={10} />
+<Reading url="https://doc.replicache.dev/concepts/offline" title="Replicache — Mutators, Sync, and Conflict Resolution" kind="docs" minutes={8} />
+<Reading url="https://www.youtube.com/watch?v=PMTwJWGs1bA" title="Local-First Sync (Aaron Boodman / Rocicorp)" kind="video" minutes={30} />
+
+**Remember this:** Cache + mutators + reconciliation. Mutators run twice and must be deterministic. The rebase loop is the algorithm. The transport (WebSocket poke + HTTP pull) is the boring part.

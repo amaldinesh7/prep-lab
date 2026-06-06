@@ -1,0 +1,505 @@
+---
+title: Offline-first todo with Replicache
+---
+
+<SectionHeader kind="mini_project" number={9} title="Offline-first todo with Replicache" />
+
+A 4-hour build that exercises every concept from the module: a Replicache client with `useSubscribe`, a Node server with real push/pull endpoints, shared mutators, offline replay, and a WebSocket "poke" so updates fan out in real time.
+
+You'll end with a todo list that survives reload, queues writes while offline, and reconciles with the server (and other clients) when reconnected.
+
+<ProjectCard hours="4" starter="./replicache-todo-starter">
+
+## Goal
+
+A two-window demo:
+- Open the app in two browser tabs (or two browsers).
+- Add a todo in tab A. It appears in tab B within ~200ms.
+- Toggle airplane mode in tab A. Edit, add, delete several todos. Reopen the network. Watch them flush to the server and appear in tab B.
+
+The full surface to build:
+- React + Vite client with Replicache
+- Express (or Hono) server with `/api/replicache/push` and `/api/replicache/pull`
+- Postgres with a `todos` table, a `replicache_client_group` table, a `replicache_client` table, and a per-space version counter
+- A WebSocket "poke" channel that tells subscribed clients to pull
+
+## Steps
+
+### 1. Scaffold
+
+```bash
+bun create vite replicache-todo --template react-ts
+cd replicache-todo
+bun add replicache replicache-react
+bun add -D @types/node
+
+# Server (separate folder)
+mkdir server && cd server
+bun init -y
+bun add hono @hono/node-server pg
+bun add -D @types/pg tsx
+cd ..
+```
+
+Sign up for a Replicache license at https://replicache.dev — free for development. Drop it into `.env.local`:
+
+```
+VITE_REPLICACHE_LICENSE=l1234567890abcdef
+DATABASE_URL=postgres://localhost:5432/replicache_todo
+```
+
+### 2. Shared mutators
+
+`src/shared/mutators.ts` — imported by both client and server.
+
+```ts
+import type { WriteTransaction } from "replicache";
+
+export type Todo = {
+  id: string;
+  title: string;
+  done: boolean;
+  createdAt: number;
+};
+
+export const mutators = {
+  async addTodo(
+    tx: WriteTransaction,
+    args: { id: string; title: string; createdAt: number },
+  ) {
+    const todo: Todo = {
+      id: args.id,
+      title: args.title,
+      done: false,
+      createdAt: args.createdAt,
+    };
+    await tx.set(`todo/${args.id}`, todo);
+  },
+
+  async toggleTodo(tx: WriteTransaction, args: { id: string }) {
+    const t = (await tx.get(`todo/${args.id}`)) as Todo | undefined;
+    if (!t) return;
+    await tx.set(`todo/${args.id}`, { ...t, done: !t.done });
+  },
+
+  async deleteTodo(tx: WriteTransaction, args: { id: string }) {
+    await tx.del(`todo/${args.id}`);
+  },
+};
+
+export type M = typeof mutators;
+```
+
+Notice every value comes through `args`. No `Date.now()` or `crypto.randomUUID()` inside the mutators.
+
+### 3. Client setup
+
+`src/rep.ts`:
+
+```ts
+import { Replicache } from "replicache";
+import { mutators, type M } from "./shared/mutators";
+
+const SCHEMA_VERSION = 1;
+
+export function createRep(userID: string) {
+  return new Replicache<M>({
+    name: `user-${userID}-v${SCHEMA_VERSION}`,
+    licenseKey: import.meta.env.VITE_REPLICACHE_LICENSE,
+    mutators,
+    pushURL: "http://localhost:3001/api/replicache/push",
+    pullURL: "http://localhost:3001/api/replicache/pull",
+    pushDelay: 500,
+    auth: () => `Bearer dev-${userID}`,
+  });
+}
+```
+
+`src/App.tsx`:
+
+```tsx
+import { useEffect, useState } from "react";
+import { useSubscribe } from "replicache-react";
+import type { Replicache } from "replicache";
+import { createRep } from "./rep";
+import type { M, Todo } from "./shared/mutators";
+import { connectPoke } from "./poke";
+
+const USER_ID = "alice"; // hardcoded for the demo
+
+export default function App() {
+  const [rep, setRep] = useState<Replicache<M> | null>(null);
+
+  useEffect(() => {
+    const r = createRep(USER_ID);
+    setRep(r);
+    const close = connectPoke(USER_ID, () => r.pull());
+    return () => {
+      close();
+      r.close();
+    };
+  }, []);
+
+  if (!rep) return null;
+  return <TodoApp rep={rep} />;
+}
+
+function TodoApp({ rep }: { rep: Replicache<M> }) {
+  const todos = useSubscribe(
+    rep,
+    async (tx) =>
+      (await tx.scan({ prefix: "todo/" }).values().toArray()) as Todo[],
+    { default: [] as Todo[] },
+  );
+
+  const sorted = [...todos].sort((a, b) => b.createdAt - a.createdAt);
+  const [title, setTitle] = useState("");
+
+  return (
+    <main style={{ maxWidth: 480, margin: "2rem auto", padding: 16 }}>
+      <h1>Todos</h1>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!title.trim()) return;
+          rep.mutate.addTodo({
+            id: crypto.randomUUID(),
+            title: title.trim(),
+            createdAt: Date.now(),
+          });
+          setTitle("");
+        }}
+      >
+        <input
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          placeholder="What needs doing?"
+          style={{ width: "100%", padding: 8 }}
+        />
+      </form>
+      <ul>
+        {sorted.map((t) => (
+          <li key={t.id} style={{ opacity: t.done ? 0.5 : 1 }}>
+            <input
+              type="checkbox"
+              checked={t.done}
+              onChange={() => rep.mutate.toggleTodo({ id: t.id })}
+            />
+            <span style={{ marginLeft: 8 }}>{t.title}</span>
+            <button
+              style={{ marginLeft: 8 }}
+              onClick={() => rep.mutate.deleteTodo({ id: t.id })}
+            >
+              ×
+            </button>
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+```
+
+### 4. The "poke" WebSocket
+
+`src/poke.ts` — opens a WebSocket to the server, calls `onPoke` whenever the server tells the client to pull.
+
+```ts
+export function connectPoke(userID: string, onPoke: () => void) {
+  const ws = new WebSocket(`ws://localhost:3001/poke?userID=${userID}`);
+  ws.onmessage = (e) => {
+    if (e.data === "poke") onPoke();
+  };
+  return () => ws.close();
+}
+```
+
+### 5. Database schema
+
+`server/migrate.sql`:
+
+```sql
+CREATE TABLE IF NOT EXISTS replicache_space (
+  id          TEXT PRIMARY KEY,
+  version     BIGINT NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS replicache_client_group (
+  id          TEXT PRIMARY KEY,
+  user_id     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS replicache_client (
+  id                  TEXT PRIMARY KEY,
+  client_group_id     TEXT NOT NULL REFERENCES replicache_client_group(id),
+  last_mutation_id    INTEGER NOT NULL DEFAULT 0,
+  last_modified_version BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS todo (
+  id          TEXT PRIMARY KEY,
+  space_id    TEXT NOT NULL REFERENCES replicache_space(id),
+  title       TEXT NOT NULL,
+  done        BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at  BIGINT NOT NULL,
+  version     BIGINT NOT NULL,
+  deleted     BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS todo_space_version ON todo(space_id, version);
+```
+
+Run it: `psql $DATABASE_URL -f migrate.sql`.
+
+### 6. Server — push endpoint
+
+`server/index.ts`:
+
+```ts
+import { Hono } from "hono";
+import { serve } from "@hono/node-server";
+import { Pool } from "pg";
+import { mutators } from "../src/shared/mutators";
+import { WebSocketServer } from "ws";
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const app = new Hono();
+
+const userSockets = new Map<string, Set<WebSocket>>();
+
+function pokeUser(userID: string) {
+  const set = userSockets.get(userID);
+  if (!set) return;
+  for (const ws of set) ws.send("poke");
+}
+
+function spaceIDForUser(userID: string) {
+  return `space-${userID}`;
+}
+
+app.post("/api/replicache/push", async (c) => {
+  const body = await c.req.json();
+  const userID = c.req.header("Authorization")?.replace("Bearer dev-", "");
+  if (!userID) return c.json({ error: "unauthorized" }, 401);
+
+  const spaceID = spaceIDForUser(userID);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      "INSERT INTO replicache_space(id) VALUES($1) ON CONFLICT DO NOTHING",
+      [spaceID],
+    );
+    await client.query(
+      "INSERT INTO replicache_client_group(id, user_id) VALUES($1, $2) ON CONFLICT DO NOTHING",
+      [body.clientGroupID, userID],
+    );
+
+    const { rows: vrows } = await client.query(
+      "UPDATE replicache_space SET version = version + 1 WHERE id = $1 RETURNING version",
+      [spaceID],
+    );
+    const nextVersion: number = vrows[0].version;
+
+    for (const m of body.mutations) {
+      const { rows } = await client.query(
+        "SELECT last_mutation_id FROM replicache_client WHERE id = $1",
+        [m.clientID],
+      );
+      const lastMutationID: number = rows[0]?.last_mutation_id ?? 0;
+      if (m.id <= lastMutationID) continue;
+      if (m.id !== lastMutationID + 1) {
+        throw new Error(`gap: client ${m.clientID} expected ${lastMutationID + 1} got ${m.id}`);
+      }
+
+      const tx = makeServerTx(client, spaceID, nextVersion);
+      try {
+        await (mutators as never)[m.name](tx, m.args);
+      } catch (err) {
+        console.error("mutator failed", m.name, err);
+        // Bump lastMutationID anyway so we don't loop.
+      }
+
+      await client.query(
+        `INSERT INTO replicache_client (id, client_group_id, last_mutation_id, last_modified_version)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (id) DO UPDATE
+         SET last_mutation_id = $3, last_modified_version = $4`,
+        [m.clientID, body.clientGroupID, m.id, nextVersion],
+      );
+    }
+
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    return c.json({ error: String(err) }, 500);
+  } finally {
+    client.release();
+  }
+
+  pokeUser(userID);
+  return c.json({});
+});
+```
+
+The `makeServerTx` is a small adapter that gives the shared mutator something with `tx.set/get/del` semantics backed by Postgres:
+
+```ts
+function makeServerTx(client: PoolClient, spaceID: string, version: number) {
+  return {
+    async get(key: string) {
+      if (!key.startsWith("todo/")) return undefined;
+      const id = key.slice("todo/".length);
+      const { rows } = await client.query(
+        "SELECT id, title, done, created_at FROM todo WHERE id = $1 AND space_id = $2 AND NOT deleted",
+        [id, spaceID],
+      );
+      const r = rows[0];
+      return r ? { id: r.id, title: r.title, done: r.done, createdAt: Number(r.created_at) } : undefined;
+    },
+    async set(key: string, value: any) {
+      const id = key.slice("todo/".length);
+      await client.query(
+        `INSERT INTO todo (id, space_id, title, done, created_at, version, deleted)
+         VALUES ($1, $2, $3, $4, $5, $6, FALSE)
+         ON CONFLICT (id) DO UPDATE
+         SET title = $3, done = $4, version = $6, deleted = FALSE`,
+        [id, spaceID, value.title, value.done, value.createdAt, version],
+      );
+    },
+    async del(key: string) {
+      const id = key.slice("todo/".length);
+      await client.query(
+        "UPDATE todo SET deleted = TRUE, version = $2 WHERE id = $1 AND space_id = $3",
+        [id, version, spaceID],
+      );
+    },
+    async has(key: string) {
+      return (await (this as any).get(key)) !== undefined;
+    },
+    async scan() {
+      throw new Error("scan in mutators isn't supported in this minimal demo");
+    },
+  } as unknown as WriteTransaction;
+}
+```
+
+### 7. Server — pull endpoint
+
+```ts
+app.post("/api/replicache/pull", async (c) => {
+  const body = await c.req.json();
+  const userID = c.req.header("Authorization")?.replace("Bearer dev-", "");
+  if (!userID) return c.json({ error: "unauthorized" }, 401);
+
+  const spaceID = spaceIDForUser(userID);
+  const fromVersion: number = body.cookie?.version ?? 0;
+
+  const { rows: spaceRows } = await pool.query(
+    "SELECT version FROM replicache_space WHERE id = $1",
+    [spaceID],
+  );
+  const currentVersion: number = spaceRows[0]?.version ?? 0;
+
+  const { rows: changes } = await pool.query(
+    "SELECT id, title, done, created_at, deleted FROM todo WHERE space_id = $1 AND version > $2",
+    [spaceID, fromVersion],
+  );
+
+  const patch = changes.map((r) =>
+    r.deleted
+      ? { op: "del", key: `todo/${r.id}` }
+      : {
+          op: "put",
+          key: `todo/${r.id}`,
+          value: {
+            id: r.id,
+            title: r.title,
+            done: r.done,
+            createdAt: Number(r.created_at),
+          },
+        },
+  );
+
+  const { rows: clientRows } = await pool.query(
+    `SELECT id, last_mutation_id FROM replicache_client
+     WHERE client_group_id = $1 AND last_modified_version > $2`,
+    [body.clientGroupID, fromVersion],
+  );
+  const lastMutationIDChanges: Record<string, number> = {};
+  for (const r of clientRows) lastMutationIDChanges[r.id] = r.last_mutation_id;
+
+  return c.json({
+    cookie: { version: currentVersion },
+    lastMutationIDChanges,
+    patch,
+  });
+});
+
+serve({ fetch: app.fetch, port: 3001 });
+
+// WebSocket "poke" server
+const wss = new WebSocketServer({ port: 3002, path: "/poke" });
+wss.on("connection", (ws, req) => {
+  const url = new URL(req.url ?? "/", "http://x");
+  const userID = url.searchParams.get("userID");
+  if (!userID) return ws.close();
+  let set = userSockets.get(userID);
+  if (!set) {
+    set = new Set();
+    userSockets.set(userID, set);
+  }
+  set.add(ws as any);
+  ws.on("close", () => set!.delete(ws as any));
+});
+```
+
+(In a real app the WS would be on the same port via an upgrade handler. Two ports keeps the demo readable.)
+
+### 8. Run it
+
+```bash
+# Terminal 1
+cd server && bun run --watch index.ts
+
+# Terminal 2
+bun run dev
+```
+
+Open `http://localhost:5173` in two browsers (or one regular tab + one incognito to get separate Replicache instances).
+
+### 9. Test offline reconciliation
+
+1. Add a few todos in tab A. Watch them appear in tab B within ~500ms.
+2. In tab A's DevTools, go to Network → set throttling to "Offline."
+3. Add 3 more todos and toggle a couple of existing ones. They appear immediately in tab A — the UI doesn't know it's offline.
+4. Set throttling back to "Online." Within a second, your pending mutations push to the server and appear in tab B.
+5. The Replicache devtools (auto-injected in dev) show the pending mutation queue draining.
+
+That's the rebase loop, working.
+
+## Stretch goals
+
+- **Auth a second user.** Add a `userID` query param to the poke WS and the Authorization header — switch between Alice and Bob in two tabs. Confirm they don't see each other's todos (different `spaceIDForUser`).
+- **A "logged out" cache wipe.** Add a logout button that calls `rep.close()` and `Replicache.dropAllDatabases()`. Confirm the next login starts cold.
+- **Multi-tab BroadcastChannel.** Open two tabs as the same user. Mutate in tab 1. Tab 2 updates without a server round-trip — Replicache uses BroadcastChannel for this automatically. Verify in Network that no pull was triggered.
+- **A "search" index.** Add an index by title prefix. Use `tx.scan({ indexName: "byTitle", prefix: q })` in `useSubscribe`. Watch the search update reactively as you type.
+- **Schema migration.** Add a `priority: "low" | "normal" | "high"` field to Todo. Bump `SCHEMA_VERSION` to `2`. Reload. Confirm the old cache is left alone and a fresh pull happens against the new schema. (Optional: write a sweeper that drops old `user-*-v1` IDBs after a week.)
+
+## What to internalize
+
+When you finish, you should be able to answer:
+
+- Why is `id` passed into `addTodo` instead of generated inside the mutator?
+- What does the `cookie` in pull responses actually represent?
+- What happens if the server crashes between applying a mutation and bumping `last_mutation_id`? (Transaction rolls back; client retries.)
+- What would change if you added 50,000 todos? (Pull payload — you'd need pagination or per-view scoping.)
+
+If those answers feel obvious, the module landed.
+
+</ProjectCard>
+
+<Reading url="https://doc.replicache.dev/byob/intro" title="Replicache — Build Your Own Backend" kind="docs" minutes={20} />
+<Reading url="https://doc.replicache.dev/concepts/how-it-works" title="Replicache — How it Works" kind="docs" minutes={10} />
+<Reading url="https://github.com/rocicorp/todo-row-versioning" title="Reference: todo-row-versioning" kind="docs" minutes={15} />
+<Reading url="https://doc.replicache.dev/howto/poke" title="Replicache — Pokes" kind="docs" minutes={6} />
