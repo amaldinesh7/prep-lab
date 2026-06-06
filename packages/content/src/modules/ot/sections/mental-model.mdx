@@ -1,0 +1,168 @@
+---
+title: How OT works
+---
+
+<SectionHeader kind="concept" number={2} title="How OT works" />
+
+OT is a small idea wrapped in a lot of algebra. The small idea is "transform my op against yours before applying it." The algebra exists because that transform has to be correct for _every pair_ of op types, in _every order_, under _every concurrency pattern_. Get one transform wrong and replicas diverge silently. So most of the OT literature is about that proof burden.
+
+This section is the small idea, plus enough algebra to read the literature without panicking.
+
+## The unit of edit: operations
+
+Every OT system models edits as a small alphabet of operations. For text, the canonical three:
+
+- `insert(pos, str)` — insert string `str` at absolute position `pos`
+- `delete(pos, len)` — delete `len` characters starting at `pos`
+- `retain(n)` — skip `n` characters (used in the "Quill / ot.js" representation where an op is a sequence of retain/insert/delete steps describing a whole edit, not a single keystroke)
+
+Two flavors of representation, both valid. Older OT (dOPT, Jupiter) treats each keystroke as one op — `insert(5, "x")`. Newer OT (ShareDB, ot.js, Quill deltas) treats a whole "edit" as a sequence of retain/insert/delete steps, like a tiny patch language. The transform math is similar either way; deltas are just more compact on the wire.
+
+For the rest of this section, use the keystroke model — it's clearer for explaining transforms.
+
+## The transform function
+
+This is the heart of OT. Given two concurrent operations `A` and `B` made on the same parent state, the transform function produces `A'` and `B'` such that:
+
+```
+apply(apply(state, A), B') === apply(apply(state, B), A')
+```
+
+In English: if I apply A first then B-transformed, I get the same result as if I applied B first then A-transformed. The transform "rewrites" each op so it makes sense after the other one already happened.
+
+This identity is called **TP1** (Transformation Property 1), and every correct transform function satisfies it.
+
+## A concrete walk-through: two concurrent inserts
+
+State: `"hello"`. Alice inserts "X" at position 0. Bob inserts "Y" at position 5.
+
+```
+A = insert(0, "X")
+B = insert(5, "Y")
+```
+
+Without transform: Alice's machine applies A → `"Xhello"`. Then Bob's op arrives. Apply B literally: `insert(5, "Y")` on `"Xhello"` → `"XhellY"o"` — wait, that lost a character. Position 5 in `"hello"` was after the 'o' (off the end). Position 5 in `"Xhello"` is between 'l' and 'o'. So `"XhellYo"`. Wrong.
+
+With transform: Alice's machine applies A → `"Xhello"`. Bob's op arrives; we transform B against A first.
+
+```ts
+function transformII(op1: Insert, op2: Insert): Insert {
+  // op2 is the op we already applied locally. We want to rewrite op1
+  // so it lands in the right place AFTER op2 has happened.
+  if (op1.pos < op2.pos) return op1;              // op1 is to the left; unaffected
+  if (op1.pos > op2.pos) return shift(op1, +op2.str.length); // op1 is to the right; shift it
+  // op1.pos === op2.pos — tie. Use a stable tiebreaker (e.g. clientId).
+  return op1.clientId < op2.clientId
+    ? op1
+    : shift(op1, +op2.str.length);
+}
+```
+
+Bob's `insert(5, "Y")` transformed against Alice's `insert(0, "X")`: Bob's position 5 is to the right of Alice's position 0, so shift right by `"X".length === 1`. New op: `insert(6, "Y")`. Apply to `"Xhello"` → `"XhelloY"`. Correct.
+
+Meanwhile, on Bob's machine: he applied B → `"helloY"`. Alice's `insert(0, "X")` arrives. Transform against B: Alice's position 0 is to the left of Bob's position 5, so no shift. Apply `insert(0, "X")` to `"helloY"` → `"XhelloY"`. Same result. Both replicas converged. That's TP1.
+
+<Code lang="ts" file="transform-insert-insert.ts">{`type Insert = { kind: "insert"; pos: number; str: string; clientId: string };
+
+// Transform op1 against op2: produce op1' that should be applied AFTER op2.
+function transformInsertInsert(op1: Insert, op2: Insert): Insert {
+  if (op1.pos < op2.pos) return op1;
+  if (op1.pos > op2.pos) return { ...op1, pos: op1.pos + op2.str.length };
+  // Same position — tiebreak deterministically so all replicas agree.
+  return op1.clientId < op2.clientId
+    ? op1
+    : { ...op1, pos: op1.pos + op2.str.length };
+}
+`}</Code>
+
+That's one transform function. A complete text OT needs all four pairs: insert/insert, insert/delete, delete/insert, delete/delete. Add rich text (formatting attributes), and you need transforms for those too. Add structural ops (object key set, list reorder), and the matrix explodes. The Quill delta spec has ~30 transform cases. ShareDB JSON OT has dozens.
+
+This is the proof burden. Every cell of the transform matrix has to be correct under TP1, and (in some algorithms) under TP2 as well.
+
+## TP1, TP2, and why P2P OT is hard
+
+Two algebraic properties define correctness:
+
+**TP1 (convergence under two-way concurrency)**
+
+```
+apply(apply(s, A), transform(B, A)) === apply(apply(s, B), transform(A, B))
+```
+
+Two clients, two concurrent ops. Both replicas converge. Every shipping OT satisfies TP1.
+
+**TP2 (convergence under three-way concurrency)**
+
+```
+transform(C, transform(A, B)) === transform(C, transform(B, A))
+   when applied through different paths through three concurrent ops
+```
+
+Three or more concurrent ops with non-trivial interactions. The transform has to be path-independent: the order in which you fold concurrent ops in shouldn't change the result.
+
+**TP2 is the hard one.** Many published OT algorithms turn out to violate TP2 in some corner case — usually involving overlapping deletes plus an insert. If your system has a central server that serializes all ops (so there are only ever two truly concurrent ops at a time — yours and the server's view), you only need TP1 and you can ship. If you have peer-to-peer OT (no server linearizing edits), you need TP2 and your life becomes very hard.
+
+This is the structural reason every shipping OT system has a central server. It's not a coincidence. It's the property the algorithm needs to be tractable.
+
+## The Jupiter algorithm
+
+Jupiter, from Lotus / Xerox PARC in 1995, is the version that became the production blueprint. The shape:
+
+1. Each client maintains a doc state and a queue of unacknowledged local ops.
+2. Server holds the canonical doc and a per-client view of "what this client has seen."
+3. Client makes a local op, applies it immediately, sends to server.
+4. Server transforms incoming ops against any ops the client hadn't seen yet, applies, broadcasts to others.
+5. Server-to-client acks track which ops the client has confirmed; the client trims its unacked queue accordingly.
+
+Because the server linearizes — every op has a canonical position in a global sequence — there are never more than two truly concurrent op streams (client's unacked queue, and the new ops the server is sending down). That's a TP1 world. Jupiter is provably correct under TP1, which is achievable; it sidesteps TP2 by architecture.
+
+<Code lang="ts" file="jupiter-sketch.ts">{`// Conceptual sketch of the client side of Jupiter. Real implementations
+// are more careful about edge cases (ops in flight, server reconnects).
+class JupiterClient {
+  doc = "";
+  unacked: Op[] = []; // local ops we've sent but server hasn't confirmed
+
+  applyLocal(op: Op) {
+    this.doc = apply(this.doc, op);
+    this.unacked.push(op);
+    server.send(op);
+  }
+
+  onServerOp(remoteOp: Op) {
+    let r = remoteOp;
+    const newUnacked: Op[] = [];
+    for (const local of this.unacked) {
+      // Transform remoteOp through each unacked local op.
+      // Also produce a new local op that fits after remoteOp.
+      const rPrime = transform(r, local);
+      const localPrime = transform(local, r);
+      r = rPrime;
+      newUnacked.push(localPrime);
+    }
+    this.unacked = newUnacked;
+    this.doc = apply(this.doc, r);
+  }
+
+  onServerAck(opId: string) {
+    this.unacked = this.unacked.filter(o => o.id !== opId);
+  }
+}
+`}</Code>
+
+The operation tree (the data structure the algorithm walks) is just the graph of "which ops were causally before which." On a client, your unacked queue is one path through that tree. The server's history is the canonical path. Transform composes the two.
+
+## What you should hold in your head
+
+You don't need to memorize the transform matrix. You need to remember the shape:
+
+1. **Ops are the unit.** Insert, delete, retain, plus type-specific extensions.
+2. **Transform is the operation.** Given two concurrent ops on the same parent state, produce shifted versions that compose correctly.
+3. **TP1 is the bar; TP2 is the wall.** TP1 gets you two-way convergence; TP2 gets you peer-to-peer. Most production OT only does TP1 and uses a central server to dodge TP2.
+4. **Jupiter is the production shape.** Client queue of unacked ops, server linearizes, transform on both sides.
+
+Hold those four and you can read any OT paper. Don't hold those four and you'll get lost in the algebra fast.
+
+<Reading url="https://operational-transformation.github.io/" title="Operational Transformation FAQ" author="Daniel Spiewak" kind="docs" minutes={20} />
+<Reading url="https://www.bartoszsypytkowski.com/operational-transformation/" title="Operational transformation explained" author="Bartosz Sypytkowski" kind="blog" minutes={15} />
+
+**Remember this:** OT = ops as the unit + transform function for every pair + TP1 (or TP2 if you're brave). The transform turns "your op as written" into "your op rewritten to fit after mine." Central server makes the math tractable.

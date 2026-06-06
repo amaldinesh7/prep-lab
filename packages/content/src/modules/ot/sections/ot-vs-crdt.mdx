@@ -1,0 +1,89 @@
+---
+title: OT vs CRDT head-to-head
+---
+
+<SectionHeader kind="concept" number={4} title="OT vs CRDT head-to-head" />
+
+You now know both algorithms. Time for the comparison that matters in an actual design review.
+
+## The summary table
+
+| Axis | OT | CRDT |
+| --- | --- | --- |
+| Correctness | Proven per-transform, per-pair, fragile | Correct by construction (lattice / unique IDs) |
+| Topology | Central server required in practice | Peer-to-peer capable |
+| Memory | Small — doc is just the doc | ~3× — tombstones, origin pointers |
+| Update size | Tiny (deltas with positions) | Larger (IDs, metadata) |
+| Implementation effort | Heroic | Library import |
+| Schema evolution | Server-side migrations possible | Hard (additive-only) |
+| Offline support | Bounded (server must reconcile) | First-class (any duration) |
+| History | Linear op log — natural | Synthesizable but not free |
+| Famous products | Google Docs, Etherpad, ShareDB apps, Wave | Figma (custom), Yjs apps, Linear (sync engine), Notion (mixed) |
+
+That's the headline. Now the texture.
+
+## Correctness: proofs vs structure
+
+OT's correctness is a chain of theorems. For every pair of op types, you write a transform function, you (hopefully) prove TP1, you (with great difficulty) prove TP2 if you need peer-to-peer. Every time you add a new op type — say, "set table cell" — you extend the matrix and re-prove. Bugs in the transform manifest as silent divergence between replicas, hours or days after the offending keystroke. They are nightmarish to debug.
+
+CRDTs invert this. The correctness comes from the data structure itself. Yjs is correct because YATA is correct because the merge of any two operations is determined by stable IDs that no two clients can collide on. The proof is once-and-done at the algorithm level; adding new field types doesn't reopen it (as long as they compose existing CRDT primitives).
+
+This is the actual reason new collab products pick CRDTs. Not the topology, not the memory, not the API — the proof burden. It's the difference between "we hire a PhD and pray" and "we npm install and ship."
+
+## Architecture: server bound vs free
+
+OT requires a server in production. You can build an OT system without one in academic papers; nobody ships one. The server's job — linearizing ops — is structurally what makes the math tractable. Remove the server and you need TP2-correct transforms, and TP2 is not a problem the field has cleanly solved.
+
+CRDTs don't require a server. They benefit from one (a relay, a persistence layer, an access control point) but the merge happens client-side. Two phones on a plane can sync via Bluetooth. A web app can hold offline edits for a week and merge them on reconnect with no special server logic.
+
+If your product can ever be offline for longer than a sync window — local-first apps, mobile editors, desktop tools with sketchy connectivity — CRDTs are structurally the right answer. If your product is a tab in a browser that always has a connection, OT is fine in principle, but you still have to build the server.
+
+## Memory: small ops vs tombstones
+
+OT documents look like normal data structures in memory. A 100KB doc is 100KB of state plus a small op log if you keep one. Update messages on the wire are tiny — `{"op":"insert","pos":1234,"str":"x"}` is maybe 30 bytes.
+
+CRDTs pay structural overhead. Yjs's `Y.Text` runs ~3× the cost of a plain string at editor scale. Each character lives in an `Item` block with origin pointers, IDs, and flags. Tombstones persist deleted content (logically; physically they get GC'd carefully). Update messages carry IDs and origin metadata — bigger than equivalent OT deltas.
+
+For a doc the size of a chat message, the difference is negligible. For a 5MB document with millions of historical edits, the difference is real — initial sync time, mobile memory pressure, server costs.
+
+## Real-world: who picked what
+
+The map of who runs which algorithm tells the story of the field:
+
+- **Google Docs** — OT (Jupiter-shaped). Built before CRDTs were viable. Two decades of engineering investment. Not going to migrate.
+- **Etherpad** — OT (Easysync, a Jupiter cousin). One of the original open-source OT shippers. Still alive, still OT.
+- **ShareDB / ShareJS** — OT library underlying many smaller products. Joseph Gentle's project; he eventually wrote Diamond Types as a CRDT replacement.
+- **Figma** — Custom CRDT-like protocol, not a textbook CRDT. They published a great blog post — it's a tree-CRDT-flavored system with their own concurrency rules. The point is they built it custom because nothing off the shelf fit a vector design canvas.
+- **Linear** — Sync engine architecture; not pure CRDT but operates as a delta-streamed model with server linearization. Closer to OT philosophically; the local-first feel comes from optimistic UI plus heavy caching, not from CRDT merge.
+- **Notion** — Mixed. Earlier versions used an OT-shaped protocol. Some blocks are CRDTs, some are LWW. Hybrid by design.
+- **VS Code Live Share** — OT (from Microsoft). Inherits the Jupiter playbook.
+- **Yjs / Automerge ecosystems** — Pure CRDT. Anything built on top of these (Tiptap collab, Liveblocks's Yjs mode, Hocuspocus) is a CRDT shop.
+
+The pattern: products built before ~2015 are OT-leaning. Products built after ~2020 are CRDT-leaning. Products in between are mixed and often regret it.
+
+## Why most new collab products pick CRDTs
+
+Restated as a rule of thumb:
+
+1. **CRDT libraries exist and are battle-tested.** Yjs has been shipping for years. You can have collab editing working in a weekend. OT means writing transforms from scratch or adopting ShareDB and accepting its constraints.
+2. **Offline-first is a product expectation now.** Users assume an app that can sync edits made on a plane. CRDTs do this naturally; OT requires building a queue-and-replay layer with bounded offline windows.
+3. **No central server bottleneck.** Even if you run a relay, the merge doesn't depend on it being available. Servers can scale horizontally without coordination per doc.
+4. **Local-first as a movement.** Ink & Switch, the local-first community, the rise of edge databases — all are aligned with CRDT-shaped architectures. The mindshare is there.
+
+OT's pitch in 2024 is increasingly "we already have it and migrating is expensive." Which is a real argument for incumbents, and a non-argument for greenfield projects.
+
+<Callout kind="pattern">
+  **Rule of thumb for new builds (2024+):** start with a CRDT. Reach for OT only if you have an existing OT infrastructure you can't replace, or a strict server-of-truth requirement (compliance, audit, regulated industry) that maps cleanly to OT's central-server model. For everything else — the broad middle of "we want collab editing in our product" — the answer is Yjs or Automerge.
+</Callout>
+
+## The honest take
+
+OT is not obsolete. Google Docs is still the most-used collaborative editor in the world. ShareDB still ships. The algorithm works, the math is sound (modulo well-known TP2 issues), and the tooling is mature. If you walk into a job at a company already running OT, the answer isn't "tell them to migrate to Yjs." The answer is "learn the codebase, ship features, respect the algorithm."
+
+But if you're picking the algorithm yourself, for a new product, in 2024: CRDT. The cost difference (memory, update size) is dominated by the engineering cost difference (months of OT implementation vs. days of CRDT integration). The reason to pick OT is increasingly historical.
+
+<Reading url="https://josephg.com/blog/crdts-go-brrr/" title="5000x faster CRDTs: An adventure in optimization (Joseph Gentle)" kind="blog" minutes={20} />
+<Reading url="https://www.figma.com/blog/how-figmas-multiplayer-technology-works/" title="How Figma's multiplayer technology works" author="Evan Wallace" kind="blog" minutes={15} />
+<Reading url="https://martin.kleppmann.com/2020/07/06/crdt-hard-parts-hydra.html" title="CRDTs: The Hard Parts" author="Martin Kleppmann" kind="blog" minutes={20} />
+
+**Remember this:** CRDTs are correct by construction; OT is correct by careful proof. CRDTs can be peer-to-peer; OT needs a server. The new defaults reflect those structural facts. Old Google products still run OT and will for years.

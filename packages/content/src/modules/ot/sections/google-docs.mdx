@@ -1,0 +1,113 @@
+---
+title: How Google Docs does it
+---
+
+<SectionHeader kind="concept" number={3} title="How Google Docs does it" />
+
+The most-used collaborative editor in the world is built on operational transform (OT). Knowing the shape of that system is useful both as engineering folklore and as a reference architecture — every "build a Google Docs clone" interview question is asking you to describe some subset of this.
+
+The reconstruction here is from Google engineering blog posts, public talks (Jeff Harris and others), the Wave whitepaper that preceded Docs, and Joseph Gentle's analyses (he worked on Wave). Google has never published the production algorithm in full; what's public is enough to know the architecture.
+
+## The architecture in one diagram
+
+```
+   Client A                    Server                    Client B
+   --------                    ------                    --------
+   doc state                   canonical doc             doc state
+   unacked queue               op log (linearized)       unacked queue
+        |                            |                        |
+        |--- op1 ------------------->|                        |
+        |                            |--- op1 broadcast ----->|
+        |                            |                        |
+        |                            |<--- op2 ---------------|
+        |<-- op2 (transformed) ------|                        |
+        |                            |--- op2' broadcast ---->|
+        |                                                     |
+        |                            (ack op1 to A)           |
+```
+
+Every edit goes through the server. There is no peer-to-peer Google Docs. The server is the linearization point — it assigns the canonical order to every operation. Clients hold a local view; the server holds the truth.
+
+Three things this gives Google:
+
+1. **TP1 is enough.** Because the server serializes ops, the algorithm never sees three-way concurrency in the wild — it only ever sees "client's unacked queue" vs "server's authoritative history." Two paths. TP1 suffices. The hellscape of TP2 is sidestepped.
+
+2. **Compliance and audit.** Every keystroke that ever happened in your doc is on Google's servers, time-stamped, in a known order. You can revert by version. Enterprise customers can audit who typed what when. This is not free for CRDT-based products — they have no canonical history without bolting one on.
+
+3. **Server-side intelligence.** Spellcheck, grammar suggestions, AI smart-compose — all of these run server-side against the canonical doc. Because the server owns the truth, it can compute on it without races.
+
+## The client side: optimistic + reconcile
+
+Your browser tab holds a local copy of the doc plus a queue of unacknowledged operations — ops you typed that the server hasn't confirmed yet. When you press a key:
+
+1. Apply the op locally, immediately. Your cursor moves; the character appears. No round-trip.
+2. Send the op to the server. Add it to the unacked queue.
+3. Server eventually acks (or rejects, but rejection is rare in OT — the server has to transform, not refuse).
+4. Server may interleave other clients' ops in its response. For each remote op, the client transforms it against every unacked local op (those are the ops the remote op couldn't have known about), then applies the result.
+5. The client also rewrites its own unacked queue to reflect "what these ops look like after the server's view has shifted."
+
+Functionally identical to Jupiter. Conceptually it's optimistic UI with a much smarter reconciliation step than a typical REST app.
+
+The latency budget: keystroke to local render = single-digit ms. Keystroke to other-user-sees-it = whatever the network round-trip is. The two are decoupled, which is the whole reason it feels fluid.
+
+## The server side: linearize + broadcast
+
+The server's job, as Joseph Gentle has summarized it:
+
+- Hold the canonical document state.
+- Maintain a per-client "high-water mark" — the server's last op number that this client acknowledged.
+- Accept incoming client ops. For each, transform against any server ops the client hadn't seen (everything above their high-water mark). Apply to the canonical doc. Assign it a server op number.
+- Broadcast the (possibly transformed) op to all other clients, along with what each one is expected to transform it against.
+- Track acks; advance high-water marks.
+
+The server is single-threaded per doc. Two clients sending ops at the same time results in the server picking an order and serializing them — usually first-arrival-first-served, with the transform handling the resulting concurrency. This is the linearization that makes the math work.
+
+<Code lang="ts" file="server-sketch.ts">{`// A heavy simplification of what the Docs server does per document.
+type ServerState = {
+  doc: string;
+  history: Op[];                  // canonical op log, indexed
+  perClient: Map<string, number>; // clientId -> last acked op index
+};
+
+function onClientOp(s: ServerState, clientId: string, clientOp: Op) {
+  const lastSeen = s.perClient.get(clientId) ?? 0;
+  // Transform clientOp against every server op the client missed.
+  let op = clientOp;
+  for (let i = lastSeen; i < s.history.length; i++) {
+    op = transform(op, s.history[i]);
+  }
+  // Apply, append, update bookkeeping.
+  s.doc = apply(s.doc, op);
+  s.history.push(op);
+  s.perClient.set(clientId, s.history.length);
+  // Broadcast op (with index) to all other clients.
+  broadcast(op, s.history.length - 1, exclude: clientId);
+}
+`}</Code>
+
+Real implementations are vastly more complex (sharding, persistence, presence, ACLs, undo stacks, formatting ops, embeds, comments) — but the heartbeat is this loop.
+
+## The scale story
+
+Google Docs at peak has tens of millions of concurrent active editors across hundreds of millions of docs. The architecture scales by:
+
+- **One doc, one server.** Each document is owned by a single server process at any moment. All ops for that doc go through that one process. This keeps the linearization simple — no distributed consensus needed per keystroke.
+- **Document migration.** Docs move between servers based on load and locality. The owning server changes; the op log persists in storage.
+- **Persistence is the log.** The doc isn't the truth; the op log is. The doc is a materialization. Rebuild from log on demand; snapshot periodically.
+- **Read replicas.** Clients can read snapshots from edge caches; writes go to the owning server.
+
+The interesting consequence: you cannot use the same architecture for a peer-to-peer product. If your product needs to work on a flight with no server, OT doesn't get you there — every op needs the server to assign its position. CRDTs do.
+
+## Why no production OT is peer-to-peer
+
+You'll see "P2P OT" mentioned in academic papers. None of these systems shipped at scale. The reason is TP2: without a central server, three-way concurrency is real, and TP2 transforms are genuinely brutal to get right. Several published "TP2-correct" OT algorithms were later shown to be incorrect by Imine and others.
+
+Joseph Gentle, who worked on the Wave codebase, has written that the Wave server was an enormous engineering investment specifically because it dodged the TP2 problem by linearizing. He's also written that he would not build OT today for a new product — he ships CRDTs for everything now.
+
+That migration of opinion — from OT being the default in 2009 to CRDTs being the default in 2024 — is the subject of the next section.
+
+<Reading url="https://josephg.com/blog/crdts-go-brrr/" title="CRDTs go brrr (with OT context from a Wave engineer)" author="Joseph Gentle" kind="blog" minutes={20} />
+<Reading url="https://www.waveprotocol.org/whitepapers/operational-transform" title="Google Wave Operational Transformation whitepaper" kind="paper" minutes={40} />
+<Reading url="https://drive.google.com/file/d/0B4nzPKi-Ya6vd1RKaC1tWHFCLW8/view" title="What's different about the new Google Docs (engineering blog)" author="Jeff Harris" kind="blog" minutes={12} />
+
+**Remember this:** Google Docs = client unacked queue + central server linearizing + transform on both sides. The server is what makes the algorithm tractable. No server, no production OT.

@@ -1,0 +1,64 @@
+{
+  "questions": [
+    {
+      "id": "q1",
+      "prompt": "Why does operational transform (OT) typically need a central server in production?",
+      "options": [
+        { "id": "a", "label": "Because clients are too slow to compute transforms locally — the server does it for them" },
+        { "id": "b", "label": "Because the server provides a linearization point (only ever two concurrent op streams to reconcile), letting the algorithm satisfy TP1 — peer-to-peer OT requires TP2-correct transforms, which are notoriously hard and have repeatedly been shown to be buggy in published algorithms" },
+        { "id": "c", "label": "Because TCP requires a server endpoint" },
+        { "id": "d", "label": "Because the server holds the encryption keys for the document" }
+      ],
+      "correct": "b",
+      "explanation": "The central server in OT is structural, not incidental. It linearizes ops into a canonical order, which means the algorithm only ever has to handle two-way concurrency — the client's unacked queue vs the server's history. That's TP1 territory, which is achievable. Peer-to-peer OT introduces three-way+ concurrency, which requires TP2, and no published TP2-correct algorithm has survived long-term scrutiny. The server is what makes OT tractable."
+    },
+    {
+      "id": "q2",
+      "prompt": "Informally, what does the TP1 property guarantee?",
+      "options": [
+        { "id": "a", "label": "Every operation is transformed at most once" },
+        { "id": "b", "label": "If client A applies B's op (transformed) on top of its own state, and client B applies A's op (transformed) on top of its own state, both replicas end up in the same state" },
+        { "id": "c", "label": "Operations always arrive in the order they were created" },
+        { "id": "d", "label": "The transform function is associative and commutative" }
+      ],
+      "correct": "b",
+      "explanation": "TP1 is the two-way convergence property: apply(apply(s, A), transform(B, A)) === apply(apply(s, B), transform(A, B)). In plain terms, the transformed ops compose so that any client applying both ops (in either order, with the appropriate transform) lands in the same final state. It is the bar every shipping OT system has to clear."
+    },
+    {
+      "id": "q3",
+      "prompt": "What is the main architectural difference between OT and CRDTs?",
+      "options": [
+        { "id": "a", "label": "OT supports text; CRDTs only support numbers" },
+        { "id": "b", "label": "OT runs in the browser; CRDTs run on the server" },
+        { "id": "c", "label": "OT in practice requires a central server to linearize ops; CRDTs can converge peer-to-peer with no coordinator because the data structure is correct by construction" },
+        { "id": "d", "label": "OT is open-source; CRDTs are proprietary" }
+      ],
+      "correct": "c",
+      "explanation": "Topology is the deepest architectural split. OT's correctness relies on linearization, which in practice means a central server. CRDTs are designed so that any two replicas seeing the same set of ops converge to the same state, regardless of order or arrival path — no coordinator needed. That's why CRDTs power offline-first and P2P products and OT powers central-server products like Google Docs."
+    },
+    {
+      "id": "q4",
+      "prompt": "In 2024+, when is OT a better choice than CRDTs?",
+      "options": [
+        { "id": "a", "label": "When you want a fancier algorithm to put on a resume" },
+        { "id": "b", "label": "When you have a strict server-of-truth model (compliance, server-side AI, permission enforcement), small ops over the wire genuinely matter, or you already have an existing OT infrastructure that would be expensive to replace" },
+        { "id": "c", "label": "When the product is offline-first and peer-to-peer" },
+        { "id": "d", "label": "Whenever the document is shorter than 1KB" }
+      ],
+      "correct": "b",
+      "explanation": "OT's modern wins are: existing infrastructure (Wave-lineage code, ShareDB shops, internal OT systems), strict server-of-truth requirements (compliance, server-side intelligence, permissions), and bandwidth-tight workloads where per-op size matters. Offline-first + P2P is exactly where CRDTs beat OT, so option (c) is backwards."
+    },
+    {
+      "id": "q5",
+      "prompt": "Name a famous, real-world production system that uses operational transform.",
+      "options": [
+        { "id": "a", "label": "Google Docs (the canonical example; Etherpad is also acceptable)" },
+        { "id": "b", "label": "Figma" },
+        { "id": "c", "label": "Yjs" },
+        { "id": "d", "label": "Automerge" }
+      ],
+      "correct": "a",
+      "explanation": "Google Docs is the most-used OT-based system in the world, running a Jupiter-shaped algorithm. Etherpad (Easysync) and VS Code Live Share are other shipping OT systems. Figma uses a custom CRDT-like protocol (not pure OT); Yjs and Automerge are CRDT libraries."
+    }
+  ]
+}

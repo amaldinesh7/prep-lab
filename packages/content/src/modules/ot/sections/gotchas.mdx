@@ -1,0 +1,105 @@
+---
+title: Production gotchas
+---
+
+<SectionHeader kind="gotcha" number={6} title="Production gotchas" />
+
+If you're on a team running OT, here are the failure modes you'll see. None of them are exotic — they're the same handful of bugs that have shipped, regressed, and re-shipped in every OT system ever deployed.
+
+## 1. Transform function bugs (TP1, TP2)
+
+The transform matrix is where 80% of OT bugs live. Symptom: two replicas diverge silently. Same op stream, different final state. The user doesn't notice for hours because the divergence might be a misplaced character in a paragraph nobody is currently reading. Then someone scrolls back, sees the discrepancy, and files "the doc is wrong on my screen."
+
+Root cause is almost always one of:
+
+- A transform pair that violates TP1 in some edge case. Usually involves ties (same position, same op type) where the tiebreaker isn't deterministic — e.g. comparing timestamps that aren't actually unique.
+- A transform pair where you handled `insert vs insert` and `delete vs delete` but forgot `insert vs delete` in one direction.
+- A TP2 violation when more than two clients edit concurrently with overlapping ops. Symptom: works fine with two clients, breaks with three or more on bad networks.
+
+Diagnostic protocol:
+
+1. Reproduce with a deterministic op sequence (timestamps fixed, clientIds fixed). If it's deterministic, the bug is in the transform; if it's not deterministic, it's a network ordering bug.
+2. For every reported divergence, log both client states + the full op sequence both clients applied. Diff them.
+3. Build a test harness that fuzz-tests transforms: random ops, random concurrency patterns, check TP1 holds for every pair on every replica path.
+
+This is the kind of debugging that takes weeks. Budget for it.
+
+## 2. Server crashes mid-transform
+
+The server is the single linearization point. It crashes — process killed, server rebooted, network partition. What's the state?
+
+The right design holds:
+
+- Every op the server applied is durably written to the op log _before_ broadcasting to other clients.
+- Acks to the originating client are sent _after_ the log write.
+- On restart, the server replays the log to reconstruct the canonical doc.
+
+The failure mode: the server applied the op in-memory, broadcast it to peers, and crashed before persisting. On restart, the canonical doc doesn't include the op. Peers think they have the doc; the server thinks they don't. Their next op transforms against a server view that doesn't include the missing op, and divergence ensues.
+
+The fix is write-ahead logging — the same discipline a database uses. The op gets to disk, _then_ broadcasts, _then_ acks. If you crash between any of these, on restart you replay the log and the world is consistent.
+
+If your OT system doesn't have this discipline (some open-source ones don't), you have a latent data corruption bug waiting to fire on the next outage.
+
+## 3. Network reordering and causal order
+
+OT assumes ops arrive in causal order from any single client's perspective. Op #5 from client A must arrive after op #4 from client A. The server numbers them, but if the network reorders messages (UDP, multiple TCP connections, retried requests), you can get op #5 applied before op #4. Boom: the transform input is wrong, the result diverges.
+
+Defense:
+
+- Single TCP connection per client per doc. Don't multiplex over multiple sockets.
+- Sequence numbers on every op, server-validated. If op #5 arrives before #4, buffer it; apply only when its predecessor lands.
+- Don't retry transparently at the transport layer in a way that can reorder. If a request fails, the client retries with the same sequence number, server idempotently handles it.
+
+Causal order is sneakier than it sounds. Most teams get the happy path right and discover the failure on a flaky 4G connection two months in.
+
+## 4. Late-joining clients need full snapshots
+
+A new user opens the doc. They have nothing. The server has the canonical state. How does the new client catch up?
+
+The naive answer: send the full op log so the client can replay it. This works until the log has millions of entries and the client takes 30 seconds to apply them on a phone.
+
+The right answer: send a snapshot of the current doc, plus enough metadata to position the client in the op stream (the latest server op number). The client starts from the snapshot, listens for new ops, transforms its local ops against the server's history. Snapshots get generated periodically — every N ops, every hour, etc.
+
+The subtler problem: a client that was offline for a week reconnects. Their unacked queue has ops based on a doc version that's now ancient. The server has to transform those ops through everything that happened in the intervening week — potentially thousands of ops to transform against. This can be slow on the server, and the transform might compound errors if any single transform pair is buggy.
+
+Long-offline reconnects in OT are intrinsically hard. CRDTs handle this better, because they don't depend on op replay through a linear history. If your OT product has heavy offline use, you'll feel this.
+
+## 5. Schema changes are brutal
+
+Your ops reference field IDs. `{"op":"insert","field":"body","pos":5,"str":"x"}`. The doc structure has a field called `body`.
+
+You decide to rename `body` to `content`. Now you have:
+
+- Historical ops in the log that reference `body`.
+- New ops from old clients (cached, unflushed) that reference `body`.
+- New ops from updated clients that reference `content`.
+
+You can write a translation layer: server-side, every `body` op becomes a `content` op. Now historical replay works. But you also have to handle the case where an old client (still running yesterday's code) sends a `body` op _while_ a new client sends a `content` op against the new field — both ops have to converge. If your translation is one-way (old → new), you handle the old-client case but lose the new client's edit. If it's two-way, you're maintaining two field names forever.
+
+Type changes are worse. A `body` that was a string OT field becoming a structured array of paragraphs — there's no transform from "insert character" to "insert paragraph object." You're effectively migrating to a new doc.
+
+Schema evolution in OT is closer to relational DDL than to most application-level code. Plan migrations the way you'd plan a Postgres schema migration: phases, dual-writes, version gating.
+
+## 6. Undo: the famous OT undo problem
+
+User-level undo (Cmd-Z) in OT is its own research area. The straightforward implementation — "invert my last op and apply it" — breaks when other users have edited in between, because the inversion has to be transformed through their changes.
+
+The literature calls this "selective undo," and the algorithms are not trivial. Done wrong, undo can resurrect deleted content, lose unrelated edits, or produce states that no user expected.
+
+Google Docs has a sophisticated undo stack with selective undo support. Etherpad's undo is famously quirky. ShareDB delegates to the application. If you're building OT undo yourself, study the existing implementations carefully before rolling your own.
+
+## 7. Op ordering bugs from race conditions in the server
+
+Server is single-threaded per doc — in principle. In practice, an async event loop with promises and microtasks can let two ops interleave in surprising ways. Op A is being persisted; op B arrives and is enqueued; persistence callback for A fires; the order in which the broadcast goes out depends on which Promise resolved first. If both ops are timestamped at apply time but broadcast at resolution time, they can appear out of order on the wire.
+
+Defense: serialize ops through a single queue per doc. Each op fully completes (apply → log → broadcast → ack) before the next starts. The throughput cost is the price of correctness.
+
+<Callout kind="gotcha">
+  The classic OT production failures: (1) transform function bugs causing silent divergence — fuzz-test the transform matrix; (2) server crashes losing in-flight ops — write-ahead log discipline; (3) network reordering breaking causal order — sequence numbers + single connection; (4) long-offline reconnects swamping the transform pipeline — snapshot strategy + offline window limits; (5) schema renames corrupting historical ops — additive migrations + version gating; (6) undo resurrecting deleted state — use a vetted selective-undo algorithm.
+</Callout>
+
+<Reading url="https://github.com/share/sharedb/blob/master/docs/projections.md" title="ShareDB — production OT library docs" kind="docs" minutes={10} />
+<Reading url="https://etherpad.org/doc/v1.8.18/" title="Etherpad — documentation (OT in production)" kind="docs" minutes={15} />
+<Reading url="https://operational-transformation.github.io/visualization.html" title="OT visualization (transforms in action)" kind="docs" minutes={10} />
+
+**Remember this:** OT failures are mostly in the transform matrix or the persistence discipline. Fuzz the transforms. Write-ahead the log. Sequence the ops. Snapshot late joiners. Migrate schemas additively. Everything else is variations on these.

@@ -1,0 +1,96 @@
+---
+title: When OT still wins
+---
+
+<SectionHeader kind="tradeoff" number={5} title="When OT still wins" />
+
+The CRDT module made the case for CRDTs. The previous section made the case for CRDTs as the new default. This section is the counterweight — the situations where I'd still pick OT, or at least defend it from a CRDT migration.
+
+If you're at a company already on OT, these are the arguments to bring to the "should we migrate?" meeting.
+
+## You're already on OT and it's working
+
+This is the boring answer and it's almost always the right one. If you have a working OT system serving production traffic — Google Docs, an internal tool built on ShareDB, a fork of Etherpad — the cost of migrating to CRDTs is enormous and the benefit is mostly architectural elegance.
+
+The migration involves:
+
+- Replaying every existing document into the CRDT data structure (your historical op log has to translate into CRDT operations with proper IDs)
+- Rewriting every client binding (editor integrations, format converters, exporters)
+- Rewriting persistence (op log → CRDT update log; snapshots have different shape)
+- Re-validating every undo/redo, every collaborative scenario, every conflict case
+- Running both systems in parallel for months while you build confidence
+
+For a system that already works, this is millions of engineering dollars to ship the same product. The argument "but CRDTs are nicer" doesn't survive a budget review. The argument that does survive is "OT is actively limiting us in product X, Y, Z" — and you'd better be able to name X, Y, Z.
+
+## Small ops over the wire
+
+This is the genuine technical advantage. An OT delta — `{"op":"insert","pos":1234,"str":"x"}` — is maybe 30 bytes. The CRDT equivalent carries an ID, an origin pointer, and possibly a right-origin pointer. Real numbers from Yjs: a single character insert encoded for the wire is ~15-25 bytes, plus the per-update framing.
+
+For most apps this is irrelevant. For a few it matters:
+
+- **High-frequency, small-edit workloads.** A finance tool where many users are making tiny edits per second. OT lets you keep update payloads minimal.
+- **Mobile data budgets.** Apps shipping to networks where bytes matter. The cumulative difference over a session can be noticeable, though both are usually fine.
+- **Embedded environments.** Browser extensions, low-spec devices, IoT-adjacent surfaces.
+
+If your product is shipping to North American broadband users, the wire-size difference disappears into noise. If it's shipping to mobile-only emerging markets, do the math.
+
+## Strict server-of-truth model
+
+Some products genuinely benefit from "the server is the truth and clients are best-effort views." OT maps to this naturally — every op goes through the server, the server has the canonical doc, every client is reconciling against a single source.
+
+This matters for:
+
+- **Compliance.** A regulated industry (healthcare, legal, finance) often requires that the canonical state of a document is determinable, auditable, and reproducible. "Who wrote what at what wall-clock time" is a real question. OT's linear op log is a natural fit; CRDTs require bolting on a separate audit layer.
+- **Server-side intelligence.** If you want spellcheck, grammar AI, content moderation, or anything else running on the server's view of the doc — that view has to be authoritative. OT gives you that. With CRDTs, the server is always a few ops behind and the canonical state is "whatever the replicas converge to," which is fine for users but awkward for AI features.
+- **Permissions and ACLs.** "User B is not allowed to edit this section." With OT's central server, you can reject an op at the server. With CRDTs, the merge happens at the client, and refusing an op after the fact requires a layer above the CRDT that fights against its structural guarantee.
+
+If your product's identity is "the server knows the truth and clients catch up," OT is the more honest tool. CRDTs can be made to work, but you'll be putting a server-of-truth layer on top of an algorithm designed for peerless convergence — fighting the abstraction.
+
+## Existing infra: Wave codebase descendants
+
+Google's Wave codebase escaped the lab and became the foundation for Google Docs, Wave Federation, parts of Apache Wave (open-source attempt), and various internal projects. If you join a team that descended from that lineage, you inherit:
+
+- A mature OT implementation (with the bugs and quirks already discovered and worked around)
+- A well-understood operational model
+- A team that knows how to debug OT, which is a non-trivial skill
+
+Switching that team to CRDTs throws away years of compounded expertise. The new system would be easier to reason about in the abstract but harder in the specific — everyone would be a beginner again.
+
+Same goes for ShareDB shops, Etherpad forks, OpenAPI-style OT services in enterprise systems. The infrastructure is a moat against migration.
+
+## When NOT to migrate
+
+The cleanest negative case: don't migrate from OT to CRDT unless you have a concrete product reason that the migration would unblock.
+
+Bad reasons to migrate:
+
+- "CRDTs are newer." So what.
+- "The team wants to try Yjs." Fine, try it on a new product, not a migration.
+- "Offline support would be nice." Quantify the demand. OT can do bounded offline reasonably well. If users genuinely need week-long offline editing, that's a real reason — but verify.
+- "Our op log is getting huge." So is everyone's. Snapshot + compact periodically. That's not an OT problem.
+
+Good reasons to migrate (or to start fresh on CRDTs for a new feature):
+
+- True peer-to-peer requirement (offline-first, no central server, federation between independent orgs)
+- A new product where the team has CRDT expertise and no OT investment
+- Significantly broader range of data types beyond text that your current OT system doesn't handle well (JSON CRDTs are now more mature than JSON OT)
+- A research project where you're explicitly avoiding central infrastructure
+
+The migration cost is the dominant term. Don't underestimate it.
+
+## The hybrid temptation
+
+Some teams try to do both: OT for the part that needs server linearization, CRDTs for the part that needs offline. This usually goes badly.
+
+You end up maintaining two algorithms, two persistence layers, two conflict models, two debugging stories. The seam between them — "this field is OT, this field is CRDT, this field is LWW" — becomes the source of weird bugs that don't fit either mental model.
+
+If you must hybridize, do it at module boundaries (this entire doc is OT, that entire doc is CRDT), not at field boundaries within a doc. Notion does the latter and has paid for it.
+
+<Callout kind="tradeoff">
+  OT wins when: (1) you already have an OT system and the migration cost outweighs the benefit; (2) your product needs strict server-of-truth semantics for compliance, server-side intelligence, or permission enforcement; (3) update size is genuinely a bottleneck and the per-op savings vs CRDTs matter; (4) you inherit Wave/ShareDB-lineage infrastructure with team expertise to match. Outside those cases, CRDTs are usually the better bet in 2024.
+</Callout>
+
+<Reading url="https://josephg.com/blog/crdts-are-the-future/" title="CRDTs are the future (and a sober look at OT's strengths)" author="Joseph Gentle" kind="blog" minutes={15} />
+<Reading url="https://hal.archives-ouvertes.fr/inria-00071213/document" title="Real time group editors without Operational Transformation" author="Oster, Urso, Molli, Imine" kind="paper" minutes={40} />
+
+**Remember this:** OT still wins for existing OT infrastructure, strict server-of-truth products, and bandwidth-tight workloads. For new builds without those constraints, CRDTs are usually the better default. Don't migrate without a concrete product reason.

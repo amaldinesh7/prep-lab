@@ -1,0 +1,22 @@
+---
+title: Cheatsheet
+---
+
+<SectionHeader kind="cheatsheet" number={8} title="Cheatsheet" />
+
+Reference card for design reviews, on-call shifts, and the next time someone asks "should we use OT or CRDT?"
+
+<Cheatsheet rows={[
+  { k: "Algorithm class", v: "Operational transform (OT) — concurrent edits reconciled by transforming ops against each other" },
+  { k: "Operation primitives", v: "insert(pos, str), delete(pos, len), retain(n); plus type-specific ops for rich text and JSON" },
+  { k: "Transform function", v: "A' = transform(A, B) — rewrite A so it makes sense after B has already been applied" },
+  { k: "Required properties", v: "TP1 (two-way convergence) is required; TP2 (multi-way) only needed for true P2P OT" },
+  { k: "Architecture", v: "Central server linearizes ops; clients hold unacked queues; transform on both sides (Jupiter shape)" },
+  { k: "Famous use", v: "Google Docs (Jupiter-shaped), Etherpad (Easysync), ShareDB / ShareJS, VS Code Live Share, Wave" },
+  { k: "vs CRDT", v: "Server-bound; smaller per-op payloads; smaller in-memory doc; correctness via per-pair proofs (fragile)" },
+  { k: "When to pick OT", v: "Existing OT infrastructure, strict server-of-truth (compliance/permissions/AI), bandwidth-tight workloads" },
+  { k: "When to skip OT", v: "New P2P or offline-first builds, greenfield projects without OT expertise, products needing long-offline editing" },
+  { k: "Reading priority", v: "Joseph Gentle — \"CRDTs go brrr\" and his OT-vs-CRDT essays; he worked on Wave and has the receipts" }
+]} />
+
+**Remember this:** OT trades engineering effort and topological rigidity for smaller, faster runtime. The bet only pays off when you have the server, the team, and a reason CRDTs don't fit. Otherwise, ship CRDTs.

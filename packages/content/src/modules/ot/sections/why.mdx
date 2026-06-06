@@ -1,0 +1,58 @@
+---
+title: Why OT exists
+---
+
+<SectionHeader kind="why" number={1} title="Why OT exists" />
+
+You just finished the CRDT module. Now rewind the clock twenty years. It is 2005. Wikipedia is four years old, Gmail is a year old, and "collaborative editing" means emailing a Word document around and praying nobody opens it twice. The conflict-free replicated data type (CRDT) papers exist but are unimplementable for real text. Someone at Google has a problem.
+
+## The problem nobody had solved
+
+Two people open the same document. They both start typing. Their keystrokes travel to a server. The server has to figure out what the document _now is_ — and ship that back to both clients so their screens match each other and match the server.
+
+Three things make this hard:
+
+**Latency.** Alice's keystroke takes 80ms to reach the server. In those 80ms Bob has typed three characters. By the time Alice's "insert 'h' at position 5" arrives, position 5 isn't position 5 anymore — Bob's three characters shoved everything to the right. Apply Alice's op literally and her 'h' lands in the wrong place. Both screens diverge.
+
+**Lock-free.** You can't grab a write lock per character; the editor would feel like a 1990s mainframe. Both users need to type at the same time, see each other's edits stream in, and have the document end up coherent.
+
+**Determinism.** All clients have to converge on the same document. Not "approximately the same" — exactly the same byte sequence. Two people writing a contract clause cannot end up with different text on their screens.
+
+This is the problem operational transform (OT) solves. It was the first algorithm that solved it well enough to ship.
+
+## Wave, then Docs
+
+The famous moment was Google Wave in 2009 — the demo where Lars Rasmussen showed real-time character-by-character co-editing and the audience gasped. Wave failed as a product, but the algorithm shipped inside Google Docs and quietly powered the most-used collaborative editor on Earth for the next fifteen years.
+
+OT was not invented at Google. The original paper is Ellis and Gibbs, 1989 — "Concurrency Control in Groupware Systems." Through the 90s the academic community published variant after variant: dOPT, GOT, GOTO, SOCT2, SOCT4, Jupiter. Most of them were eventually shown to be wrong in some corner case. Jupiter (Lotus, 1995) was the one that turned out to be both correct and practical when you have a central server. Google Docs runs a Jupiter-shaped algorithm.
+
+So OT is older than CRDTs in any practical sense. It is what got built when the question was "real-time text editing" and the answer "design a data structure where merge is correct by construction" was still a research paper nobody had implemented for ordered sequences.
+
+## The intuition in one sentence
+
+You and I both have a copy of the document. I type "x" at position 5. You concurrently delete the character at position 3. Both ops travel over the wire. When my insert reaches your machine, your delete has already happened — so position 5 isn't position 5 anymore from your perspective. Position 5 in my world is position 4 in yours.
+
+OT's answer: **don't apply my op as written. _Transform_ it against your op first.** Take my "insert 'x' at 5" and turn it into "insert 'x' at 4" — the version of my op that makes sense after your delete already landed. Apply the transformed op. The result is a document state that matches what would have happened if both ops had executed in some sequential order — _any_ sequential order — on one machine.
+
+The whole field of OT is variations on that one move. Define operations. Define a transform function for every pair of operation types. Prove (or hope) that the transforms compose correctly. Ship.
+
+<Callout kind="why">
+  Operational transform exists because in 2005 you couldn't build Google Docs out of CRDTs — the text CRDTs were either unproven or too expensive. OT gave you concurrent editing if you accepted a central server and the algorithmic burden of proving every transform pair correct. For fifteen years, this was the only thing that worked at scale.
+</Callout>
+
+## Why this module is shorter
+
+You already know CRDTs. OT is the road not taken — the algorithm that won the 2000s and is now ceding ground to CRDTs for new products. By the end of this module you should be able to:
+
+- Explain how OT transforms ops so concurrent edits converge
+- Sketch the architecture of Google Docs from the network up
+- Argue for OT or CRDT in a design review without hand-waving
+- Recognize the production gotchas (TP1/TP2, causal order, late joiners) when you see them
+
+That's it. Five sections, a quiz, a cheatsheet. Tight.
+
+<Reading url="https://josephg.com/blog/crdts-go-brrr/" title="CRDTs go brrr (and OT vs CRDT context)" author="Joseph Gentle" kind="blog" minutes={15} />
+<Reading url="https://en.wikipedia.org/wiki/Operational_transformation" title="Operational transformation — Wikipedia" kind="docs" minutes={20} />
+<Reading url="https://drive.google.com/file/d/1yEMb3PZE9HwAhcjL9rN7VnNDXAxQGN3p/view" title="Jupiter: a toolkit for cooperative applications (Nichols et al., 1995)" kind="paper" minutes={40} />
+
+**Remember this:** OT is "transform my op against yours so concurrent edits compose." It is the algorithm Google Docs runs on. It is also the algorithm CRDTs are quietly replacing for everything built after 2020.
