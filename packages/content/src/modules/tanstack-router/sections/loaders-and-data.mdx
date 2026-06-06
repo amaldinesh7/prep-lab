@@ -1,0 +1,171 @@
+---
+title: Loaders and data flow
+---
+
+<SectionHeader kind="concept" number={3} title="Loaders and data flow" />
+
+A loader is "what this URL needs to render." It runs when the route matches, in parallel with sibling-route loaders, before the component renders. The mental model is the inversion of the React tradition: **data fetches because the URL changed**, not because a component mounted.
+
+## The shape
+
+<Code lang="tsx" file="src/routes/posts.$postId.tsx">{`import { createFileRoute } from "@tanstack/react-router";
+
+export const Route = createFileRoute("/posts/$postId")({
+  loader: async ({ params, context, abortController, deps }) => {
+    const res = await fetch(
+      \`https://jsonplaceholder.typicode.com/posts/\${params.postId}\`,
+      { signal: abortController.signal },
+    );
+    if (!res.ok) throw new Error("Post not found");
+    return (await res.json()) as Post;
+  },
+  component: PostDetail,
+});
+
+function PostDetail() {
+  const post = Route.useLoaderData(); // typed Post, no annotation
+  return <article>{post.title}</article>;
+}
+
+type Post = { id: number; title: string; body: string };`}</Code>
+
+What you get for free:
+
+- **Suspense-like behavior with no Suspense boilerplate.** The router waits on the loader before mounting the component. Pair it with `<Route ... pendingComponent={Spinner}>` for a fast spinner once the loader takes longer than a configurable threshold (`defaultPendingMs`).
+- **Cancellation.** The `abortController` is wired to navigation away. Pass `signal: abortController.signal` to `fetch` and you'll never spam the API when users click around fast.
+- **Parallel loaders.** Nested route loaders fire in parallel — `/posts` and `/posts/$postId` both run side-by-side, not waterfall.
+- **Typed return value.** Whatever you return is `Route.useLoaderData()`'s type. No generics to chase.
+
+## The four args, ranked by how often you use them
+
+1. **`params`** — typed from the filename. Daily use.
+2. **`context`** — what `RouterProvider`'s `context` prop (or parent route `beforeLoad`) hands you. This is where you stash `queryClient`, `auth`, `trpcUtils`. We come back to this.
+3. **`abortController`** — pass `signal` to fetch. Always. Don't think about it.
+4. **`deps`** — derived from search params (more in the type-safe-params section). Used when you want the loader to re-run on `?q=` changes but not on every search-param tweak.
+
+## Tanstack Query integration — the production pattern
+
+Loaders alone are great for "fetch once on navigate." For caching, background refetch, mutations, and the whole React Query feature surface, you don't pick between TSR and Tanstack Query — you compose them. This is the pattern most production TSR apps end up at.
+
+<Code lang="tsx" file="src/main.tsx">{`import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { createRouter, RouterProvider } from "@tanstack/react-router";
+import { routeTree } from "./routeTree.gen";
+
+const queryClient = new QueryClient({
+  defaultOptions: { queries: { staleTime: 30_000 } },
+});
+
+const router = createRouter({
+  routeTree,
+  context: { queryClient },     // <-- injected into every loader
+  defaultPreload: "intent",     // prefetch on hover/focus
+  defaultPreloadStaleTime: 0,   // let React Query own caching
+});
+
+declare module "@tanstack/react-router" {
+  interface Register { router: typeof router }
+}
+
+function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>
+  );
+}`}</Code>
+
+Then in `__root.tsx` you tell TS what's in context:
+
+<Code lang="tsx" file="src/routes/__root.tsx">{`import { createRootRouteWithContext, Outlet } from "@tanstack/react-router";
+import type { QueryClient } from "@tanstack/react-query";
+
+interface RouterContext {
+  queryClient: QueryClient;
+}
+
+export const Route = createRootRouteWithContext<RouterContext>()({
+  component: () => <Outlet />,
+});`}</Code>
+
+And now loaders prime the React Query cache:
+
+<Code lang="tsx" file="src/routes/posts.$postId.tsx">{`import { createFileRoute } from "@tanstack/react-router";
+import { queryOptions, useSuspenseQuery } from "@tanstack/react-query";
+
+const postQuery = (postId: string) =>
+  queryOptions({
+    queryKey: ["post", postId],
+    queryFn: async () => {
+      const res = await fetch(\`https://jsonplaceholder.typicode.com/posts/\${postId}\`);
+      return res.json() as Promise<Post>;
+    },
+    staleTime: 60_000,
+  });
+
+export const Route = createFileRoute("/posts/$postId")({
+  loader: ({ params, context }) =>
+    context.queryClient.ensureQueryData(postQuery(params.postId)),
+  component: PostDetail,
+});
+
+function PostDetail() {
+  const { postId } = Route.useParams();
+  const { data: post } = useSuspenseQuery(postQuery(postId));
+  return <article>{post.title}</article>;
+}
+
+type Post = { id: number; title: string; body: string };`}</Code>
+
+Read that carefully. The loader doesn't `return` the post — it `ensureQueryData`s it into the React Query cache. The component then reads it back via `useSuspenseQuery`. Two payoffs:
+
+- The loader makes the URL feel instant on navigation (cache is warm before mount).
+- The component owns its data lifecycle — refetch, invalidation, mutations all go through React Query like normal.
+
+This is the pattern. Internalize it.
+
+## Loader vs in-component fetch — when each wins
+
+| Use a loader when | Use `useQuery` in the component when |
+|---|---|
+| Data is essential to render the route | Data is optional/secondary (sidebar widgets, comments below the fold) |
+| You want the URL to feel instant on prefetch | The data is user-triggered (filters, search) |
+| Sibling routes can fetch in parallel | The data has its own loading boundary you want isolated |
+| Tab-switching needs warm caches | The query depends on state set inside the component |
+
+The rule of thumb: **if a user pasted this URL into a fresh tab, would this data need to be there before paint?** If yes, loader. If no, component-level query.
+
+## Prefetching on hover
+
+`defaultPreload: "intent"` on the router (or `preload="intent"` per `<Link>`) starts the loader the moment the user hovers a link. By the time they click, the data is already in flight or in cache. Free perceived performance.
+
+<Code lang="tsx" file="src/components/PostList.tsx">{`import { Link } from "@tanstack/react-router";
+
+export function PostList({ posts }: { posts: { id: number; title: string }[] }) {
+  return (
+    <ul>
+      {posts.map((p) => (
+        <li key={p.id}>
+          <Link
+            to="/posts/$postId"
+            params={{ postId: String(p.id) }}
+            preload="intent"
+          >
+            {p.title}
+          </Link>
+        </li>
+      ))}
+    </ul>
+  );
+}`}</Code>
+
+The cost is real — every hover fires a request. On dense lists, switch to `preload="viewport"` or remove preloading for that link. Measure before optimizing either way.
+
+<Callout kind="pattern">
+  Production apps converge on: TSR loaders to prime the Tanstack Query cache, components to read via `useSuspenseQuery`. The loader makes navigation feel instant; React Query owns caching, refetch, and mutation invalidation. Don't pick one; compose both.
+</Callout>
+
+<Reading url="https://tanstack.com/router/latest/docs/framework/react/guide/data-loading" title="Data Loading Guide" kind="docs" minutes={12} />
+<Reading url="https://tanstack.com/router/latest/docs/framework/react/guide/external-data-loading" title="External Data Loading (Query integration)" kind="docs" minutes={10} />
+<Reading url="https://tkdodo.eu/blog/react-query-meets-react-router" title="React Query meets React Router" author="Dominik Dorfmeister (TkDodo)" kind="blog" minutes={9} />
+
+**Remember this:** Loaders run because the URL changed. They prime the cache; components consume it. `ensureQueryData` + `useSuspenseQuery` is the pattern that scales.

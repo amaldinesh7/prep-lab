@@ -1,0 +1,60 @@
+---
+title: Why Tanstack Router exists
+---
+
+<SectionHeader kind="why" number={1} title="Why Tanstack Router exists" />
+
+React Router shipped in 2014 and dominated single-page application (SPA) routing for a decade. It worked. It also accumulated a decade of compromises. Tanstack Router (TSR) is what happens when you start over knowing what teams actually run into in production.
+
+## The pre-v1 React Router pain
+
+Three things made every mature React Router codebase feel the same kind of bad.
+
+**Params and search were `any`.** `useParams()` handed you a `Record<string, string | undefined>`. You either wrote a runtime parser at every consumer, or you cast and hoped. A rename from `:id` to `:postId` broke nothing at compile time and everything at runtime.
+
+**Data fetching was bolted on later.** v6.4 introduced loaders, but they sat on top of a router that wasn't designed for them. Type inference across `loader` → `useLoaderData` lost its grip the moment you crossed a file boundary. Most teams reached for React Query inside components instead, which moved the problem rather than solving it.
+
+**The route config was a JSX tree or an object literal.** Either way, the relationship between "this file" and "this URL" was invisible. Want to know what renders at `/teams/$teamId/settings`? Grep. Hope.
+
+You can ship a product with all of this. Many teams did. The cost is paid one refactor at a time.
+
+## What changed around 2023
+
+Two things landed at once.
+
+Remix popularized loaders as the primary data primitive — the router fetches data alongside the route component, in parallel, before render. The mental model is "URL implies data," not "component mounts, then asks for data." That nukes waterfalls and gives you a real loading story for free.
+
+Tanstack Router took that loader idea, kept it client-first (no server runtime required), and built the whole router around end-to-end type inference. Tanner Linsley's bet: if the router knows the route tree statically, TypeScript can know everything else — params, search, loader return types, link destinations.
+
+The result is a router where `<Link to="/posts/$postId" params={{ postId: post.id }}>` is type-checked against the actual route tree. Rename the file, the link breaks at `tsc`, not in production.
+
+## File-based + type-inferred params is the right primitive
+
+There are two ideas doing the work, and they reinforce each other.
+
+**File-based routing** makes URL structure visible in the file tree. `routes/posts.$postId.tsx` is the route at `/posts/$postId`. You don't maintain a parallel config — the filesystem _is_ the config. Next.js proved this scales; TSR ports the pattern to client-only React apps where Next.js is overkill.
+
+**Type-inferred params** means the plugin reads the filename, parses `$postId`, and generates a route tree where `params: { postId: string }` is statically known. Every consumer downstream — `Route.useParams()`, `<Link>`, `loader({ params })` — gets the typed value with zero hand-written type annotations.
+
+Together they collapse a category of bugs. The router is the single source of truth for URL structure, and the type system enforces every reference to it.
+
+<Callout kind="why">
+  Tanstack Router exists because React Router's params and loaders were stapled onto an API that predated TypeScript-first React. TSR's bet is that file-based routing plus codegen-driven inference gives you a router where the compiler catches what runtime used to. For a startup SPA where you don't need server components, it's the lowest-cognitive-load option that scales.
+</Callout>
+
+## What this means for your week-one decisions
+
+If you're joining a team on TSR, the muscle memory you need to build is different from React Router.
+
+- Stop reaching for `useState` + `useEffect` to fetch route data. Loaders.
+- Stop typing params by hand. They're already typed; trust the route tree.
+- Stop hand-writing route configs. Add a file; the plugin does the rest.
+- Treat `routeTree.gen.ts` like Prisma's generated client: don't edit it, do regenerate it on every file move.
+
+The rest of this module is about making each of those reflexes load-bearing.
+
+<Reading url="https://tanstack.com/router/latest/docs/framework/react/overview" title="Tanstack Router — Overview" kind="docs" minutes={8} />
+<Reading url="https://tanstack.com/blog/announcing-tanstack-router-v1" title="Announcing TanStack Router v1" author="Tanner Linsley" kind="blog" minutes={12} />
+<Reading url="https://remix.run/blog/remix-data-flow" title="Remix Data Flow (loaders mental model)" kind="blog" minutes={10} />
+
+**Remember this:** TSR's whole pitch is "the router knows the routes, so the compiler knows everything else." Every feature falls out of that.

@@ -1,0 +1,146 @@
+---
+title: Type-safe params and search
+---
+
+<SectionHeader kind="pattern" number={4} title="Type-safe params and search" />
+
+This is the section that sells the framework. Once you've shipped a refactor with typed routing, you don't go back.
+
+## Path params — inferred from the filename
+
+The filename is the source of truth. The plugin parses `$slug` segments, generates the route tree, and TS infers `params: { slug: string }` everywhere downstream.
+
+<Code lang="tsx" file="src/routes/modules.$slug.tsx">{`import { createFileRoute } from "@tanstack/react-router";
+
+export const Route = createFileRoute("/modules/$slug")({
+  loader: ({ params }) => {
+    // params is { slug: string } — inferred from the filename.
+    return loadModule(params.slug);
+  },
+  component: ModulePage,
+});
+
+function ModulePage() {
+  const { slug } = Route.useParams();
+  //      ^? string
+  return <h1>{slug}</h1>;
+}`}</Code>
+
+Zero annotations. Rename the file to `modules.$moduleSlug.tsx` and TS lights up everywhere `params.slug` was used. That's the refactor-safety story.
+
+Multiple params nest naturally:
+
+<Code lang="tsx" file="src/routes/teams.$teamId.members.$memberId.tsx">{`import { createFileRoute } from "@tanstack/react-router";
+
+export const Route = createFileRoute("/teams/$teamId/members/$memberId")({
+  component: () => {
+    const { teamId, memberId } = Route.useParams();
+    //      ^? { teamId: string; memberId: string }
+    return <div>{teamId} / {memberId}</div>;
+  },
+});`}</Code>
+
+## Search params — validated, typed, owned by the route
+
+URL search params are where most apps lose the plot. They're stringly-typed, parsed ad-hoc, and every component invents its own contract. TSR forces you to declare a schema per route via `validateSearch`.
+
+<Code lang="tsx" file="src/routes/posts.tsx">{`import { createFileRoute } from "@tanstack/react-router";
+import { z } from "zod";
+
+const searchSchema = z.object({
+  q: z.string().optional(),
+  page: z.number().int().min(1).catch(1),
+  sort: z.enum(["new", "top"]).catch("new"),
+});
+
+export const Route = createFileRoute("/posts")({
+  validateSearch: searchSchema,            // parse + validate on every nav
+  loaderDeps: ({ search }) => ({           // tell the loader which search keys it cares about
+    q: search.q,
+    page: search.page,
+  }),
+  loader: ({ deps }) =>
+    fetchPosts({ q: deps.q, page: deps.page }),
+  component: PostsPage,
+});
+
+function PostsPage() {
+  const { q, page, sort } = Route.useSearch();
+  //      ^? { q?: string; page: number; sort: "new" | "top" }
+  const navigate = Route.useNavigate();
+
+  return (
+    <input
+      defaultValue={q}
+      onChange={(e) =>
+        navigate({
+          search: (prev) => ({ ...prev, q: e.target.value, page: 1 }),
+        })
+      }
+    />
+  );
+}`}</Code>
+
+Three details worth dwelling on:
+
+- **`validateSearch` runs on every URL change.** Garbage in `?page=abc` gets coerced (or thrown). `catch(1)` means "if validation fails for `page`, default to 1." Use `catch` for defaults, not `default`.
+- **`loaderDeps` is what makes the loader re-run.** Without it, the loader treats all search params as opaque and re-runs on every change. With it, only the keys you list trigger a re-fetch — typing in `?q=...` re-fetches; changing `?sort=...` does not (unless you add it to deps).
+- **`navigate({ search: (prev) => ... })`** is the canonical update. Pass a function; never reach for `URLSearchParams` by hand. The router serializes correctly (including arrays, nested objects via `parseSearch`/`stringifySearch`).
+
+## Typed `<Link>` — the killer feature
+
+Every `to`, `params`, and `search` is checked against the route tree.
+
+<Code lang="tsx" file="src/components/PostLink.tsx">{`import { Link } from "@tanstack/react-router";
+
+// All of these are type-checked:
+<Link to="/posts/$postId" params={{ postId: "42" }}>post</Link>;
+<Link to="/posts" search={{ q: "hello", page: 1, sort: "new" }}>posts</Link>;
+
+// All of these fail typecheck:
+<Link to="/postss/$postId" params={{ postId: "42" }} />;        // bad path
+<Link to="/posts/$postId" params={{ id: "42" }} />;             // wrong param name
+<Link to="/posts" search={{ page: "1" }} />;                    // wrong type
+<Link to="/posts/$postId">missing params</Link>;                // params required`}</Code>
+
+The first time you try to refactor a route in a large codebase and `tsc` walks you through every stale link, you'll understand the appeal.
+
+## Relative navigation, from-aware
+
+`<Link>` and `useNavigate` accept a `from` prop. With it, the path is resolved relative to the current route — and TS narrows `to` to valid sibling/child routes only.
+
+<Code lang="tsx" file="src/routes/posts.$postId.tsx">{`<Link from={Route.fullPath} to="../">back to posts</Link>;
+<Link from={Route.fullPath} to="./edit">edit this post</Link>;`}</Code>
+
+This is more than ergonomics — `from` is what lets the same component live under multiple parent layouts without hard-coding absolute paths.
+
+<Callout kind="pattern">
+  The discipline that pays off: every route file declares `validateSearch` (even if it's `z.object({}).optional()`), and every navigation uses typed `<Link>` or `Route.useNavigate()`. The day a teammate adds `?utm_source=…` you don't have to audit the codebase — the schema either accepts it or rejects it loudly.
+</Callout>
+
+## Why this kills a class of refactor bugs
+
+In React Router v6, this is the bug:
+
+```ts
+// some component, written 6 months ago
+const { id } = useParams<{ id: string }>();
+// the route was renamed to :postId last week
+// id is now undefined; nothing complained
+```
+
+In TSR, you can't write that bug. `Route.useParams()` is bound to the route file. If the filename changes, every consumer breaks at compile time. The type annotation a v6 developer reaches for (`useParams<{ id: string }>()`) is a lie the compiler can't catch; in TSR it doesn't exist because you never need it.
+
+The class of bugs eliminated:
+- Stale param names after route rename
+- Hand-typed search-param shapes that drift from URL reality
+- Broken `<Link to="...">` after a file move
+- `useParams` returning `undefined` for params that should be required
+
+These aren't theoretical. Every team that's run a v6 codebase past a year has fixed each of them, multiple times.
+
+<Reading url="https://tanstack.com/router/latest/docs/framework/react/guide/path-params" title="Path Params" kind="docs" minutes={5} />
+<Reading url="https://tanstack.com/router/latest/docs/framework/react/guide/search-params" title="Search Params" kind="docs" minutes={10} />
+<Reading url="https://tkdodo.eu/blog/typesafe-routing-with-tanstack-router" title="Typesafe Routing with TanStack Router" author="TkDodo" kind="blog" minutes={8} />
+
+**Remember this:** Path params come free from the filename. Search params require a `validateSearch` schema — pay that cost once per route and every consumer gets typed search forever.

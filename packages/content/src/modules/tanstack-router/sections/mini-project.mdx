@@ -1,0 +1,267 @@
+---
+title: Typed routing demo
+---
+
+<SectionHeader kind="mini_project" number={7} title="Typed routing demo" />
+
+A 2-3 hour build that exercises every TSR concept you'll use day-to-day: file-based routes, a typed loader, dynamic params, validated search, and a nested layout. End with prefetch-on-hover and an error boundary.
+
+The reference API is JSONPlaceholder — no auth, generous CORS, ships posts and users on demand. https://jsonplaceholder.typicode.com.
+
+<ProjectCard hours="2-3" starter="./starter">
+
+## Goal
+
+Build a posts app:
+- `/` — landing page with a link into posts
+- `/posts` — list of posts, filterable by `?q=`
+- `/posts/$postId` — detail view, loader-fetched
+- Nested layout: shared nav at the root
+
+## Steps
+
+### 1. Scaffold
+
+```bash
+bun create vite tsr-demo --template react-ts
+cd tsr-demo
+bun add @tanstack/react-router @tanstack/react-query zod
+bun add -D @tanstack/router-plugin @tanstack/router-devtools
+```
+
+### 2. Wire the Vite plugin
+
+Edit `vite.config.ts`:
+
+```ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import { tanstackRouter } from "@tanstack/router-plugin/vite";
+
+export default defineConfig({
+  plugins: [
+    tanstackRouter({ target: "react", autoCodeSplitting: true }),
+    react(),
+  ],
+});
+```
+
+Plugin order matters — router before React.
+
+### 3. Root layout with context
+
+Create `src/routes/__root.tsx`:
+
+```tsx
+import { createRootRouteWithContext, Link, Outlet } from "@tanstack/react-router";
+import { TanStackRouterDevtools } from "@tanstack/router-devtools";
+import type { QueryClient } from "@tanstack/react-query";
+
+interface RouterContext { queryClient: QueryClient }
+
+export const Route = createRootRouteWithContext<RouterContext>()({
+  component: () => (
+    <>
+      <nav style={{ display: "flex", gap: 12, padding: 12 }}>
+        <Link to="/">Home</Link>
+        <Link to="/posts">Posts</Link>
+      </nav>
+      <Outlet />
+      <TanStackRouterDevtools position="bottom-right" />
+    </>
+  ),
+});
+```
+
+### 4. Landing page
+
+`src/routes/index.tsx`:
+
+```tsx
+import { createFileRoute, Link } from "@tanstack/react-router";
+
+export const Route = createFileRoute("/")({
+  component: () => (
+    <main style={{ padding: 16 }}>
+      <h1>TSR demo</h1>
+      <Link to="/posts">See posts →</Link>
+    </main>
+  ),
+});
+```
+
+### 5. Posts index with validated search
+
+`src/routes/posts.index.tsx`:
+
+```tsx
+import { createFileRoute, Link } from "@tanstack/react-router";
+import { z } from "zod";
+
+type Post = { id: number; title: string; body: string };
+
+const searchSchema = z.object({
+  q: z.string().optional(),
+});
+
+export const Route = createFileRoute("/posts/")({
+  validateSearch: searchSchema,
+  loaderDeps: ({ search }) => ({ q: search.q }),
+  loader: async () => {
+    const res = await fetch("https://jsonplaceholder.typicode.com/posts");
+    return (await res.json()) as Post[];
+  },
+  component: PostsIndex,
+});
+
+function PostsIndex() {
+  const posts = Route.useLoaderData();
+  const { q } = Route.useSearch();
+  const navigate = Route.useNavigate();
+
+  const filtered = q
+    ? posts.filter((p) => p.title.toLowerCase().includes(q.toLowerCase()))
+    : posts;
+
+  return (
+    <main style={{ padding: 16 }}>
+      <input
+        placeholder="filter…"
+        defaultValue={q ?? ""}
+        onChange={(e) =>
+          navigate({
+            search: () => ({ q: e.target.value || undefined }),
+            replace: true,
+          })
+        }
+      />
+      <ul>
+        {filtered.map((p) => (
+          <li key={p.id}>
+            <Link
+              to="/posts/$postId"
+              params={{ postId: String(p.id) }}
+              preload="intent"
+            >
+              {p.title}
+            </Link>
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+```
+
+Note `replace: true` on navigate — typing in the filter shouldn't push history entries for every keystroke.
+
+### 6. Post detail with loader
+
+`src/routes/posts.$postId.tsx`:
+
+```tsx
+import { createFileRoute, Link } from "@tanstack/react-router";
+
+type Post = { id: number; title: string; body: string };
+
+export const Route = createFileRoute("/posts/$postId")({
+  loader: async ({ params, abortController }) => {
+    const res = await fetch(
+      \`https://jsonplaceholder.typicode.com/posts/\${params.postId}\`,
+      { signal: abortController.signal },
+    );
+    if (!res.ok) throw new Error("Post not found");
+    return (await res.json()) as Post;
+  },
+  component: PostDetail,
+  pendingComponent: () => <p style={{ padding: 16 }}>Loading…</p>,
+  pendingMs: 200,
+  errorComponent: ({ error }) => (
+    <main style={{ padding: 16 }}>
+      <p>Could not load post: {String(error)}</p>
+      <Link to="/posts">back</Link>
+    </main>
+  ),
+});
+
+function PostDetail() {
+  const post = Route.useLoaderData();
+  return (
+    <article style={{ padding: 16 }}>
+      <Link to="/posts">← back</Link>
+      <h1>{post.title}</h1>
+      <p>{post.body}</p>
+    </article>
+  );
+}
+```
+
+### 7. Mount the router
+
+`src/main.tsx`:
+
+```tsx
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { createRouter, RouterProvider } from "@tanstack/react-router";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { routeTree } from "./routeTree.gen";
+
+const queryClient = new QueryClient();
+
+const router = createRouter({
+  routeTree,
+  context: { queryClient },
+  defaultPreload: "intent",
+  defaultPendingMs: 200,
+});
+
+declare module "@tanstack/react-router" {
+  interface Register { router: typeof router }
+}
+
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>
+  </StrictMode>,
+);
+```
+
+### 8. Run it
+
+```bash
+bun run dev
+```
+
+Open the URL. You should see:
+- Nav at the top of every page
+- `/posts` filters by typing
+- The URL updates with `?q=…`
+- Refresh the URL — filter state survives
+- Hover a post link — the detail loader fires (Network tab)
+- Click — feels instant because the data is already in flight
+
+## Stretch goals
+
+- **Error boundary at the root.** Throw inside a component, watch `errorComponent` catch it. Add a "Reload" button that calls `Route.useRouter().invalidate()`.
+- **Tanstack Query integration.** Convert the post detail loader to `context.queryClient.ensureQueryData(postQuery(postId))` and read in the component with `useSuspenseQuery`. Confirm hover-prefetching warms the same cache the component reads.
+- **`pendingMs` tuning.** Drop the loader's network throttle to "Slow 3G" in DevTools. Notice the skeleton appears only after 200ms. Try 500ms — feels different.
+- **Pathless layout.** Add a `_authed.tsx` layout and move `/posts/*` under it. Add a fake `beforeLoad` that throws `redirect({ to: "/" })` if a `localStorage` flag isn't set.
+
+## What to internalize
+
+When you finish, you should be able to answer:
+- Why does `<Link to="/posts/$postId">` autocomplete?
+- What does `validateSearch` give you beyond hand-parsing `URLSearchParams`?
+- Why is `ensureQueryData` better than `return fetch(...)` in the loader?
+- What happens if you delete `routeTree.gen.ts` and don't restart Vite?
+
+If those answers feel obvious, the module landed.
+
+</ProjectCard>
+
+<Reading url="https://tanstack.com/router/latest/docs/framework/react/quick-start" title="Quick Start" kind="docs" minutes={6} />
+<Reading url="https://tanstack.com/router/latest/docs/framework/react/devtools" title="TanStack Router Devtools" kind="docs" minutes={3} />
+<Reading url="https://jsonplaceholder.typicode.com/" title="JSONPlaceholder — free fake API" kind="docs" minutes={2} />

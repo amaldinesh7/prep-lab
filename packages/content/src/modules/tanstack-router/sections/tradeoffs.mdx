@@ -1,0 +1,88 @@
+---
+title: Tradeoffs vs the alternatives
+---
+
+<SectionHeader kind="tradeoff" number={5} title="Tradeoffs vs the alternatives" />
+
+Nothing about TSR is universally correct. Picking it is a bet about what your app is and isn't. Here's the honest comparison against the three routers a startup actually evaluates.
+
+## vs React Router v6 / v7 (Remix-merged)
+
+React Router is the safe choice. Every React developer has seen it. The ecosystem (Auth0 guides, blog posts, library examples) targets it by default. v6.4 added loaders; v7 (the Remix merge) brings file-based routing and SSR as opt-ins.
+
+**Where React Router wins:**
+- Hiring — every React dev knows it
+- Smaller bundle in trivial apps (no codegen overhead)
+- Works without a build plugin (you can drop it into any setup)
+- v7 with framework mode covers SSR + RSC if you grow into it
+
+**Where TSR wins:**
+- Type inference is dramatically better. RR's typed routes (added late) are opt-in and partial
+- Search params are a first-class typed primitive, not an afterthought
+- Loader → component data flow has cleaner type ergonomics
+- Codegen catches structural mistakes at build time
+
+The summary: if you're starting a 6-month-old codebase fresh and TypeScript discipline matters, TSR. If you're inheriting a v6 app or your team is 20+ engineers with varied levels of TS depth, the cost of switching often doesn't clear.
+
+## vs Next.js App Router
+
+This is the most common confusion. Both have file-based routing. They are not in the same category.
+
+Next.js App Router is a **server-first framework**. Routes are React Server Components by default. Data fetching happens on the server. Client interactivity is opt-in via `"use client"`. The router is one feature of a full-stack framework with its own deployment story (Vercel, but workable elsewhere).
+
+TSR is a **client-side router**. Everything runs in the browser. No server runtime, no RSC, no streaming HTML out of the box (TSR's Start framework adds SSR if you want it, but it's not the default mental model).
+
+**Pick Next when:**
+- You need server-rendered HTML for SEO (marketing sites, e-commerce, content)
+- Server components fit (database access in components, edge runtime)
+- You want a batteries-included full-stack thing
+
+**Pick TSR when:**
+- The app is fundamentally a logged-in SPA (dashboards, internal tools, B2B apps)
+- The API is a separate service you don't want to merge with the frontend
+- You want client-side caching control (Tanstack Query) over server-side data lifecycle
+- The complexity tax of RSC outweighs the SEO benefit (rare for SaaS dashboards)
+
+Most "do I need Next.js?" debates resolve to: do you need server-rendered HTML for users who aren't logged in? If no, TSR is lighter and the type story is better.
+
+## vs Remix (now React Router v7)
+
+Remix and TSR share DNA — loaders, nested routes, URL-as-source-of-truth. The split:
+
+Remix is full-stack opinionated. Forms post to actions, loaders run on the server, you get progressive enhancement out of the box. The framework owns deployment.
+
+TSR is router-only by default. Your API is wherever; the loader runs in the browser; you bring your own state management. TSR Start is the matching full-stack story, but it's newer and less battle-tested than Remix.
+
+If you're greenfield and want server actions + progressive enhancement, Remix/RR v7 is the right pick. If you have an existing API and want the lightest possible client-side routing layer with great types, TSR.
+
+## When NOT to use TSR
+
+Be honest about these cases:
+
+- **You need React Server Components.** TSR has no RSC story. Use Next or RR v7.
+- **You need true static-site generation (SSG).** TSR isn't a static site generator. For marketing sites with thousands of pre-rendered pages, use Next, Astro, or Eleventy.
+- **You need SEO on public unauthenticated pages.** TSR's default is client-rendered. The HTML the crawler sees is a shell. (Google now executes JS, but Twitter cards, LinkedIn, Bing, and your performance budget care.)
+- **Your team is 50+ engineers with low TS engagement.** The codegen step and the type-heavy ergonomics will create more friction than they save. RR v6 with discipline is fine at that scale.
+- **You ship to a no-build environment.** TSR's value depends on the Vite plugin. If you can't run a build step, use RR.
+
+## Tradeoff axes summarized
+
+<Cheatsheet rows={[
+  { k: "Type safety", v: "TSR > RR v7 > Next App Router (for client routing)" },
+  { k: "SSR / SEO out of the box", v: "Next > Remix/RR v7 >> TSR" },
+  { k: "Server-side data fetching", v: "Next, Remix natively; TSR via TSR Start (newer)" },
+  { k: "Bundle weight (SPA)", v: "RR < TSR < Next" },
+  { k: "Time to first hire knowing it", v: "RR >> Next > TSR" },
+  { k: "Refactor safety", v: "TSR >> Next > RR" },
+  { k: "Search param ergonomics", v: "TSR >> Remix > Next > RR" },
+]} />
+
+<Callout kind="tradeoff">
+  TSR is the best client-side router for typed SPAs. It is _not_ a Next.js alternative — they solve different problems. The trap is using TSR for a marketing site or Next for an internal dashboard. Pick the right tool for the rendering model you need, then sweat the type ergonomics second.
+</Callout>
+
+<Reading url="https://tanstack.com/router/latest/docs/framework/react/comparison" title="TanStack Router Comparison" kind="docs" minutes={6} />
+<Reading url="https://nextjs.org/docs/app/building-your-application/rendering/server-components" title="Next.js — Server Components" kind="docs" minutes={10} />
+<Reading url="https://remix.run/blog/merging-remix-and-react-router" title="Merging Remix and React Router" kind="blog" minutes={8} />
+
+**Remember this:** TSR is for typed client-side SPAs. If you need server rendering, you need a different tool. Pick the rendering model first, the router second.

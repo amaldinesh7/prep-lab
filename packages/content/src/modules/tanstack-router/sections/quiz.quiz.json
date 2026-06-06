@@ -1,0 +1,64 @@
+{
+  "questions": [
+    {
+      "id": "q1",
+      "prompt": "Where does the Tanstack Router plugin generate its typed route tree by default?",
+      "options": [
+        { "id": "a", "label": "node_modules/@tanstack/router-plugin/routes.ts" },
+        { "id": "b", "label": "src/routeTree.gen.ts" },
+        { "id": "c", "label": ".tanstack/routes.json" },
+        { "id": "d", "label": "dist/routeTree.ts at build time only" }
+      ],
+      "correct": "b",
+      "explanation": "The plugin writes `src/routeTree.gen.ts` and keeps it in sync while Vite runs. You import `routeTree` from there into `createRouter`. Commit it — it's the contract your other types depend on."
+    },
+    {
+      "id": "q2",
+      "prompt": "Inside a route file's component, what's the canonical way to read data returned by that route's loader?",
+      "options": [
+        { "id": "a", "label": "useLoaderData() imported from @tanstack/react-router" },
+        { "id": "b", "label": "useContext(LoaderContext)" },
+        { "id": "c", "label": "Route.useLoaderData()" },
+        { "id": "d", "label": "props.loaderData passed by the router" }
+      ],
+      "correct": "c",
+      "explanation": "`Route` is the local export from the same file. `Route.useLoaderData()` is type-narrowed to this route's loader return — global hooks would lose that specificity."
+    },
+    {
+      "id": "q3",
+      "prompt": "Where does the typing for a `$slug` path param come from?",
+      "options": [
+        { "id": "a", "label": "A generic you pass to useParams<{ slug: string }>()" },
+        { "id": "b", "label": "A Zod schema you declare in the route" },
+        { "id": "c", "label": "It's inferred from the filename by the router plugin, then surfaced through routeTree.gen.ts" },
+        { "id": "d", "label": "TypeScript pattern matching on the URL string" }
+      ],
+      "correct": "c",
+      "explanation": "The plugin parses `$slug` from the filename, generates the route tree, and TS infers `{ slug: string }` for every consumer. That's why you never annotate params by hand."
+    },
+    {
+      "id": "q4",
+      "prompt": "What's the primary architectural difference between TSR and Next.js App Router?",
+      "options": [
+        { "id": "a", "label": "TSR has loaders; Next App Router has none" },
+        { "id": "b", "label": "TSR is client-only by default; Next App Router is server-component first" },
+        { "id": "c", "label": "TSR is type-safe; Next App Router uses any" },
+        { "id": "d", "label": "TSR uses file-based routing; Next App Router doesn't" }
+      ],
+      "correct": "b",
+      "explanation": "Both use file-based routing. The real split is the rendering model — TSR runs in the browser, Next App Router renders React Server Components on the server by default. That changes where data fetching lives and what your deployment looks like."
+    },
+    {
+      "id": "q5",
+      "prompt": "Which file is the root layout that wraps every route in a TSR app?",
+      "options": [
+        { "id": "a", "label": "src/routes/layout.tsx" },
+        { "id": "b", "label": "src/routes/_root.tsx" },
+        { "id": "c", "label": "src/routes/__root.tsx" },
+        { "id": "d", "label": "src/App.tsx" }
+      ],
+      "correct": "c",
+      "explanation": "Double underscore: `__root.tsx`. Single underscore (`_authed.tsx`) makes a pathless layout — different feature. `__root.tsx` is unique: always rendered, always uses `createRootRoute` (or `createRootRouteWithContext`)."
+    }
+  ]
+}

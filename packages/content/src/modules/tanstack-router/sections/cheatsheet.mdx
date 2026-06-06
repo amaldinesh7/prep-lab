@@ -1,0 +1,37 @@
+---
+title: Cheatsheet
+---
+
+<SectionHeader kind="cheatsheet" number={9} title="Cheatsheet" />
+
+Keep this open while you write TSR code for the first month.
+
+<Cheatsheet rows={[
+  { k: "Vite plugin", v: "@tanstack/router-plugin/vite (must run before @vitejs/plugin-react)" },
+  { k: "Generated route tree", v: "src/routeTree.gen.ts — commit it, lint it in CI" },
+  { k: "Root layout", v: "src/routes/__root.tsx (double underscore, special)" },
+  { k: "Pathless layout", v: "src/routes/_authed.tsx (single underscore, groups without URL segment)" },
+  { k: "Dynamic param", v: "$paramName in filename → params.paramName is typed string" },
+  { k: "Splat / catch-all", v: "src/routes/files.$.tsx → params._splat" },
+  { k: "Loader hook", v: "Route.useLoaderData() (per-route, typed)" },
+  { k: "Params hook", v: "Route.useParams() (per-route, typed)" },
+  { k: "Search hook", v: "Route.useSearch() (typed by validateSearch)" },
+  { k: "Typed navigation", v: "<Link to=\"/posts/$id\" params={{ id }} search={{ q }} />" },
+  { k: "Programmatic nav", v: "const navigate = Route.useNavigate(); navigate({ to, params, search })" },
+  { k: "Search validation", v: "validateSearch: z.object({...}) — use .catch() for defaults" },
+  { k: "Loader re-run trigger", v: "loaderDeps: ({ search }) => ({ q: search.q })" },
+  { k: "Context type", v: "createRootRouteWithContext<{ queryClient: QueryClient }>()" },
+  { k: "Register globals", v: "declare module '@tanstack/react-router' { interface Register { router: typeof router } }" },
+  { k: "Prefetch on hover", v: "defaultPreload: 'intent' on router OR preload='intent' per link" },
+  { k: "Query integration", v: "loader: ({ context }) => context.queryClient.ensureQueryData(opts)" },
+  { k: "Pending UI", v: "pendingComponent + pendingMs (delay before showing skeleton)" },
+  { k: "Error UI", v: "errorComponent: ({ error, reset }) => <Fallback />" },
+  { k: "Code-splitting", v: "autoCodeSplitting: true in plugin; createLazyFileRoute for explicit splits" },
+  { k: "Redirect from loader", v: "throw redirect({ to: '/login' })" },
+  { k: "Devtools", v: "<TanStackRouterDevtools /> — render once, anywhere in tree" },
+  { k: "\"Route not found\" error", v: "Almost always stale routeTree.gen.ts — restart Vite, or run `tsr generate`" },
+  { k: "Renamed file → broken types", v: "Restart Vite OR run the plugin's generator; commit the updated tree" },
+  { k: "SSR", v: "Not in core TSR. Use TSR Start for full-stack, or a separate marketing site" }
+]} />
+
+**Remember this:** When something's weird, restart Vite first. Half of TSR mysteries are a stale generated tree.
