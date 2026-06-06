@@ -1,0 +1,113 @@
+---
+title: Tradeoffs
+---
+
+<SectionHeader kind="tradeoff" number={7} title="Tradeoffs" />
+
+WebRTC is the right tool for a narrow set of problems and a costly mistake for the rest. The marketing makes it sound like "browsers can do P2P now, just use it!" The reality is that WebRTC is the heaviest API in the browser, the operational footprint is non-trivial, and a startup choosing WebRTC when WebSocket would do has just chosen six extra weeks of work for no user-visible benefit.
+
+This section is the honest comparison.
+
+## The complexity tax is real
+
+Nothing else in the browser has WebRTC's surface area. Compare:
+
+- `fetch()`: one function, one return type.
+- `WebSocket`: one constructor, three events (`open`, `message`, `close`), one method (`send`).
+- `RTCPeerConnection`: 8+ event types, 15+ async methods, 4 supporting types (`RTCSessionDescription`, `RTCIceCandidate`, `RTCDataChannel`, `MediaStream`), 2 state machines you must observe (`connectionState`, `iceConnectionState`), and an SDP munging culture for cross-browser fixes.
+
+You will hit weird browser bugs:
+
+- Safari's renegotiation flow differs subtly from Chrome's; tracks added mid-call don't always render.
+- Firefox's `iceCandidatePoolSize` behavior changed in 2023 and again in 2025.
+- Chrome's H.264 hardware encoder is feature-gated by GPU; you can ship video that works on Mac and fails on a Windows machine with no GPU.
+- iOS Safari aggressively suspends WebRTC connections in background tabs (more in the gotchas section).
+
+The browser implementations have shipped real bugs in production within the last 18 months. You should expect to write workarounds, file issues, and read `chrome://webrtc-internals` more than you read your own logs during debugging weeks.
+
+You will also need TURN — operational TURN, in multiple regions, with rotating credentials, with monitoring. That's its own dedicated infra footprint that a WebSocket server doesn't have.
+
+## Mesh topology cost: N² connections
+
+The headline scaling problem. In a mesh (peer-to-peer-to-peer), each participant maintains a connection to every other participant. For N peers, that's N(N-1)/2 total connections, and each peer is uploading N-1 copies of their data.
+
+For a 1080p video call at ~3 Mbps per stream:
+
+- 2 peers: each uploads 3 Mbps. Fine on any home Wi-Fi.
+- 4 peers: each uploads 9 Mbps. Painful on cellular, OK on broadband.
+- 6 peers: each uploads 15 Mbps. Many home connections cap upload at 10-20 Mbps; you've maxed them out.
+- 10 peers: each uploads 27 Mbps. Impossible on most consumer connections.
+
+This is why all real video conferencing — Zoom, Meet, Teams, Discord — uses an **SFU** (Selective Forwarding Unit) beyond ~4 participants. The SFU is a server-side WebRTC peer: each client sends one upstream, the SFU duplicates it down to each receiver. Bandwidth per client stays at "1 upstream + N downstream" instead of "N upstream + N downstream."
+
+For data channels (no video), the math is gentler — y-webrtc routinely runs 10-20 person rooms because text updates are kilobytes per second, not megabits. But the connection count itself (N²) matters too: each connection has DTLS state, ICE candidate pairs, SCTP state — all in browser memory. Past ~30 peers per room, browsers start to choke on the connection bookkeeping alone, mesh data or not.
+
+The rule of thumb:
+
+- ≤4 peers → mesh is fine.
+- 4-8 peers → mesh works for data, marginal for video.
+- 8-20 peers → SFU for video; mesh can hold for data if updates are small.
+- 20+ peers → SFU mandatory, and consider whether server-mediated isn't simpler anyway.
+
+## Server-side WebRTC requires deep expertise
+
+If you decide you need an SFU, your options are:
+
+- **A SaaS** — LiveKit Cloud, Daily, 100ms, Twilio. The team handles every gritty detail; you pay $0.001-0.01 per participant-minute. Most products should do this.
+- **`mediasoup` (Node).** TypeScript-y, well-maintained, used in production by big names. Requires you to operate it: deploy across regions, handle codec negotiation, scale horizontally, monitor for crashes. Realistically a 4-6 month project for a senior backend engineer to get to production-ready.
+- **`ion-sfu` or `pion` (Go).** Go-native WebRTC implementations. Use if your team has Go expertise. The pion ecosystem is mature for self-hosting WebRTC infrastructure.
+- **`Janus` or `Jitsi Videobridge`.** Older, C/Java-based. Battle-tested for video conferencing specifically. Used by Jitsi Meet and most "video calls but I want to self-host" projects.
+
+For a startup, building your own SFU is almost always wrong. The math is "spend 4 months building infra you'll outgrow at 1000 users, or pay LiveKit $0.003/participant-min and ship today." The break-even is at huge scale (millions of participant-minutes) or specific requirements (E2EE for regulated industries, jurisdictions where you can't use US-based SaaS).
+
+For data-only WebRTC (no video), you usually don't need an SFU — y-webrtc's mesh holds for small collab groups, and beyond that, y-websocket via your own server is simpler than building anything WebRTC-server-side.
+
+## When WebSocket via your server is just better
+
+Be honest about these cases. They cover most products.
+
+**You have one server and N clients talking to it.** Notifications, chat between users mediated by your app, real-time dashboards, live data feeds. WebSocket plus a pub/sub backend (Redis, NATS, your queue) does all of this. WebRTC adds nothing and costs you signaling + TURN + complexity.
+
+**The bytes need to go through your server anyway** for moderation, indexing, analytics, audit, or compliance. If your servers are seeing the data either way, peer-to-peer just complicates the byte path.
+
+**Your users are mostly on mobile.** Mobile NAT is hostile (more symmetric, more aggressive timeouts). TURN usage on mobile is much higher than on desktop, and you're paying for that bandwidth anyway — so why not just relay through your own efficient infrastructure?
+
+**Late joiners need historical state.** Mesh WebRTC has no canonical history. WebSocket-mediated services do (or can, with a database behind them). For chat with scrollback, doc collab with version history, anything where "what did people say yesterday" matters, you're going to have a server in the loop. Adding WebRTC for the live-edit path on top of that is rarely worth the complexity.
+
+**You're a small team.** WebRTC has a learning curve. Three engineers building a SaaS dashboard with collab features should ship faster with y-websocket and a simple server than with y-webrtc and a TURN deployment, even if the WebRTC path is more "elegant."
+
+## When WebRTC actually wins
+
+For balance, the genuine wins. If your product is one of these, WebRTC is correct:
+
+- **Voice / video calling.** Nothing else in the browser does this. SaaS (LiveKit, Daily) recommended.
+- **Screen share / remote desktop.** Same — WebRTC's congestion-controlled real-time video is the only browser-native option.
+- **Game multiplayer.** Unordered data channels for inputs + reliable channel for game state. Beats WebSocket head-of-line for fast-twitch games.
+- **Local-first collab (small rooms).** y-webrtc for shared editors with no server-side state. Real cost savings at small scale.
+- **P2P file transfer.** WebRTC is faster than uploading-then-downloading via your server, and it's free for you on the egress side.
+- **Sensitive collaboration where end-to-end encryption is a requirement.** Even with HTTPS, your server can see WebSocket payloads. WebRTC's DTLS makes the data invisible to you. Compliance teams sometimes care.
+
+## The composite tradeoff table
+
+<Cheatsheet rows={[
+  { k: "API surface", v: "WebRTC >>> WebSocket >> fetch" },
+  { k: "Operational footprint", v: "WebRTC + TURN + signaling > WebSocket server > none" },
+  { k: "Browser quirks", v: "WebRTC has more; expect to file issues" },
+  { k: "Latency (same region)", v: "P2P direct < P2P+TURN ~ WebSocket through your server" },
+  { k: "Bandwidth cost to you", v: "P2P direct $0 < TURN-relayed ~ WebSocket through your server" },
+  { k: "Late-joiner state", v: "Easy with WebSocket+server; hard with raw P2P; needs y-indexeddb or similar for y-webrtc" },
+  { k: "Group size limit (video)", v: "Mesh ~4; SFU 50-1000+" },
+  { k: "Group size limit (data)", v: "Mesh ~20; SFU not needed in browser" },
+  { k: "End-to-end encryption", v: "P2P/SFU yes (DTLS); WebSocket only as far as your TLS termination" },
+  { k: "Build time for greenfield collab", v: "y-websocket: days. y-webrtc: weeks. Custom SFU: months" },
+]} />
+
+<Callout kind="tradeoff">
+  WebRTC is the right answer when peer-to-peer is the actual requirement (privacy, cost, latency below ~150ms) or when you need real-time media in the browser. It's the wrong answer when "real-time" just means "low-latency updates to/from your server" — that's what WebSocket is for. The most common WebRTC mistake at startups is using it because it sounds cool; the second most common is _not_ using it for the one workload it's actually built for (video calling) and rolling your own broken thing.
+</Callout>
+
+<Reading url="https://livekit.io/blog/scaling-webrtc-with-an-sfu" title="LiveKit — Scaling WebRTC with an SFU" kind="blog" minutes={12} />
+<Reading url="https://bloggeek.me/sfu-mcu-mesh/" title="Mesh, MCU, SFU compared (Tsahi Levent-Levi)" kind="blog" minutes={10} />
+<Reading url="https://mediasoup.org/documentation/v3/scalability/" title="mediasoup — Scalability" kind="docs" minutes={8} />
+
+**Remember this:** WebRTC is heavy. Pick it for video, real-time media, P2P-required, or end-to-end-encrypted use cases. For everything else, WebSocket through your server is faster to build, cheaper to run, and easier to debug.

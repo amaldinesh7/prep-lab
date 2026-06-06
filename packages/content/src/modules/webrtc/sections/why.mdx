@@ -1,0 +1,57 @@
+---
+title: Why WebRTC
+---
+
+<SectionHeader kind="why" number={1} title="Why WebRTC" />
+
+You already have HTTP and WebSocket. They cover most of what a web app needs. Then you hit one of three problems where they stop being enough — and where the only browser-native answer is WebRTC.
+
+## The three problems WebRTC was built for
+
+**Browser-to-browser without your server in the path.** Two users on the same Wi-Fi want to share a file. With HTTP, you upload it to your server, then the other user downloads it back. That's the file traversing the public internet twice for a transfer that should have been a 5-meter LAN hop. WebRTC lets the two browsers talk directly — peer-to-peer (P2P) — once they've found each other. Your server brokers the introduction, then steps out of the way.
+
+**Real-time audio and video with sub-200ms latency.** A WebSocket can stream bytes, but it can't open a microphone, can't encode H.264 in hardware, can't drop late video frames intelligently, can't tell you what bitrate to send when the network gets congested. WebRTC ships with a full media stack — codecs, jitter buffers, congestion control, echo cancellation — wired into `getUserMedia()`. The reason Google Meet, Zoom Web, Discord voice, and FaceTime for Web all use WebRTC is that nothing else in the browser does what it does.
+
+**Arbitrary data channels with UDP-like semantics.** WebSocket is TCP. TCP retransmits lost packets and preserves order, which is exactly what you don't want for real-time inputs in a multiplayer game or a synchronized cursor stream. WebRTC's `RTCDataChannel` lets you opt out — `ordered: false, maxRetransmits: 0` gives you UDP-style "fire and forget" delivery. For 60Hz cursor positions where a dropped packet is fine but a 300ms head-of-line block is not, this is the only browser API that does the right thing.
+
+## When P2P beats WebSocket
+
+Most apps should use WebSocket. Most apps have one or two clients talking to one server, and the server is the source of truth. WebRTC is the wrong tool there.
+
+P2P starts winning when one or more of these are true:
+
+1. **Bandwidth costs scale linearly with users.** Video routing through your server means you pay for every byte twice (ingress + egress). At 1080p video for 10 concurrent users, you're paying ~30Mbps per session. P2P pushes that traffic onto the participants' connections. Discord, before they had money, ran almost entirely P2P for voice for this reason.
+
+2. **Latency below ~150ms matters.** A WebSocket round-trip through your us-east-1 server is at minimum 2× the client-to-server RTT. Two users in Tokyo talking via your Virginia server eat 250ms+ of pure transit. P2P over the same LAN is <5ms. For voice, gaming inputs, and live cursor sync, that gap is felt.
+
+3. **End-to-end privacy is a feature.** If the bytes never traverse your server, you don't have to encrypt them at rest, you don't have to comply with subpoenas about their content, you don't have to worry about a server breach exposing call recordings. WebRTC's media is encrypted (SRTP) and data channels run over DTLS — your server can't decrypt them even if it wanted to.
+
+4. **The app already works offline.** Local-first apps with CRDTs (Yjs, Automerge) want a peer-to-peer transport when one is available. Two laptops in the same conference room can sync over WebRTC's data channels without your server existing. That's the dream local-first promises and WebRTC delivers.
+
+## What WebRTC costs
+
+It's the most operationally heavy API in the browser. You have to run a signaling system (WebRTC doesn't ship one). You probably have to run a TURN relay (most home networks need one ~5-10% of the time). The API surface is the chunkiest thing in the platform — `RTCPeerConnection`, `RTCSessionDescription`, `RTCIceCandidate`, `RTCDataChannel`, `MediaStream`, `MediaStreamTrack`, plus a few dozen events to wire together. Browsers ship subtle behavioral differences. Mobile browsers shed background tabs aggressively.
+
+Most teams don't use the raw API — they use `simple-peer` or PeerJS for the connection setup and a library like LiveKit, Daily, or 100ms for actual production video. We'll cover both layers.
+
+<Callout kind="why">
+  WebRTC exists because three things — browser-to-browser direct connections, real-time media, and UDP-style data — have no other path in the browser. If your app is talking to one server, you don't need it. If your app needs peers to talk to each other, or to ship real-time audio/video, or to send small unreliable packets at high rate, WebRTC is the only door.
+</Callout>
+
+## What this module gives you
+
+You're a senior frontend engineer. You probably won't write raw `RTCPeerConnection` code in production — you'll use libraries. But you'll be on a team where WebRTC is failing for one user behind a corporate firewall, or your y-webrtc collab session is dropping peers on mobile, and you'll need to know enough to read the ICE candidate logs and identify whether you need TURN, or DTLS is failing, or the renegotiation isn't firing.
+
+By the end of this module you should be able to:
+
+- Explain the offer/answer/ICE dance from first principles
+- Choose between WebSocket and WebRTC for a given product
+- Diagnose a failing connection by reading `iceConnectionState` and candidate types
+- Decide when y-webrtc beats y-websocket for a collab use case
+- Estimate when you need TURN, an SFU, or to just give up and use a service
+
+<Reading url="https://webrtc.org/getting-started/overview" title="WebRTC.org — Overview" kind="docs" minutes={8} />
+<Reading url="https://hpbn.co/webrtc/" title="High Performance Browser Networking — WebRTC" author="Ilya Grigorik" kind="paper" minutes={45} />
+<Reading url="https://bloggeek.me/webrtc-vs-websocket/" title="WebRTC vs WebSocket (Tsahi Levent-Levi)" kind="blog" minutes={10} />
+
+**Remember this:** WebRTC is for peer-to-peer, real-time media, or UDP-semantic data. If you don't need one of those three, you don't need WebRTC.

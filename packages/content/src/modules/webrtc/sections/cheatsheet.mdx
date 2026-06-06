@@ -1,0 +1,30 @@
+---
+title: Cheatsheet
+---
+
+<SectionHeader kind="cheatsheet" number={11} title="Cheatsheet" />
+
+Keep this open while you write WebRTC code for the first month and while you're deciding whether WebRTC is even the right call.
+
+<Cheatsheet rows={[
+  { k: "Three pillars", v: "Signaling (out of scope for WebRTC) + ICE (connection establishment) + transport (SRTP for media, SCTP/DTLS for data)" },
+  { k: "Signaling channel", v: "You build it — WebSocket is the default. Five message types: offer, answer, ice, end-of-candidates, hangup" },
+  { k: "Offer / answer", v: "SDP text blob exchanged via signaling. setLocalDescription → send → setRemoteDescription on the other side. Trickle ICE candidates alongside" },
+  { k: "ICE candidate", v: "An announcement of a network path. Types: host (LAN), srflx (STUN-discovered public), relay (TURN). Sent via signaling as discovered" },
+  { k: "STUN", v: "Free, public (stun:stun.l.google.com:19302). One UDP round trip → 'your public IP is X.X.X.X:port'. Works for ~80-90% of connections" },
+  { k: "TURN", v: "Relay fallback when STUN can't establish direct (symmetric NAT, ~5-10% of cases). coturn is the standard self-hosted option; bandwidth costs ~$0.25/hr per relayed video participant on AWS" },
+  { k: "Data channel reliable", v: "createDataChannel('name', { ordered: true }) — TCP-like. Default. For chat, file transfer, anything where every byte matters" },
+  { k: "Data channel unreliable", v: "{ ordered: false, maxRetransmits: 0 } — UDP-like. For cursor positions, game inputs, high-rate state where stale > nothing" },
+  { k: "Mesh limit", v: "~4 peers for video (bandwidth), ~20 peers for data (connection count). Beyond → SFU" },
+  { k: "SFU options", v: "mediasoup (Node), ion-sfu (Go), pion (Go), LiveKit/Daily/100ms (SaaS). Mandatory beyond ~6-person video" },
+  { k: "Yjs transport", v: "y-webrtc (P2P mesh, no server in byte path, ≤6 peers), y-websocket (server-mediated, scales further, server-side state)" },
+  { k: "Common library", v: "simple-peer wraps RTCPeerConnection in a stream API. Use this for any 1:1 P2P project. PeerJS adds a bundled signaling server" },
+  { k: "Production gotcha #1", v: "ICE restart on network change (Wi-Fi → cellular) — pc.createOffer({ iceRestart: true }) on iceConnectionState='failed'" },
+  { k: "Production gotcha #2", v: "HTTPS mandatory outside localhost — getUserMedia is a secure-context API" },
+  { k: "Production gotcha #3", v: "TURN-over-TLS on port 443 for corporate networks that block UDP" },
+  { k: "Production gotcha #4", v: "Always provider.destroy() / pc.close() on unmount — peer connections leak DTLS + ICE state" },
+  { k: "Debug tool", v: "chrome://webrtc-internals — live ICE candidate pairs, selected pair, bytes sent/received, current connection type" },
+  { k: "When to use WebRTC", v: "Video/voice calls, real-time media, P2P required (cost/privacy/latency), UDP semantics in browser. Otherwise: WebSocket" }
+]} />
+
+**Remember this:** WebRTC is heavy. The signal-to-noise ratio is low until you've internalized the three pillars and the NAT story. Once you have, it's the only browser API that does what it does — and for collaboration, calling, and games, the alternatives are worse. For everything else, WebSocket plus your server is faster to build and easier to operate.

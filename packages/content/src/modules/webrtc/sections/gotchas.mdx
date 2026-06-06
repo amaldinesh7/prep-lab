@@ -1,0 +1,159 @@
+---
+title: Production gotchas
+---
+
+<SectionHeader kind="gotcha" number={8} title="Production gotchas" />
+
+Every team shipping WebRTC trips over these. Most aren't documented anywhere central — they're learned by losing a day to each one. Reading them now is cheaper than reading them at 2am while a support ticket is open.
+
+## 1. ICE restart on network change
+
+A user starts a call on Wi-Fi at home, walks outside, switches to LTE. Their public IP changes. The existing ICE candidate pair is now dead. The connection drops — sometimes recoverably, often not.
+
+The fix is _ICE restart_: a renegotiation that re-runs candidate gathering on the existing peer connection without tearing down DTLS or media tracks. The browser doesn't do this automatically (in most cases) — you have to detect the disconnect and trigger it.
+
+<Code lang="ts" file="ice-restart.ts">{`pc.addEventListener("iceconnectionstatechange", async () => {
+  if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
+    // Re-create the offer with iceRestart: true
+    const offer = await pc.createOffer({ iceRestart: true });
+    await pc.setLocalDescription(offer);
+    signaling.send({ type: "offer", sdp: offer.sdp });
+    // The other peer responds with an answer; ICE re-trickles new candidates.
+  }
+});
+`}</Code>
+
+Tune the debounce — `disconnected` can be transient (a 500ms blip). Wait 2-5 seconds before restarting; otherwise you'll restart on every micro-blip and make things worse. Real production code uses a backoff: 2s on first disconnect, 5s on second within 30s, etc.
+
+`simple-peer` and the SaaS clients (LiveKit, Daily) do this for you. If you roll your own, write it.
+
+## 2. HTTPS is mandatory outside localhost
+
+`getUserMedia` (camera/mic access) is a secure-context API. It only works on `https://` and `localhost`. If you serve your WebRTC demo over `http://192.168.1.x:3000` to test on your phone, `navigator.mediaDevices.getUserMedia` returns `undefined` and you'll waste an hour wondering why.
+
+This also bites in dev tunnels. `ngrok` and Cloudflare Tunnel give you HTTPS by default — use them. Locally, set up a self-signed cert and serve over `https://localhost` (Vite supports this via `--https`). Don't try to disable security in Chrome flags; the flags get reset between releases and you'll forget.
+
+Same secure-context requirement applies to `RTCPeerConnection` itself in some browsers — Safari is the strictest.
+
+## 3. getUserMedia permission UX
+
+The browser permission prompt is brutal. Users see "example.com wants to use your camera and microphone" and ~60% of them dismiss it on first attempt — sometimes by accident, sometimes because they don't realize what triggered it.
+
+Three things to do:
+
+- **Don't request on page load.** Wait until the user does something that obviously requires the camera (clicks "Join call"). Pre-requesting feels intrusive and tanks the grant rate.
+- **Pre-explain.** Show a "we'll ask for camera access next" screen with the actual prompt button on it, so the user is mentally ready when the browser prompt appears.
+- **Handle the denial.** `getUserMedia` rejects with `NotAllowedError` if the user blocks, `NotFoundError` if no device exists, `NotReadableError` if another app is using the device, `OverconstrainedError` if your `constraints` were too specific. Catch each and show useful UI.
+
+<Code lang="ts" file="permission-flow.ts">{`async function startVideo() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: { echoCancellation: true, noiseSuppression: true },
+    });
+    // ...attach to peer connection
+    return stream;
+  } catch (err) {
+    if (err.name === "NotAllowedError") {
+      showHelp("Click the camera icon in your address bar to grant access.");
+    } else if (err.name === "NotFoundError") {
+      showHelp("No camera found. Plug one in or try audio-only.");
+    } else if (err.name === "NotReadableError") {
+      showHelp("Camera is being used by another app. Close it and try again.");
+    } else {
+      console.error("Unexpected getUserMedia error", err);
+    }
+  }
+}
+`}</Code>
+
+Once granted, the permission is per-origin and persists. The user can revoke from site settings. There's no API to query whether they've granted before — `navigator.permissions.query({ name: "camera" })` exists in modern browsers but is unreliable on Safari.
+
+## 4. Mobile background tab loses connection
+
+On iOS Safari, switching tabs or backgrounding the browser kills your WebRTC connection within seconds. On Android Chrome it's slightly more lenient but still throttles. The OS aggressively suspends JavaScript execution and media tracks in background tabs to save battery.
+
+What you'll see:
+
+- `iceConnectionState` goes to `disconnected` or `failed` while the user is on another app.
+- The user comes back and the call doesn't auto-resume.
+- The other peer is staring at a frozen video frame because nothing told them you dropped.
+
+What to do:
+
+- **Listen for `visibilitychange`.** When `document.hidden === true`, surface to your UI that the call may be suspended. When it returns to visible, trigger an ICE restart proactively.
+- **Use the Page Lifecycle API** (`pagehide`, `pageshow`, `freeze`, `resume`) to detect when the tab is being suspended vs the user just swiping away.
+- **Audio-only fallback.** If video drops but the user needs the call to continue, switch to audio-only — audio is more resilient to background throttling than video.
+- **Server-side timeouts.** Don't trust the client to tell you when a call has ended. Time out connections server-side after ~30 seconds of inactivity and clean up state.
+
+Native mobile apps don't have this problem (they get background audio entitlements). If your product is a serious mobile video calling app, ship a native shell.
+
+## 5. Corporate firewalls block UDP — need TURN over TCP
+
+This is the one that catches every "WebRTC works in our demo but fails for enterprise customers" team. Many corporate firewalls block outbound UDP entirely. STUN and the WebRTC media path are UDP-first. With no UDP, both peers' ICE candidate gathering finds nothing usable.
+
+The fix is TURN over TCP, ideally TLS-wrapped so it looks like HTTPS to the firewall's deep packet inspection:
+
+<Code lang="ts" file="turn-fallback.ts">{`const pc = new RTCPeerConnection({
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },                       // UDP STUN
+    { urls: "turn:turn.example.com:3478?transport=udp", username, credential },  // TURN UDP
+    { urls: "turn:turn.example.com:3478?transport=tcp", username, credential },  // TURN TCP (firewall bypass)
+    { urls: "turns:turn.example.com:5349?transport=tcp", username, credential }, // TURN TLS over 443
+  ],
+});
+`}</Code>
+
+Put your TURN-over-TLS endpoint on port 443. Most corporate firewalls let port 443 through unconditionally because it's HTTPS — the TURN handshake inside is invisible to them. This is how Google Meet works on locked-down corporate networks.
+
+The performance penalty: TURN-over-TCP-over-TLS is slower than UDP and head-of-line-blocks media (TCP's retransmits ruin real-time video). Audio survives; video gets glitchy on packet loss. But "glitchy video" is much better than "no call at all," which is what you get without this fallback.
+
+## 6. Memory: forgetting to close data channels and peer connections
+
+Every `RTCPeerConnection` and `RTCDataChannel` you create holds DTLS state, ICE state, SCTP buffers — easily a few hundred KB each. Long-running pages that create connections without closing them slowly bloat memory.
+
+The pattern:
+
+```ts
+function teardown(pc: RTCPeerConnection) {
+  pc.getSenders().forEach((s) => s.track?.stop());
+  pc.getReceivers().forEach((r) => r.track?.stop());
+  pc.close();
+}
+window.addEventListener("beforeunload", () => teardown(pc));
+```
+
+Three places this leaks in production:
+
+1. **React Strict Mode double-mounting.** A component mounts, creates a peer connection, then re-mounts (Strict Mode in dev) — now you have two connections. Always create connections in effects with cleanup functions, never inline.
+2. **Hot reload during dev.** Each module reload may create a new peer connection without cleaning up the old. You'll see warnings about "duplicate signaling" in dev that you wouldn't in prod, but it does mask real cleanup bugs.
+3. **Provider abandonment.** y-webrtc's `WebrtcProvider` needs `provider.destroy()` when you're done. Without it, the underlying peer connections stay open even after the component using them unmounts. Same for y-websocket. Always destroy providers on unmount.
+
+```ts
+useEffect(() => {
+  const provider = new WebrtcProvider(roomId, doc, opts);
+  return () => provider.destroy();  // ← don't skip this
+}, [roomId]);
+```
+
+## 7. Renegotiation deadlocks (glare)
+
+If both peers try to send an offer at the same time (e.g., both detect they need to add a video track in the same instant), they enter a state called _glare_ where each rejects the other's offer because they're "stable" in their own offer state. The connection wedges.
+
+The W3C spec calls the fix "perfect negotiation" — designate one peer as "polite" and one as "impolite." When glare happens, the polite peer rolls back its local offer and accepts the remote one. simple-peer and the SaaS libraries implement this. If you write your own renegotiation logic, copy the W3C example.
+
+## 8. SDP munging — the dark art
+
+For codec preferences, bitrate caps, or fixing browser bugs, production code sometimes edits SDP strings between `createOffer()` and `setLocalDescription()`. Things like "prefer Opus, then PCMU" or "cap video at 1 Mbps."
+
+This works. It's also brittle — SDP format changes between browser versions, your regex breaks, and now you've shipped a stealth bug. Modern alternative: use `RTCRtpSender.getParameters()` / `setParameters()` and `RTCRtpTransceiver.setCodecPreferences()` instead. These are the structured API replacements for SDP munging. Greenfield code should never touch SDP strings directly.
+
+<Callout kind="gotcha">
+  The classic WebRTC production failures, in priority order: (1) connection drops on network change because you didn't implement ICE restart; (2) "works for me, fails for the enterprise customer" because you didn't ship TURN-over-TLS on port 443; (3) memory leaks from undisposed peer connections in React effects; (4) mobile background tabs killing calls; (5) HTTPS not configured in staging; (6) renegotiation glare wedging the connection. Audit for these on every code review of WebRTC-touching code.
+</Callout>
+
+<Reading url="https://webrtchacks.com/sfu-load-testing/" title="WebRTC hacks — SFU load testing (with mobile gotchas)" kind="blog" minutes={15} />
+<Reading url="https://blog.mozilla.org/webrtc/perfect-negotiation-in-webrtc/" title="Perfect Negotiation in WebRTC (Mozilla)" kind="blog" minutes={12} />
+<Reading url="https://developer.chrome.com/docs/web-platform/webrtc-debugging" title="Chrome — WebRTC debugging" kind="docs" minutes={8} />
+
+**Remember this:** the failures are all variations on "didn't budget for the network changing under you." ICE restart on disconnect. TURN over TCP/TLS for restricted networks. Dispose connections on unmount. Watch for background tab suspension. Get these right early; retrofitting them in a crisis is how engineers burn out on WebRTC.

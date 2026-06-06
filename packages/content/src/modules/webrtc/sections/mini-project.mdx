@@ -1,0 +1,262 @@
+---
+title: Swap Yjs transport to y-webrtc
+---
+
+<SectionHeader kind="mini_project" number={9} title="Swap Yjs transport to y-webrtc" />
+
+Three hours that take you from "I read about WebRTC" to "I have a real Yjs editor running peer-to-peer, two browsers syncing without my server in the byte path, awareness cursors painted in real-time, and I've watched the signaling server die while the peers happily keep typing." If you finish the CRDTs module's mini-project first, this picks up exactly where that left off — swap one provider, change nothing else.
+
+<ProjectCard hours="3" starter="./yjs-webrtc-starter">
+
+## Goal
+
+A minimal editor that:
+
+- Renders CodeMirror 6 bound to a Y.Text (same as the CRDTs mini-project).
+- Syncs **peer-to-peer over WebRTC** between two browser tabs.
+- Uses the public y-webrtc signaling network (no signaling server of your own at first).
+- Paints awareness cursors P2P, no server needed.
+- Survives the signaling server going away mid-session — peers keep syncing.
+- (Stretch) Adds your own tiny WebSocket signaling server.
+
+## Setup
+
+Start from the CRDTs mini-project (the y-websocket editor) if you have it. If not, scaffold a fresh one:
+
+```bash
+bun create vite yjs-webrtc --template vanilla-ts
+cd yjs-webrtc
+bun add yjs y-webrtc y-codemirror.next
+bun add codemirror @codemirror/state @codemirror/view @codemirror/lang-markdown
+```
+
+No `y-websocket-server` to run. No signaling infra to deploy. Yet.
+
+## Steps
+
+### 1. Wire CodeMirror to a Y.Doc over y-webrtc
+
+Replace `src/main.ts`:
+
+<Code lang="ts" file="src/main.ts">{`import * as Y from "yjs";
+import { WebrtcProvider } from "y-webrtc";
+import { yCollab } from "y-codemirror.next";
+import { EditorState } from "@codemirror/state";
+import { EditorView, basicSetup } from "codemirror";
+import { markdown } from "@codemirror/lang-markdown";
+
+// 1. The shared document
+const doc = new Y.Doc();
+const ytext = doc.getText("body");
+
+// 2. y-webrtc provider — uses the library's default public signaling
+//    servers for now; we'll swap to our own later.
+const provider = new WebrtcProvider("prep-lab-webrtc-demo-room-001", doc, {
+  // signaling: ["wss://signaling.yjs.dev"],  // default if omitted
+  peerOpts: {
+    config: {
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        // Add a TURN entry here for prod; OK to skip for LAN testing.
+      ],
+    },
+  },
+});
+
+// 3. Awareness — same API as y-websocket
+provider.awareness.setLocalStateField("user", {
+  name: \`tab-\${Math.floor(Math.random() * 1000)}\`,
+  color: \`hsl(\${Math.floor(Math.random() * 360)} 70% 50%)\`,
+});
+
+// 4. Bind the editor
+const state = EditorState.create({
+  doc: ytext.toString(),
+  extensions: [
+    basicSetup,
+    markdown(),
+    yCollab(ytext, provider.awareness),
+  ],
+});
+
+const editor = new EditorView({
+  state,
+  parent: document.getElementById("editor")!,
+});
+
+// 5. Expose for devtools
+Object.assign(window, { doc, ytext, provider, editor, Y });
+
+// 6. Status badge — y-webrtc fires "peers" events with connection counts
+const status = document.getElementById("status")!;
+function updateStatus() {
+  const peers = provider.awareness.getStates().size - 1;
+  status.textContent = peers > 0 ? \`P2P (\${peers} peer\${peers === 1 ? "" : "s"})\` : "waiting for peers…";
+}
+provider.awareness.on("change", updateStatus);
+provider.on("peers", updateStatus);
+updateStatus();
+
+// 7. Clean teardown
+window.addEventListener("beforeunload", () => provider.destroy());
+`}</Code>
+
+Update `index.html` to a minimal shell with `<div id="editor">` and `<span id="status">`.
+
+Run `bun run dev`.
+
+### 2. Confirm P2P sync between two tabs/browsers
+
+Open the URL in two tabs (or two browsers, or a browser and a phone on the same network). Type in one. Watch the other update. You should also see the remote tab's cursor painted in a different color.
+
+Open DevTools → Network in both tabs:
+
+- You should see WebSocket traffic to `signaling.yjs.dev` (or whichever default signaling host is current).
+- You should _not_ see ongoing high-rate traffic to that signaling server — the signaling traffic is a small burst at the start, then nothing. The byte-level edit traffic doesn't appear in the Network panel because WebRTC data channels don't show up there.
+
+Open `chrome://webrtc-internals` in a Chromium browser. You'll see your peer connection, the ICE candidate pairs, the data channel, and live stats — bytes sent/received, current connection type (`host`/`srflx`/`relay`). For two tabs on the same machine, expect `host`/`host` (loopback). For two browsers on the same LAN, expect `host`/`host` or `srflx`/`srflx`.
+
+### 3. Add awareness — cursors over P2P
+
+You already have awareness wired (step 3 above). Confirm by:
+
+1. In tab A, click into the editor and move your cursor around.
+2. In tab B, watch the remote cursor move in real-time.
+3. In DevTools of one tab, run `provider.awareness.getStates()` — you'll see a `Map<clientId, state>` with each connected peer's user info and cursor position.
+
+This is the bit that "feels" multiplayer. It's also pure y-webrtc — there's no server seeing those cursor moves.
+
+### 4. Kill the signaling server — peers stay connected
+
+The headline experiment. With both tabs open and connected:
+
+1. Open DevTools → Network in tab A, filter to "WS," and click on the signaling WebSocket. Notice it's idle (no recent messages) — signaling is only used during connection setup.
+2. In tab A's DevTools console, run:
+   ```js
+   // Forcibly close the signaling WebSocket.
+   // The library will try to reconnect — for the demo, just disconnect from network entirely.
+   provider.signalingConns.forEach(c => c.destroy());
+   ```
+   Or, more dramatically, toggle DevTools → Network throttling to "Offline" briefly _while still keeping the WebRTC connection alive_ (you can't — offline mode kills both — so just close the signaling WebSocket above).
+3. Type in tab A. Watch tab B receive the edits. They're flowing peer-to-peer over the data channel, which never touched the signaling server.
+
+This is the "no server in the byte path" claim made concrete. Once the peers have established their WebRTC connection, signaling is gone — the bytes travel directly.
+
+(If you actually want to verify by killing the public signaling server, you can't — it's run by someone else. The stretch goal below has you run your own and kill it for real.)
+
+### 5. Inspect a data channel update
+
+In tab A's DevTools, run:
+
+```js
+// y-webrtc exposes the underlying simple-peer connections.
+const peers = Array.from(provider.room.webrtcConns.values());
+console.log(peers[0]);  // simple-peer instance with a peerConnection
+console.log(peers[0].peer);  // RTCPeerConnection
+```
+
+Open `chrome://webrtc-internals` and look at the data channel's `messagesSent` / `bytesSent` counters. Type a few characters and watch them tick up — usually 30-80 bytes per keystroke (the Yjs binary update format is compact). Compare against the same load on y-websocket — same byte count, different transport.
+
+### 6. (Stretch) Roll your own signaling
+
+Now that you've seen y-webrtc end-to-end on a public signaling server, replace it with your own. The library ships a signaling server:
+
+```bash
+# In a new terminal
+bunx y-webrtc-signaling --port 4444
+```
+
+Update your provider:
+
+```ts
+const provider = new WebrtcProvider("prep-lab-webrtc-demo-room-001", doc, {
+  signaling: ["ws://localhost:4444"],  // ← your own
+  peerOpts: { /* same as before */ },
+});
+```
+
+Restart both tabs. Confirm they still connect — now via your signaling server.
+
+Now kill the signaling server (`Ctrl+C` the bunx process). Type in both tabs. Edits keep syncing because the data channels are alive. Restart the signaling server. New tabs can now join the room again.
+
+You've just proven the core architectural property of y-webrtc: signaling is only required for introduction, not for ongoing sync.
+
+### 7. (Stretch) Add y-indexeddb for offline-first
+
+```bash
+bun add y-indexeddb
+```
+
+```ts
+import { IndexeddbPersistence } from "y-indexeddb";
+new IndexeddbPersistence("prep-lab-webrtc-demo-room-001", doc);
+```
+
+Now: close both tabs. Reopen one. The doc reloads from IndexedDB instantly, before any peer connects. Open the second tab — they re-sync via y-webrtc. You have a fully offline-capable, peer-to-peer collab editor with no server-side state at all.
+
+### 8. (Stretch) Compare bytes-on-wire to y-websocket
+
+If you did the CRDTs mini-project, you have a y-websocket version of the same editor. Run both side-by-side in two browser windows. Make identical edits. Compare:
+
+- WebRTC: bytes go peer-to-peer (you can't easily measure them in Network panel — use `webrtc-internals`).
+- WebSocket: bytes go through your server (or `signaling.yjs.dev`), visible in Network panel.
+
+For two-user collab, the y-webrtc byte path is faster (no extra hop) and free (no server bandwidth). For 10-user collab, you'd see y-webrtc's mesh start to amplify each edit by N-1.
+
+## What to internalize
+
+By the time you close the lid, you should be able to answer:
+
+- Why doesn't the editor stop working when signaling goes away?
+- What does the signaling server actually do — and how much data passes through it?
+- How many WebRTC connections exist when 4 tabs are in the same room? (Hint: 6 = N(N-1)/2.)
+- What changes between y-webrtc and y-websocket from the application's perspective? (Hint: almost nothing.)
+- If you wanted this to scale to 50 users, what would you switch back to?
+- Where do TURN credentials fit into y-webrtc's config? Why might you need them?
+
+If those answers feel earned rather than memorized, the project landed.
+
+## Reference snapshot
+
+The full provider construction with TURN, custom signaling, password encryption, and awareness — keep this as your starting template for production use:
+
+<Code lang="ts" file="prod-provider.ts">{`const provider = new WebrtcProvider(roomId, doc, {
+  signaling: ["wss://signaling.your-company.com"],
+  password: roomPassword,   // optional; encrypts metadata between peers
+  maxConns: 20,
+  filterBcConns: true,
+  peerOpts: {
+    config: {
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun.cloudflare.com:3478" },
+        {
+          urls: [
+            "turn:turn.your-company.com:3478?transport=udp",
+            "turn:turn.your-company.com:3478?transport=tcp",
+            "turns:turn.your-company.com:5349?transport=tcp",
+          ],
+          username: turnUsername,
+          credential: turnCredential,
+        },
+      ],
+    },
+  },
+});
+
+provider.on("synced", () => console.log("synced with at least one peer"));
+provider.on("peers", ({ added, removed }) => {
+  console.log("peers added:", added);
+  console.log("peers removed:", removed);
+});
+
+// Always destroy on unmount
+const cleanup = () => provider.destroy();
+`}</Code>
+
+</ProjectCard>
+
+<Reading url="https://github.com/yjs/y-webrtc" title="y-webrtc — GitHub repo + README" kind="docs" minutes={10} />
+<Reading url="https://github.com/feross/simple-peer" title="simple-peer (the engine y-webrtc uses)" kind="docs" minutes={10} />
+<Reading url="https://docs.yjs.dev/ecosystem/connection-provider/y-webrtc" title="Yjs docs — y-webrtc provider" kind="docs" minutes={6} />
+<Reading url="https://www.youtube.com/watch?v=DZIQpZSwKAU" title="Kevin Jahns talks Yjs — including y-webrtc" kind="video" minutes={30} />

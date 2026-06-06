@@ -1,0 +1,137 @@
+---
+title: "Mental model: signaling + ICE + media/data"
+---
+
+<SectionHeader kind="concept" number={2} title="Mental model: signaling + ICE + media/data" />
+
+The single thing that makes WebRTC feel impenetrable on first read is that it bundles three independent problems under one name. They look like one API. They're three completely different concerns, each with their own protocols, their own failure modes, their own infrastructure. Once you can name the three out loud, the spec stops being mysterious.
+
+## The three independent concerns
+
+**Concern 1: signaling.** Before two peers can talk, they need to exchange a few kilobytes of metadata — codec preferences, IP addresses, network paths, encryption fingerprints. This metadata has to travel _somehow_, but the peers aren't connected yet. So you use _something else_ — a WebSocket, an HTTP POST, a Supabase realtime channel, a QR code passed between two phones. WebRTC does not specify how. It just says: "you, the application developer, get these messages from one peer to the other; I'll do everything from there."
+
+**Concern 2: connection establishment.** Once signaling has handed the peers each other's network info, they have to actually open a connection. This is where NAT (network address translation) bites: home routers, corporate firewalls, and mobile carrier networks all sit between your browser and the public internet, rewriting addresses. WebRTC uses ICE (Interactive Connectivity Establishment) — a protocol that tries every possible network path between two peers in parallel and picks the one that works. ICE leans on STUN servers (to discover your public address) and sometimes TURN servers (to relay when nothing else works).
+
+**Concern 3: data transport.** Once the connection is open, you can send three kinds of payloads: audio (encoded with Opus, transported via SRTP), video (encoded with VP8/VP9/H.264/AV1, also SRTP), or application data (any bytes, transported via SCTP over DTLS). Each has its own API — `addTrack` for media, `createDataChannel` for data — but they all share the same underlying connection.
+
+Most failures you'll debug live in one of those three layers. Identifying which one is half the fix.
+
+<Callout kind="concept">
+  Hold this in your head as the entire mental model: signaling moves metadata, ICE establishes the path, and SRTP/SCTP carry the bytes. Whenever WebRTC breaks, you ask "which of the three?" — and the diagnostic narrows by an order of magnitude.
+</Callout>
+
+## "Signaling is up to you"
+
+This is the line that catches every WebRTC newbie. The browser does not ship a signaling channel. You have to build (or import) one. The reason is intentional: WebRTC works in environments where there is no central server (think two laptops meeting over Bluetooth via a discovery beacon), and tying it to a specific signaling protocol would make it useless there.
+
+In practice, every production WebRTC system has signaling. The choices:
+
+- **A WebSocket to your own server.** Works for any topology where users are logged into your app. Most common.
+- **An existing realtime service** (Supabase Realtime, Pusher, Ably, Firebase Realtime DB). Lets you skip running infra.
+- **HTTP long-polling.** The fallback when WebSockets are blocked by a firewall. Painful but works.
+- **Sneakernet / QR code / NFC.** Two phones in physical proximity can exchange SDP via QR. WebRTC-over-paper has shipped.
+- **Public signaling networks** (e.g., y-webrtc's default signaling server). Convenient for demos; not for production.
+
+Whatever you choose, signaling has one job: be a reliable bidirectional message channel between peers _before_ they have a peer connection. It carries five kinds of messages, none of which exceeds a few KB:
+
+1. "Here's my SDP offer."
+2. "Here's my SDP answer."
+3. "Here's a new ICE candidate I just found."
+4. "I'm done sending candidates."
+5. "I want to end the call."
+
+That's it. Anything past that is your app's business.
+
+## Offer / answer: the SDP dance
+
+When peer A wants to connect to peer B, they perform a structured exchange. WebRTC calls it _offer/answer_. The thing they're exchanging is called SDP — Session Description Protocol — a text format inherited from the SIP/VoIP world.
+
+Here's the choreography, ignoring NAT for a moment:
+
+<Code lang="ts" file="offer-answer.ts">{`// === PEER A (the initiator) ===
+const pcA = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+
+// Add what we want to send (could be media tracks or a data channel)
+const dc = pcA.createDataChannel("chat");
+
+// Generate an offer describing our capabilities
+const offer = await pcA.createOffer();
+await pcA.setLocalDescription(offer);
+
+// Send offer.sdp over signaling to peer B
+signaling.send({ type: "offer", sdp: offer.sdp });
+
+// === PEER B (the responder) ===
+const pcB = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+
+signaling.on("offer", async ({ sdp }) => {
+  await pcB.setRemoteDescription({ type: "offer", sdp });
+
+  // Create an answer describing what we agree to
+  const answer = await pcB.createAnswer();
+  await pcB.setLocalDescription(answer);
+
+  signaling.send({ type: "answer", sdp: answer.sdp });
+});
+
+// === PEER A receives the answer ===
+signaling.on("answer", async ({ sdp }) => {
+  await pcA.setRemoteDescription({ type: "answer", sdp });
+});
+`}</Code>
+
+The SDP itself is a multi-line text blob — codecs supported, encryption keys, transport hints. You almost never need to read it. The browser builds it; the other browser parses it. Treat it as an opaque token.
+
+What you do need to internalize: **the offer/answer is two messages, sent in order, over signaling.** That's it. Forget the contents, remember the shape.
+
+## The ICE candidate stream runs alongside
+
+Here's the part the offer/answer description omits: while the SDP is being exchanged, the peer is _also_ asking ICE to discover network paths. ICE finds candidates one at a time:
+
+- "I can be reached on my local IP 192.168.1.42:5000." (host candidate)
+- "STUN says my public IP is 73.x.y.z:54321." (server-reflexive candidate)
+- "A TURN server says it'll relay for me at turn-server:3478." (relay candidate)
+
+Each candidate appears asynchronously. The browser fires an `icecandidate` event for each one, and you forward each to the other peer via signaling:
+
+<Code lang="ts" file="ice-trickle.ts">{`pcA.addEventListener("icecandidate", (e) => {
+  if (e.candidate) {
+    signaling.send({ type: "ice", candidate: e.candidate.toJSON() });
+  } else {
+    // null candidate = "I'm done gathering"
+  }
+});
+
+signaling.on("ice", async ({ candidate }) => {
+  await pcA.addIceCandidate(candidate);
+});
+`}</Code>
+
+This is called _trickle ICE_ — sending candidates as you find them rather than waiting until you've found them all. It's standard now; you should always use it. Old WebRTC code that waits for all candidates before sending the offer is slower by hundreds of milliseconds and you'll see it in the wild.
+
+## Media and data ride on the same connection
+
+After the offer/answer succeeds and ICE picks a path, you have an `RTCPeerConnection` that's live. Now both media tracks and data channels just work:
+
+- `pc.addTrack(audioTrack, stream)` for audio.
+- `pc.addTrack(videoTrack, stream)` for video.
+- `pc.createDataChannel("name")` for arbitrary data (already shown above).
+
+Each gets its own multiplexed substream over the same UDP-or-TURN-relayed path. Media goes via SRTP (Secure Real-time Transport Protocol — encrypted, lossy-friendly, with built-in jitter buffering). Data goes via SCTP-over-DTLS (Stream Control Transmission Protocol over Datagram TLS — supports both reliable and unreliable delivery modes; we'll dig into this in the data channels section).
+
+## The state machine that matters
+
+Two state properties tell you most of what you need during debugging. Watch these in DevTools every time you write WebRTC code:
+
+- `pc.connectionState`: `new` → `connecting` → `connected` → `disconnected` → `failed` / `closed`. The summary line.
+- `pc.iceConnectionState`: `new` → `checking` → `connected` → `completed` → `disconnected` → `failed`. Finer-grained ICE status.
+
+If `iceConnectionState` lands on `failed`, ICE could not find any path between the peers. That usually means: you need a TURN server, you forgot to forward ICE candidates over signaling, or one peer is on a network that blocks UDP outbound. We'll cover all three.
+
+If `iceConnectionState` reaches `connected` but data still doesn't flow, your DTLS handshake is the next layer to check.
+
+<Reading url="https://www.rfc-editor.org/rfc/rfc8866" title="RFC 8866 — Session Description Protocol (SDP)" kind="paper" minutes={20} />
+<Reading url="https://hpbn.co/webrtc/#establishing-a-peer-to-peer-connection" title="HPBN — Establishing a Peer-to-Peer Connection" author="Ilya Grigorik" kind="paper" minutes={20} />
+<Reading url="https://webrtchacks.com/trickle-ice/" title="Why is trickle ICE such a big deal? (webrtcHacks)" kind="blog" minutes={10} />
+
+**Remember this:** signaling + ICE + transport. Three independent layers. Whenever WebRTC misbehaves, name the layer before you debug. Half the senior-engineer skill in WebRTC is just keeping these straight.

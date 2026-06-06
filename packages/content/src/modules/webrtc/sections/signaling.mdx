@@ -1,0 +1,194 @@
+---
+title: Signaling
+---
+
+<SectionHeader kind="concept" number={3} title="Signaling" />
+
+Signaling is the part of WebRTC that nobody warns you about until you've started writing the rest. It's the most "your problem" piece of the stack — the spec literally won't tell you how to do it. This section is about taking it seriously: what messages you have to move, how to move them, and which library to grab so you don't roll it yourself.
+
+## What signaling has to transport
+
+You only need to move five message types between two peers. Hold this list — it's the entire surface area.
+
+1. **Offer** — peer A's SDP offer.
+2. **Answer** — peer B's SDP answer.
+3. **ICE candidates** — either side, any time, while connecting (and on ICE restarts).
+4. **End-of-candidates** signals (optional but cleaner).
+5. **Hangup / close** — bookkeeping.
+
+Each message is small (a few KB max). The channel just has to be reliable and bidirectional, and you have to know which two peers a given message belongs to (room ID, call ID, conversation ID — whatever your domain calls it).
+
+## The offer → answer → candidates flow, end-to-end
+
+Let's walk through a complete handshake. Peer A wants to call peer B. Both are connected to the same signaling server over WebSocket. They've each joined a "room" identified by a string.
+
+```
+A → signaling: { room: "demo", from: "alice", to: "bob", type: "offer", sdp: "..." }
+signaling → B: { from: "alice", type: "offer", sdp: "..." }
+B → signaling: { room: "demo", from: "bob", to: "alice", type: "answer", sdp: "..." }
+signaling → A: { from: "bob", type: "answer", sdp: "..." }
+
+# In parallel, both sides trickle ICE candidates:
+A → signaling: { ... type: "ice", candidate: { ... } }
+signaling → B: { ... }
+B → signaling: { ... type: "ice", candidate: { ... } }
+signaling → A: { ... }
+# ...repeated as candidates appear
+```
+
+The signaling server is doing _almost nothing_. It's a typed message router. It does not parse SDP. It does not understand ICE. It just takes messages keyed by `(room, from, to)` and forwards them. That's the whole job.
+
+## A minimal WebSocket signaling server
+
+Here's a complete signaling server in ~40 lines. It handles rooms, message routing, and graceful disconnects. Don't ship this to prod — but it shows you exactly how little a signaling server has to do.
+
+<Code lang="ts" file="server/signaling.ts">{`import { WebSocketServer, WebSocket } from "ws";
+
+interface Peer { id: string; room: string; ws: WebSocket }
+const peers = new Map<string, Peer>();
+
+const wss = new WebSocketServer({ port: 8080 });
+
+wss.on("connection", (ws) => {
+  let me: Peer | null = null;
+
+  ws.on("message", (raw) => {
+    const msg = JSON.parse(raw.toString());
+
+    // First message: "join"
+    if (msg.type === "join") {
+      me = { id: msg.peerId, room: msg.room, ws };
+      peers.set(me.id, me);
+      // Notify others in the room that we joined
+      for (const p of peers.values()) {
+        if (p.room === me.room && p.id !== me.id) {
+          p.ws.send(JSON.stringify({ type: "peer-joined", peerId: me.id }));
+          ws.send(JSON.stringify({ type: "peer-present", peerId: p.id }));
+        }
+      }
+      return;
+    }
+
+    // Subsequent messages route by recipient
+    const to = peers.get(msg.to);
+    if (to && me) {
+      to.ws.send(JSON.stringify({ ...msg, from: me.id }));
+    }
+  });
+
+  ws.on("close", () => {
+    if (!me) return;
+    peers.delete(me.id);
+    for (const p of peers.values()) {
+      if (p.room === me.room) p.ws.send(JSON.stringify({ type: "peer-left", peerId: me.id }));
+    }
+  });
+});
+`}</Code>
+
+That's it. ~40 lines, no dependencies beyond `ws`, and you have a working WebRTC signaling server. You can scale it horizontally by adding Redis pub/sub so multiple instances can route between peers. You can add auth by validating a JWT on `join`. You can persist nothing — the server is stateless except for the in-memory peer table, which is fine because if a peer disconnects, you want to drop them.
+
+## The matching client
+
+Pair the server above with this client. The pattern is "wrap the WebSocket in a tiny event emitter, then drive the peer connection from those events":
+
+<Code lang="ts" file="client/peer.ts">{`type Msg = { type: string; from?: string; to?: string; [k: string]: unknown };
+
+class Signaling extends EventTarget {
+  private ws = new WebSocket("ws://localhost:8080");
+  private ready = new Promise<void>((resolve) => this.ws.onopen = () => resolve());
+
+  constructor(private peerId: string, private room: string) {
+    super();
+    this.ws.onmessage = (e) => {
+      const msg: Msg = JSON.parse(e.data);
+      this.dispatchEvent(new CustomEvent(msg.type, { detail: msg }));
+    };
+  }
+
+  async send(msg: Msg) {
+    await this.ready;
+    this.ws.send(JSON.stringify(msg));
+  }
+
+  async join() {
+    await this.send({ type: "join", peerId: this.peerId, room: this.room });
+  }
+}
+
+const sig = new Signaling(crypto.randomUUID(), "demo");
+const pc = new RTCPeerConnection({
+  iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+});
+
+// Trickle ICE → signaling
+pc.addEventListener("icecandidate", (e) => {
+  if (e.candidate) sig.send({ type: "ice", to: remotePeerId!, candidate: e.candidate.toJSON() });
+});
+
+let remotePeerId: string | null = null;
+
+// Inbound messages from signaling
+sig.addEventListener("peer-joined", async (e: any) => {
+  remotePeerId = e.detail.peerId;
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  sig.send({ type: "offer", to: remotePeerId, sdp: offer.sdp });
+});
+
+sig.addEventListener("offer", async (e: any) => {
+  remotePeerId = e.detail.from;
+  await pc.setRemoteDescription({ type: "offer", sdp: e.detail.sdp });
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  sig.send({ type: "answer", to: remotePeerId, sdp: answer.sdp });
+});
+
+sig.addEventListener("answer", async (e: any) => {
+  await pc.setRemoteDescription({ type: "answer", sdp: e.detail.sdp });
+});
+
+sig.addEventListener("ice", async (e: any) => {
+  await pc.addIceCandidate(e.detail.candidate);
+});
+
+await sig.join();
+`}</Code>
+
+A few things to notice that are easy to miss:
+
+- The peer who joins _second_ initiates the offer (in our toy implementation). Coordinating "who offers" is an application decision and is wrong as often as it's right in production code — the typical bug is both peers offering simultaneously, called _glare_, which makes neither connection complete. Real libraries handle this with politeness rules (RFC 8829 "perfect negotiation").
+- ICE candidates are sent independently from the offer/answer. They can arrive before or after the SDP is set. The browser buffers ICE candidates for you _if_ the remote description hasn't been set yet — but only for the first ~500ms in some browsers, so don't lean on it for slow signaling.
+- Errors in any of these `await`s are swallowed by the demo code. In production you need to handle each — a failed `setRemoteDescription` is usually a malformed SDP from a misbehaving peer, and you'll want to surface it.
+
+## Production reality: use a library
+
+The 80-line example above is what you write to understand WebRTC. It's not what you ship. The reasons:
+
+- **Glare.** Two peers offering at the same time. Hard to get right.
+- **Renegotiation.** You added a video track mid-call — the SDP has to be re-exchanged. The state machine for "second offer mid-call without disrupting existing tracks" is delicate.
+- **ICE restart.** When your network changes (Wi-Fi to cellular), the existing connection breaks and you need to re-trickle candidates without rebuilding the whole connection. The control flow is non-obvious.
+- **Browser compat.** Safari, Firefox, and Chrome all have slightly different SDP munging quirks. Production libraries normalize.
+- **Data channel readiness, congestion, backpressure.** All real concerns once you push significant data.
+
+The libraries you should consider, in order of "amount of magic":
+
+**`simple-peer` (Feross).** Wraps `RTCPeerConnection` with a Node-stream-like interface. You feed it signaling messages, it emits events. Doesn't run a server — bring your own signaling channel. Lightweight, well-maintained. Most one-off P2P projects use this.
+
+**PeerJS.** Slightly heavier abstraction; includes a free public signaling server (PeerJS Cloud) and a self-hostable signaling broker. Good if you don't want to write any server code at all.
+
+**LiveKit / Daily / 100ms / Twilio Video.** Full services. They run the signaling, the TURN, and most importantly an SFU (Selective Forwarding Unit — a media-layer multi-party router). If you're building "video calls with more than 4 people," you want one of these, not raw WebRTC.
+
+**`mediasoup` (Node), `ion-sfu` (Go), `pion` (Go).** Server-side SDKs for building your own SFU. Reserved for teams who have outgrown the SaaS price tag and have backend engineers who like packet headers.
+
+For everything in this module — the y-webrtc mini-project, the data channel experiments — `simple-peer` is the right level. You'll see how light it is in the mini-project.
+
+<Callout kind="concept">
+  Signaling is a typed message router for offers, answers, and ICE candidates. The server does ~no logic. The hard part is the application protocol on top — who offers, when to renegotiate, how to recover from ICE failure — and that's why production code uses simple-peer, PeerJS, or a managed service. Roll your own to learn; don't ship it.
+</Callout>
+
+<Reading url="https://github.com/feross/simple-peer" title="simple-peer (Feross)" kind="docs" minutes={10} />
+<Reading url="https://www.w3.org/TR/webrtc/#perfect-negotiation-example" title="W3C WebRTC — Perfect Negotiation Example" kind="docs" minutes={15} />
+<Reading url="https://blog.mozilla.org/webrtc/perfect-negotiation-in-webrtc/" title="Perfect Negotiation in WebRTC (Mozilla)" kind="blog" minutes={12} />
+
+**Remember this:** signaling is a small message bus you build (or rent). The five-message shape never changes. After signaling delivers the SDP, the rest is ICE and DTLS — neither of which your server has to understand.

@@ -1,0 +1,64 @@
+{
+  "questions": [
+    {
+      "id": "q1",
+      "prompt": "Which of the following does the WebRTC specification explicitly NOT define?",
+      "options": [
+        { "id": "a", "label": "The ICE candidate gathering algorithm" },
+        { "id": "b", "label": "The signaling channel between peers — applications must provide their own transport (WebSocket, HTTP, anything)" },
+        { "id": "c", "label": "The SDP format used in offer/answer" },
+        { "id": "d", "label": "The SRTP encryption used for media" }
+      ],
+      "correct": "b",
+      "explanation": "Signaling is intentionally out of scope for WebRTC — the spec wants the protocol to work in environments where no specific signaling channel exists (LAN discovery, Bluetooth, QR codes). The application chooses a transport (WebSocket is most common) and moves SDP offers/answers + ICE candidates across it. ICE, SDP, and SRTP are all specified by their own RFCs that WebRTC references."
+    },
+    {
+      "id": "q2",
+      "prompt": "Two peers behind home routers fail to connect using only STUN. The most likely cause is:",
+      "options": [
+        { "id": "a", "label": "Their browsers are different versions" },
+        { "id": "b", "label": "STUN servers are down" },
+        { "id": "c", "label": "One or both peers are behind a symmetric NAT, which assigns a different external port per destination — so the port STUN discovered isn't valid for talking to the other peer; a TURN relay is required" },
+        { "id": "d", "label": "The peers are on the same LAN" }
+      ],
+      "correct": "c",
+      "explanation": "STUN works when the NAT preserves a stable external port across destinations. Symmetric NATs (common on cellular networks, university dorms, some corporate firewalls) allocate a fresh port for each new destination, so the address STUN reported for one connection is dead for any other. TURN is the fallback — it relays packets via a server that both peers can reach, making the connection 'peer-to-server-to-peer' but functional. Roughly 5-10% of home network combinations need TURN."
+    },
+    {
+      "id": "q3",
+      "prompt": "You create an RTCDataChannel with `{ ordered: false, maxRetransmits: 0 }`. What delivery semantics do you get?",
+      "options": [
+        { "id": "a", "label": "Reliable + ordered (TCP-like) — these options are ignored" },
+        { "id": "b", "label": "Reliable + unordered — every packet arrives but order is not preserved" },
+        { "id": "c", "label": "Unreliable + unordered (UDP-like) — packets may arrive in any order and lost packets are not retransmitted; ideal for high-rate state like cursor positions or game inputs" },
+        { "id": "d", "label": "The channel fails to open because the options conflict" }
+      ],
+      "correct": "c",
+      "explanation": "`ordered: false` removes the ordering guarantee; `maxRetransmits: 0` disables retransmission of lost packets. Together you get UDP-like best-effort delivery. The use case is real-time state where a stale value is worse than no value — cursor positions, sensor readings, multiplayer game inputs. Each send is independent, so no head-of-line blocking. Note that `maxRetransmits` and `maxPacketLifeTime` are mutually exclusive — specify only one."
+    },
+    {
+      "id": "q4",
+      "prompt": "Why does WebRTC mesh topology stop working past ~6 peers for video calling?",
+      "options": [
+        { "id": "a", "label": "Browsers cap the number of peer connections at 6" },
+        { "id": "b", "label": "Mesh requires N(N-1)/2 total connections, and each peer uploads N-1 copies of its stream — at 1080p video (~3 Mbps), the upload bandwidth required per peer exceeds typical home broadband upload caps. An SFU is needed to fan out streams server-side" },
+        { "id": "c", "label": "ICE can't find paths between more than 6 peers" },
+        { "id": "d", "label": "STUN servers rate-limit beyond 6 simultaneous connections" }
+      ],
+      "correct": "b",
+      "explanation": "Mesh scales O(N²) in total connections and O(N) in per-peer upload. For 6 peers at 1080p video, each peer must upload 5 × 3 Mbps = 15 Mbps — close to or beyond the upload cap of most home connections. An SFU (Selective Forwarding Unit) is a server-side WebRTC peer that receives one upstream from each client and fans it out to all receivers; each client's upload stays at ~3 Mbps regardless of group size. mediasoup, ion-sfu, and LiveKit are common SFU implementations."
+    },
+    {
+      "id": "q5",
+      "prompt": "Why does WebRTC require HTTPS in production (`getUserMedia` returns undefined on plain HTTP outside localhost)?",
+      "options": [
+        { "id": "a", "label": "WebRTC requires TLS for the data channel" },
+        { "id": "b", "label": "Camera and microphone access (`getUserMedia`) is a secure-context API — the browser enforces HTTPS to prevent man-in-the-middle attacks from silently capturing media. The same constraint covers the broader secure-context requirements that WebRTC inherits" },
+        { "id": "c", "label": "Without HTTPS, the SDP can't be encrypted" },
+        { "id": "d", "label": "Browsers cache WebRTC sessions and HTTPS is needed for the cache" }
+      ],
+      "correct": "b",
+      "explanation": "`getUserMedia` is gated to secure contexts because granting camera/mic access on an insecure page would let a network attacker (or anyone on the same Wi-Fi) MITM the page and silently turn on the user's webcam. Localhost gets an exemption because it's defined as a trustworthy origin. The DTLS encryption inside WebRTC's media and data transports is independent of the page's HTTPS — it would still encrypt the wire — but the browser refuses to even hand you a media stream over HTTP because the entire trust chain starts with the page."
+    }
+  ]
+}

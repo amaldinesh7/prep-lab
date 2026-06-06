@@ -1,0 +1,130 @@
+---
+title: NAT, STUN, TURN
+---
+
+<SectionHeader kind="concept" number={4} title="NAT, STUN, TURN" />
+
+This is the section that makes WebRTC click. Once you understand what NAT is doing to your packets and why ICE was invented, the entire spec stops feeling arbitrary. Most production WebRTC problems are NAT problems. Most TURN bills are NAT problems. Most "it works on my laptop but not on the customer's iPhone" reports are NAT problems.
+
+## NAT: what it is, why it breaks P2P
+
+Network Address Translation (NAT) is the trick that lets the entire internet keep using IPv4 in 2026 despite the address space having been "full" since 2011. Every home router does it. Every corporate firewall does it. Every mobile carrier's CGNAT (carrier-grade NAT) does it. It looks like this:
+
+- Your laptop has a private IP: `192.168.1.42`. So does every other device on your home network.
+- Your router has one public IP (say `73.x.y.z`) assigned by your ISP.
+- When you open a connection, your router rewrites the outgoing packet's source: it changes `192.168.1.42:5000` to `73.x.y.z:54321`. It stashes the mapping in a table.
+- The destination server replies to `73.x.y.z:54321`. Your router looks up the mapping, rewrites the destination back to `192.168.1.42:5000`, and forwards it to you.
+
+For client-initiated connections (laptop → server), this is invisible. For peer-to-peer, it breaks everything. Peer A wants to send a packet to peer B's _public_ IP, but peer B doesn't know what its own public IP is. Peer B sees `192.168.1.78` when it asks its OS, but that address is meaningless to anyone outside peer B's LAN.
+
+Worse: even if peer B knew its public IP, peer A's first packet to it would arrive at peer B's router, which has no NAT mapping for "an incoming packet from a random IP to port X" — the router doesn't know which internal device to forward it to. So it drops the packet. Both peers are unreachable from outside their NATs by default.
+
+This is the fundamental problem WebRTC has to solve, and it's solved with two protocols layered on top of each other: STUN and TURN.
+
+## STUN: discover your public IP
+
+Session Traversal Utilities for NAT (STUN) is a dirt-simple protocol — a few hundred lines of RFC. Your browser sends a single UDP packet to a STUN server saying "hi, what's my address?" The STUN server sees the source IP/port the packet arrived from (which, by definition, is the public IP/port your NAT translated it to) and echoes that back to you.
+
+The conversation is one round trip:
+
+```
+Browser → stun.l.google.com:19302: "STUN binding request"
+stun.l.google.com:19302 → Browser: "I see you as 73.x.y.z:54321"
+```
+
+That's it. Now your browser knows its public address. It can include that in the ICE candidates it sends over signaling. The other peer can try to connect to `73.x.y.z:54321` directly.
+
+A STUN server is essentially free to run — Google, Cloudflare, and the standard `stun:` URLs are public infrastructure. You almost never need to host your own. The default `iceServers: [{ urls: "stun:stun.l.google.com:19302" }]` is fine for most projects.
+
+But STUN alone gets you maybe 80-90% of connections. The rest fail because of how the NAT behaves on the way back in.
+
+## Why STUN isn't always enough: NAT types
+
+NATs differ in how strict they are about incoming packets. The taxonomy (simplified from the academic literature):
+
+- **Full-cone NAT.** Most permissive. Once an internal device sends a packet out, any external host can send packets back to that mapping. STUN works perfectly. Rare in the wild.
+- **Restricted-cone NAT.** Incoming packets only accepted from external IPs the internal device has previously sent to. STUN still works for WebRTC because both peers send packets toward each other simultaneously — both NATs "see" each other and accept the reverse path.
+- **Port-restricted-cone NAT.** Same but the rule applies to (IP, port) pairs. Still works for WebRTC.
+- **Symmetric NAT.** The cruel one. The NAT assigns a _different_ external port for each destination. So when you talk to the STUN server, you appear as `73.x.y.z:54321`. When you try to talk to peer B at a different IP, your router uses `73.x.y.z:54322`. The address STUN told peer B about (`54321`) is dead. Direct connection fails.
+
+Symmetric NATs are roughly 5-10% of home networks (more on mobile carriers and university dorms) and somewhere between 20-50% of corporate networks. When both sides are behind symmetric NATs, no amount of STUN cleverness will let you establish a direct path. That's where TURN comes in.
+
+<Callout kind="concept">
+  STUN is "what's my public address" — a single UDP round trip. It works whenever the NAT preserves a stable port mapping across destinations. When the NAT doesn't (symmetric NAT), STUN can't help and you fall back to TURN.
+</Callout>
+
+## TURN: relay when direct fails
+
+Traversal Using Relays around NAT (TURN) is the bailout. When two peers can't reach each other directly, both connect to a TURN server, and the TURN server relays every packet between them. Effectively, the peer-to-peer connection becomes "peer-to-server-to-peer" — same shape as your WebSocket would have been, with the TURN server in the middle.
+
+TURN is more involved than STUN. The client opens a long-lived UDP session with the TURN server. The TURN server allocates a public IP/port for it (a _relay candidate_). When peer A sends data to "peer B via TURN," the TURN server receives the packet on peer A's allocated port and re-sends it from its own connection toward peer B. Latency goes up (extra hop, often hundreds of milliseconds across regions). Bandwidth becomes the TURN operator's problem (and bill).
+
+In ICE, TURN is the fallback of last resort. ICE tries direct host-to-host first (when peers are on the same LAN), then via STUN-discovered public addresses, then relay-via-TURN. Whichever path succeeds first is used. The browser does all of this for you — you just provide the TURN credentials and ICE figures out which path to use.
+
+<Code lang="ts" file="ice-config.ts">{`const pc = new RTCPeerConnection({
+  iceServers: [
+    // STUN — free, public
+    { urls: "stun:stun.l.google.com:19302" },
+    // TURN — your own server, with credentials
+    {
+      urls: [
+        "turn:turn.example.com:3478?transport=udp",
+        "turn:turn.example.com:3478?transport=tcp",  // for UDP-blocked networks
+        "turns:turn.example.com:5349?transport=tcp", // TLS-wrapped for strict firewalls
+      ],
+      username: "user-from-your-auth-system",
+      credential: "short-lived-token",
+    },
+  ],
+  iceTransportPolicy: "all",  // or "relay" to force TURN (useful for testing)
+});
+`}</Code>
+
+A few production details that matter:
+
+**Multiple TURN URLs is normal.** UDP is fastest but ~5% of corporate networks block it. TCP fallback. TLS-wrapped TCP (`turns:` on port 443) is the most likely to work through a strict firewall — port 443 looks like HTTPS to deep-packet-inspection middleboxes. Always provide all three.
+
+**Credentials should be short-lived.** TURN is expensive — anyone with your TURN credentials can use them to relay arbitrary traffic. Don't ship a static username/password in your JS bundle. Generate per-session tokens server-side (the standard pattern is HMAC-time-based, defined in RFC 7635). Tokens valid for 24 hours are typical.
+
+**`iceTransportPolicy: "relay"`** forces ICE to use only TURN candidates. Useful for testing whether your TURN server actually works ("force everyone through it, see if calls still go through"). Never ship this to prod — it makes every call pay relay latency and bandwidth.
+
+## Cost reality: TURN servers eat bandwidth
+
+Here's the senior-level number to internalize. A TURN server bills you for every byte both ways. For a 1080p video call:
+
+- ~3 Mbps per direction = ~6 Mbps per relayed participant.
+- One hour of relay = ~2.7 GB.
+- At AWS egress prices ($0.09/GB out) = ~$0.25/hour per participant.
+
+5-10% of your sessions need TURN. So out of 1,000 hours of calls, 50-100 hours go through TURN. That's $12-25 in egress. For a hobby project, fine. For a product with thousands of concurrent calls, you're looking at thousands of dollars a month _just for the fallback path_. This is one reason the SaaS WebRTC services exist — they amortize this across many customers.
+
+## The free TURN trap
+
+Public free TURN services exist (Open Relay Project at `openrelay.metered.ca`, Xirsys's free tier, the free tier of Cloudflare's TURN). They're fine for hobby projects and demos. They're not OK for production:
+
+- Bandwidth caps that kick in silently.
+- Variable latency depending on which other clients are hammering them.
+- No SLA. The server can be down for hours.
+- The operator can see all your relayed packet metadata (not contents — DTLS encrypts those — but timing, packet sizes, peer addresses).
+
+For production, the canonical choice is to run your own `coturn`. It's the open-source TURN/STUN server (`github.com/coturn/coturn`) — written in C, battle-tested, used by Jitsi and most self-hosters. You install it on a $20-40/month VM in each region you care about (us-east, eu-west, ap-south, etc.) and point your `iceServers` at the nearest one based on the client's region. coturn handles ~1000 concurrent relayed sessions on a single mid-size VM; scale horizontally past that.
+
+The alternative is paid services: Twilio (~$0.40/GB), Xirsys (custom), Cloudflare TURN (cheaper egress because Cloudflare owns the backbone — currently the best value if you don't want to operate). The decision tree is roughly: <100 concurrent calls → free / Cloudflare TURN; 100-10k concurrent → coturn on your infra; >10k or you have video — use LiveKit/Daily/100ms which bundle TURN with an SFU.
+
+## What you'll see in the wild
+
+When you debug a WebRTC failure with `chrome://webrtc-internals`, you'll see ICE candidate pairs sorted by priority. Each candidate has a type:
+
+- `host` — local IP (same LAN connection).
+- `srflx` (server-reflexive) — STUN-discovered public address.
+- `prflx` (peer-reflexive) — discovered by the peer hitting your NAT (rare; from STUN consent checks).
+- `relay` — TURN-mediated.
+
+A healthy connection between two peers on the same LAN: a `host`/`host` pair wins. A typical home-to-home call: `srflx`/`srflx` wins. A corporate-firewall-to-mobile call: often `relay`/`srflx` or `relay`/`relay`. If you see `relay` winning on most of your traffic, your STUN traversal is failing more than it should — investigate.
+
+<Reading url="https://www.rfc-editor.org/rfc/rfc8445" title="RFC 8445 — Interactive Connectivity Establishment (ICE)" kind="paper" minutes={30} />
+<Reading url="https://www.rfc-editor.org/rfc/rfc5389" title="RFC 5389 — Session Traversal Utilities for NAT (STUN)" kind="paper" minutes={20} />
+<Reading url="https://github.com/coturn/coturn/wiki/turnserver" title="coturn — turnserver configuration" kind="docs" minutes={15} />
+<Reading url="https://gist.github.com/zziuni/3741933" title="STUN server list (community)" kind="docs" minutes={3} />
+
+**Remember this:** STUN tells you your public address. TURN relays your packets when STUN's answer doesn't work. ~10% of connections need TURN. TURN is the WebRTC line item on your AWS bill. Treat it as infra, not magic.

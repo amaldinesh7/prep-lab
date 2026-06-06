@@ -1,0 +1,128 @@
+---
+title: y-webrtc for collab
+---
+
+<SectionHeader kind="pattern" number={6} title="y-webrtc for collab" />
+
+This is where the CRDTs module and the WebRTC module fuse. If you read the CRDTs material, you saw that Yjs sync needs a transport — `y-websocket` is the default, but it puts your server in the middle of every keystroke. `y-webrtc` is the alternative: same Y.Doc, same merge guarantees, but the bytes travel peer-to-peer with no server in the byte path. For the right shape of collaboration product, this is dramatically simpler and dramatically cheaper.
+
+## What y-webrtc actually is
+
+`y-webrtc` is a Yjs Provider — same interface as `y-websocket` from the consumer's side. You construct one with a Y.Doc and a room name; it handles signaling, peer discovery, peer-to-peer connection setup, awareness, and the Yjs sync protocol (state-vector exchange + diff transmission) over WebRTC data channels.
+
+Under the hood it uses:
+- A small **signaling server** (you can run your own, or use the public ones bundled in the library) only for peer discovery and SDP/ICE exchange.
+- **simple-peer** for the actual `RTCPeerConnection` lifecycle.
+- A **mesh topology**: every peer in the room connects directly to every other peer. N peers → N(N-1)/2 connections.
+- The **reliable, ordered** mode of data channels (CRDTs need ordered delivery within a sync session — you can lose connection and reconnect, but you can't drop ops mid-stream).
+- The standard Yjs awareness layer for ephemeral cursor / presence state.
+
+The big mental shift: with `y-websocket`, your server is the source of truth and the relay. With `y-webrtc`, no peer is authoritative and the signaling server only handles introductions. Once peers are connected, your server could vanish and the room keeps working.
+
+## Public signaling vs your own
+
+The library ships with three default public signaling servers (`wss://signaling.yjs.dev`, `wss://y-webrtc-signaling-eu.herokuapp.com`, `wss://y-webrtc-signaling-us.herokuapp.com`). Convenient for demos and prototypes. Two caveats for production:
+
+1. **Privacy.** The signaling server sees room names and peer IDs (not document contents — those go P2P). If your room names encode sensitive structure (e.g., `org-acme-doc-xyz`), don't leak them to a third party.
+2. **Uptime.** Public signaling servers are best-effort. They get rate-limited, restarted, and occasionally just go away.
+
+For anything serious, run your own. The library ships a signaling server you can run with one command:
+
+```bash
+PORT=4444 npx y-webrtc-signaling
+```
+
+Or as an npm script in your project. It's a tiny WebSocket server (~200 lines) that does nothing but pair peers in rooms. Run it on a $5 VM and point your `signaling` config at it:
+
+<Code lang="ts" file="provider-config.ts">{`import * as Y from "yjs";
+import { WebrtcProvider } from "y-webrtc";
+
+const doc = new Y.Doc();
+const provider = new WebrtcProvider("my-room-name", doc, {
+  signaling: ["wss://signaling.my-company.com"],
+  password: "optional-room-password",  // encrypts metadata between peers
+  awareness: undefined,                 // auto-created if omitted
+  maxConns: 20 + Math.floor(Math.random() * 15),  // soft cap on mesh size
+  filterBcConns: true,                  // dedupe via BroadcastChannel for same-tab
+  peerOpts: {
+    config: {
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "turn:your-turn.com:3478", username: "u", credential: "p" },
+      ],
+    },
+  },
+});
+
+const ytext = doc.getText("body");
+// ...wire to your editor as you would with y-websocket
+`}</Code>
+
+Notice you still configure TURN at the WebRTC layer (via `peerOpts.config.iceServers`). y-webrtc doesn't ship its own TURN — it relies on whatever you give the underlying `simple-peer`/`RTCPeerConnection`. About 10% of your peers will need TURN to connect to each other; if you skip TURN, those users see "Connecting…" forever.
+
+## When y-webrtc beats y-websocket
+
+The decision is mostly about who you're collaborating with and how many of them there are.
+
+**y-webrtc wins when:**
+
+- **Small groups (2-6 peers per room).** Mesh scales O(N²); past ~6 peers, every client is sending its updates to every other client, and bandwidth becomes a problem. For 2-person pair collab, 5-person team docs, this is fine.
+- **You don't want server-side state.** No backend for the doc means no database, no auth on the document layer, no migrations. Your server only does signaling.
+- **End-to-end privacy matters.** With a `password` option, even your signaling server can't decrypt the room. Useful for sensitive collaboration (legal docs, medical notes) or as a marketing differentiator.
+- **You want offline-first.** y-webrtc gracefully degrades — if no peers are reachable, you keep editing locally; when a peer shows up (LAN, reconnect), they sync. Pairs especially well with `y-indexeddb` for local persistence.
+- **You're already running WebRTC for something else.** If your app does video calls anyway, adding y-webrtc for shared whiteboard or shared notes uses the same connection plumbing.
+
+**y-webrtc loses when:**
+
+- **Large groups (10+ peers).** Mesh dies. You want a hub-and-spoke topology (y-websocket) or an SFU-style fan-out (no built-in Yjs solution; you'd build one).
+- **Late-joiner state sync is critical.** With y-websocket, the server has the canonical state and hands it to new joiners. With y-webrtc, a new joiner asks an existing peer for state. If no peer is online when they arrive, they see an empty doc. (You can persist via `y-indexeddb` on each client to mitigate, but the doc still doesn't exist for users who haven't been there.)
+- **You need server-side hooks** (auth, version history, search indexing, side effects on save). y-webrtc gives you no central point to plug these in. The byte traffic is invisible to your server.
+- **You need a single source of truth for compliance.** "Where's the document?" "On every peer who happened to see it." That's an audit nightmare for some industries.
+- **Mobile networks dominate your users.** Mobile NAT is hostile (often symmetric); TURN usage will be higher than on desktop, and TURN bills you for the bandwidth anyway. The cost advantage of P2P narrows.
+
+The shorthand: y-webrtc is for collaboration that looks like Figma multiplayer on a small file or a pair-programming session. y-websocket is for collaboration that looks like Google Docs at company scale.
+
+## Swapping y-websocket for y-webrtc
+
+If you've already built a Yjs editor with y-websocket, the swap is essentially a one-line change at the provider construction site. The bindings (CodeMirror, ProseMirror, Tiptap) don't care which provider you use.
+
+<Code lang="ts" file="swap.ts">{`// Before
+import { WebsocketProvider } from "y-websocket";
+const provider = new WebsocketProvider("ws://localhost:1234", "demo", doc);
+
+// After
+import { WebrtcProvider } from "y-webrtc";
+const provider = new WebrtcProvider("demo", doc, {
+  signaling: ["ws://localhost:4444"],
+  peerOpts: { config: { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] } },
+});
+
+// Awareness API is the same on both
+provider.awareness.setLocalStateField("user", { name: "Alice", color: "#f59e0b" });
+
+// Sync API is the same on both
+provider.on("synced", () => console.log("synced with at least one peer"));
+`}</Code>
+
+That's it. Same `Y.Doc`. Same `Y.Text`. Same editor bindings. Same awareness for cursors. The only thing that changes is _where the bytes flow_.
+
+You can also run both providers on the same Y.Doc simultaneously — the merge handles duplicates idempotently. A pattern some teams use: y-webrtc as the primary fast path, y-websocket as a fallback that ensures a persistent server-side copy and helps late joiners. The bytes are duplicated on the wire but the user experience is better.
+
+## Awareness over y-webrtc
+
+Awareness (cursors, names, presence) on y-webrtc behaves slightly differently than on y-websocket. Each peer broadcasts its awareness state to all other peers in the mesh. When a peer disconnects, the others remove it. There's no central server holding a "current users" list — each peer maintains its own view based on direct connections.
+
+Two consequences worth knowing:
+
+- **Awareness updates are O(N) per change** — each cursor move is sent to every other peer.
+- **You can briefly see "ghost" cursors** when a peer's WebRTC connection drops without clean teardown. The awareness timeout is 30 seconds by default; ghosts disappear after that. You can lower it (`provider.awareness.setLocalState(null)` on `beforeunload` helps).
+
+<Callout kind="pattern">
+  y-webrtc is "y-websocket but the server only does signaling." Same Yjs APIs, same editor bindings, same awareness — different byte path. Use it for small-group collab (≤6 peers) when you don't want server-side state, value end-to-end privacy, or need true offline-first. Use y-websocket when you need a server source of truth, larger rooms, or server-side hooks.
+</Callout>
+
+<Reading url="https://github.com/yjs/y-webrtc" title="y-webrtc — GitHub" kind="docs" minutes={8} />
+<Reading url="https://docs.yjs.dev/ecosystem/connection-provider/y-webrtc" title="Yjs docs — y-webrtc" kind="docs" minutes={6} />
+<Reading url="https://github.com/yjs/y-webrtc/blob/master/bin/server.js" title="y-webrtc signaling server source" kind="docs" minutes={5} />
+
+**Remember this:** swap the provider, keep everything else. The decision is about topology and trust: small + private + offline-first → y-webrtc; large + central + server hooks → y-websocket.

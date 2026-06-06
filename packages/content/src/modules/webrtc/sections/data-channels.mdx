@@ -1,0 +1,190 @@
+---
+title: Data channels for app traffic
+---
+
+<SectionHeader kind="concept" number={5} title="Data channels for app traffic" />
+
+`RTCDataChannel` is the most underused API in the browser. Most developers know WebRTC for video. The data channel is the part that quietly powers multiplayer games, collaborative whiteboards over P2P, file transfer apps, and y-webrtc. It gives you something nothing else in the browser does: a configurable mix of reliable and unreliable delivery, encrypted end-to-end, peer-to-peer, with no server in the byte path.
+
+## The API
+
+A data channel is created on an `RTCPeerConnection` and runs over the same encrypted transport (DTLS-over-SCTP) as media tracks. You create it on one peer; the other peer receives a `datachannel` event with the channel handle. From there, it looks like a WebSocket.
+
+<Code lang="ts" file="data-channel-basic.ts">{`// === Peer A (the creator) ===
+const pcA = new RTCPeerConnection({ iceServers: [/* ... */] });
+const dc = pcA.createDataChannel("chat", {
+  ordered: true,                 // TCP-like ordering (default)
+  // negotiated: false (default — peer B gets a "datachannel" event)
+});
+
+dc.addEventListener("open", () => {
+  console.log("channel open, readyState:", dc.readyState);
+  dc.send(JSON.stringify({ type: "hello", from: "alice" }));
+});
+
+dc.addEventListener("message", (e) => {
+  const msg = JSON.parse(e.data);
+  console.log("got:", msg);
+});
+
+// === Peer B (the receiver) ===
+const pcB = new RTCPeerConnection({ iceServers: [/* ... */] });
+pcB.addEventListener("datachannel", (e) => {
+  const dc = e.channel;
+  dc.addEventListener("open", () => dc.send(JSON.stringify({ type: "hi-back" })));
+  dc.addEventListener("message", (e) => {
+    /* same shape */
+  });
+});
+`}</Code>
+
+The mental model: it's a typed WebSocket between two browsers, with three differences — (1) encrypted end-to-end, (2) can be unreliable on demand, (3) no server in the loop after signaling completes.
+
+## Reliable vs unreliable: the SCTP toggles
+
+SCTP — the underlying transport — supports multiple delivery modes. You pick one when you create the channel, and you can't change it after.
+
+**Reliable + ordered (the default).** Like TCP. Packets arrive in order; lost packets are retransmitted until they arrive. Use this for file transfer, chat messages, anything where the receiver expects to reconstruct an exact stream. The bandwidth cost: head-of-line blocking. If packet #5 is lost, packets #6, #7, #8 sit in a buffer waiting for it to be retransmitted, even if they arrived first.
+
+```ts
+pc.createDataChannel("file-transfer", { ordered: true });  // default
+```
+
+**Unreliable + unordered (UDP-like).** Packets may arrive in any order; lost packets are not retransmitted. Use this for state that's overwritten frequently — cursor positions, player inputs, sensor readings — where a stale value is worse than no value. No head-of-line blocking; every send is independent.
+
+```ts
+pc.createDataChannel("cursor", { ordered: false, maxRetransmits: 0 });
+```
+
+**Partial reliability.** SCTP lets you compromise. `maxRetransmits: 3` retries each packet up to 3 times then gives up. `maxPacketLifeTime: 100` retries for up to 100ms then gives up. You can also keep ordering on but drop late packets. Use this for voice-data-supplements or game state where a small amount of recovery is worth it but waiting forever is not.
+
+```ts
+pc.createDataChannel("partial", { ordered: false, maxPacketLifeTime: 100 });
+```
+
+The key constraint: `maxRetransmits` and `maxPacketLifeTime` are mutually exclusive. Specify one. If you specify neither, the channel is fully reliable.
+
+## When unordered matters
+
+The canonical example is multiplayer cursor positions. Every frame (16ms at 60Hz), your client sends `{ userId: "alice", x: 432, y: 198 }`. The receiving peers paint that user's cursor at the latest position.
+
+If you send these via a reliable channel and one packet is lost, you stop seeing _any_ cursor updates from Alice until the retransmit arrives — meanwhile she may have moved 100 pixels and your cursor is glued in the wrong place for 200ms. That's the head-of-line block in action.
+
+If you send via an unreliable channel and a packet is lost, you just miss one frame. The next frame (16ms later) overwrites the stale position. The eye doesn't notice.
+
+Real-time game inputs (key-down/key-up) are an interesting middle. You _can_ lose individual key events, but you don't want stale ones. The usual pattern: unordered + small `maxRetransmits` (e.g., 1) so you get one chance at recovery before moving on. Or send the entire input state every frame at high rate and treat each packet as a snapshot.
+
+## Backpressure: when the network can't keep up
+
+Like a WebSocket, a data channel has a send buffer. If you call `dc.send()` faster than the network drains, the buffer grows. Eventually the browser will either error or push back. The senior-level move is to watch `dc.bufferedAmount` and stop sending when it crosses a threshold:
+
+<Code lang="ts" file="backpressure.ts">{`const HIGH_WATER = 1_000_000;  // 1MB
+const LOW_WATER = 100_000;     // 100KB
+dc.bufferedAmountLowThreshold = LOW_WATER;
+
+async function sendWithBackpressure(payload: ArrayBuffer) {
+  if (dc.bufferedAmount > HIGH_WATER) {
+    // Wait for the buffer to drain past the low watermark
+    await new Promise<void>((resolve) => {
+      dc.addEventListener("bufferedamountlow", () => resolve(), { once: true });
+    });
+  }
+  dc.send(payload);
+}
+`}</Code>
+
+This pattern matters mainly for high-throughput channels: file transfer, screen share data, large CRDT updates being bulk-applied. For a chat channel, you'll never hit the buffer cap.
+
+## Message size limits
+
+Browsers cap individual `send()` calls. The limit has historically been 16 KB to 64 KB depending on browser; current Chrome/Edge will accept up to 256 KB and fragment internally. Cross-browser-safe is to keep individual messages under 16 KB and chunk above that.
+
+For larger payloads (file transfer, full-document CRDT updates), implement your own framing:
+
+<Code lang="ts" file="chunked-send.ts">{`const CHUNK = 16 * 1024;  // 16 KB, safe across browsers
+
+async function sendLarge(dc: RTCDataChannel, payload: ArrayBuffer) {
+  const id = crypto.randomUUID();
+  const total = Math.ceil(payload.byteLength / CHUNK);
+
+  for (let i = 0; i < total; i++) {
+    const slice = payload.slice(i * CHUNK, (i + 1) * CHUNK);
+    const frame = new Uint8Array(slice.byteLength + 16);
+    new DataView(frame.buffer).setUint32(0, i);     // chunk index
+    new DataView(frame.buffer).setUint32(4, total); // total chunks
+    // [next 8 bytes = id; skipped here for brevity]
+    frame.set(new Uint8Array(slice), 16);
+    await sendWithBackpressure(frame.buffer);
+  }
+}
+`}</Code>
+
+For real apps, don't roll this yourself — `simple-peer` and most file-transfer libraries chunk for you. Knowing the limit exists is what matters; respect it and you won't hit it.
+
+## A full minimal example: JSON over a data channel
+
+Putting it together — two peers exchanging structured messages. Assume you've already done the signaling dance from the previous section so the peer connection is open.
+
+<Code lang="ts" file="json-channel.ts">{`type AppMessage =
+  | { type: "ping"; t: number }
+  | { type: "pong"; t: number }
+  | { type: "cursor"; x: number; y: number }
+  | { type: "chat"; text: string };
+
+function wireChannel(dc: RTCDataChannel, onMessage: (m: AppMessage) => void) {
+  dc.addEventListener("message", (e) => {
+    try {
+      onMessage(JSON.parse(e.data));
+    } catch (err) {
+      console.warn("malformed message", err);
+    }
+  });
+
+  return {
+    send(m: AppMessage) {
+      if (dc.readyState === "open") dc.send(JSON.stringify(m));
+    },
+    close() { dc.close(); },
+  };
+}
+
+// Peer A
+const reliableChat = pc.createDataChannel("chat", { ordered: true });
+const liveCursor = pc.createDataChannel("cursor", { ordered: false, maxRetransmits: 0 });
+
+const chat = wireChannel(reliableChat, (m) => {
+  if (m.type === "chat") renderChatBubble(m.text);
+});
+const cursor = wireChannel(liveCursor, (m) => {
+  if (m.type === "cursor") updateRemoteCursor(m.x, m.y);
+});
+
+// Now you have two channels on one peer connection:
+// - chat is TCP-like (don't drop messages, even on lossy networks)
+// - cursor is UDP-like (drop late packets, never block)
+`}</Code>
+
+This is the headline feature of data channels: **two channels with different delivery semantics over the same peer connection**. You couldn't do this with one WebSocket — you'd have to fake unreliable on top of reliable, eating all the head-of-line cost.
+
+## What `readyState` actually means
+
+Hold this for debugging:
+
+- `connecting` — created, peer doesn't see it yet.
+- `open` — both peers see it, ready to send.
+- `closing` — `close()` called locally, draining sends.
+- `closed` — gone.
+
+If you `send()` on a `connecting` or `closing` channel, the browser throws. Always gate on `readyState === "open"`. The `open` event fires once each side sees the channel.
+
+A non-obvious gotcha: if your peer connection's ICE transport reconnects (a network change), the data channel does NOT automatically recreate — it goes to `closed` and stays there. You have to detect it (`close` event on the channel) and re-create it. This is handled for you by simple-peer and the higher-level libraries; if you roll your own, watch for it.
+
+<Callout kind="concept">
+  `RTCDataChannel` is "WebSocket with delivery-mode knobs, peer-to-peer, end-to-end encrypted." Reliable+ordered = TCP-like (default). Unordered + no retransmits = UDP-like (for high-rate, drop-stale traffic). You can have multiple channels with different semantics on one peer connection. Watch `bufferedAmount` for backpressure. Cap message size around 16 KB or chunk yourself.
+</Callout>
+
+<Reading url="https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel" title="MDN — RTCDataChannel" kind="docs" minutes={10} />
+<Reading url="https://www.rfc-editor.org/rfc/rfc8831" title="RFC 8831 — WebRTC Data Channels" kind="paper" minutes={20} />
+<Reading url="https://hpbn.co/webrtc/#scaling-with-the-rtcdatachannel-api" title="HPBN — Scaling with RTCDataChannel" author="Ilya Grigorik" kind="paper" minutes={15} />
+
+**Remember this:** when you want UDP-like semantics in a browser, this is the only API. Pick `ordered` and retransmit settings deliberately. Most production bugs are "I forgot to watch `bufferedAmount`" or "I sent over the message size cap."
