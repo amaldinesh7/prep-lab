@@ -1,0 +1,64 @@
+{
+  "questions": [
+    {
+      "id": "q1",
+      "prompt": "What's the Core Web Vitals threshold for a 'good' LCP at p75 of real users?",
+      "options": [
+        { "id": "a", "label": "≤ 1.0s" },
+        { "id": "b", "label": "≤ 2.5s" },
+        { "id": "c", "label": "≤ 4.0s" },
+        { "id": "d", "label": "≤ 5.0s" }
+      ],
+      "correct": "b",
+      "explanation": "LCP ≤ 2.5s is 'good'. 2.5-4.0s is 'needs improvement'. > 4.0s is 'poor'. The threshold is measured at p75 of your real users — hitting it for half your users isn't enough."
+    },
+    {
+      "id": "q2",
+      "prompt": "When does wrapping a component in React.memo actually help performance?",
+      "options": [
+        { "id": "a", "label": "Always — memo prevents all unnecessary renders" },
+        { "id": "b", "label": "When the component uses useState" },
+        { "id": "c", "label": "When the parent re-renders frequently AND the child receives the same props on most renders AND the child's render is expensive enough that the prop comparison saves more than it costs" },
+        { "id": "d", "label": "When the component returns a large JSX tree" }
+      ],
+      "correct": "c",
+      "explanation": "All three preconditions matter. Memo's only job is to skip render when props are shallowly equal — that requires the parent to frequently re-render, the props to often be the same (which means stable callbacks via useCallback, stable objects via useMemo), and a render expensive enough that the comparison overhead pays off. Miss any condition and memo is dead weight."
+    },
+    {
+      "id": "q3",
+      "prompt": "Your INP regressed from 180ms to 420ms after a feature shipped. What's the best first investigation?",
+      "options": [
+        { "id": "a", "label": "Wrap every component in React.memo" },
+        { "id": "b", "label": "Profile the interaction in DevTools Performance to find long tasks on the main thread, then break them up — yield to the main thread with scheduler.yield(), useTransition for heavy renders, or move work to requestIdleCallback" },
+        { "id": "c", "label": "Add more useMemo to derived values" },
+        { "id": "d", "label": "Switch to a different state management library" }
+      ],
+      "correct": "b",
+      "explanation": "INP regressions come from long tasks blocking the main thread during interactions. The fix is to find the long task (DevTools Performance shows it as a red-cornered block ≥ 50ms), then break it up — yield between chunks, mark heavy renders as transitions, or defer non-urgent work. Memo and library swaps without profiling are performance theatre."
+    },
+    {
+      "id": "q4",
+      "prompt": "Why does moment.js bloat bundles so much?",
+      "options": [
+        { "id": "a", "label": "It's written in TypeScript and TS adds runtime overhead" },
+        { "id": "b", "label": "It uses Object.assign which doesn't minify well" },
+        { "id": "c", "label": "It doesn't tree-shake (CommonJS-style internals) and ships all locales by default, so importing one function pulls in the entire library plus every locale" },
+        { "id": "d", "label": "It loads timezone data from a CDN" }
+      ],
+      "correct": "c",
+      "explanation": "moment is ~67KB gzipped even if you use one function, because its module structure prevents tree-shaking and it bundles all locales by default. date-fns and dayjs are ESM, tree-shakeable, and ~5-10KB for typical usage. The swap is mechanical and one of the highest-ROI bundle fixes in any older React codebase."
+    },
+    {
+      "id": "q5",
+      "prompt": "An SSR React app shows a console warning 'Text content does not match server-rendered HTML'. What's typically the cause?",
+      "options": [
+        { "id": "a", "label": "The server is running an older React version than the client" },
+        { "id": "b", "label": "The HTML emitted by the server is malformed" },
+        { "id": "c", "label": "The first client render produced different output than the server render — common culprits include date/time formatting using local timezone, Math.random() or non-stable IDs, conditional rendering based on window/localStorage, or third-party scripts mutating the DOM before hydration" },
+        { "id": "d", "label": "The Suspense fallback didn't render fast enough" }
+      ],
+      "correct": "c",
+      "explanation": "Hydration mismatch = server's HTML and client's first render disagree. React throws away the SSR work and re-renders from scratch — you pay the SSR cost AND lose its benefit. The cures are about determinism: render the same content on server and client, defer client-only logic to useEffect (which runs after hydration), use useId for stable IDs, and keep third-party scripts off the critical path."
+    }
+  ]
+}

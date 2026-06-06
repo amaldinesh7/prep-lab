@@ -1,0 +1,32 @@
+---
+title: Cheatsheet
+---
+
+<SectionHeader kind="cheatsheet" number={11} title="Cheatsheet" />
+
+Keep this open while you ship. Half of perf work is remembering to do the boring thing — image dimensions, font-display, the right import path.
+
+<Cheatsheet rows={[
+  { k: "Profile first", v: "DevTools Performance for the browser; React Profiler for components. Never optimize without a profile in hand." },
+  { k: "LCP — good", v: "≤ 2.5s at p75 of real users (poor > 4.0s)" },
+  { k: "INP — good", v: "≤ 200ms at p75 (poor > 500ms)" },
+  { k: "CLS — good", v: "≤ 0.1 at p75 (poor > 0.25)" },
+  { k: "Bundle budget", v: "≤ 170KB gzipped for initial JS (Addy Osmani's 'fast 3G in 1s' anchor)" },
+  { k: "memo helps when", v: "Parent re-renders often + child receives same props + child's render is expensive. All three, or skip it." },
+  { k: "Long task", v: "Any main-thread block ≥ 50ms. Three dropped frames at 60fps." },
+  { k: "List virtualization", v: "@tanstack/react-virtual or react-window. Mandatory above ~100 items." },
+  { k: "Lazy load", v: "const X = React.lazy(() => import('./X')); wrap consumer in <Suspense fallback=…>." },
+  { k: "Bundle visualizer", v: "rollup-plugin-visualizer or vite-bundle-visualizer. Run on every release build." },
+  { k: "RUM", v: "web-vitals library — onLCP/onINP/onCLS to sendBeacon. p75 is the metric." },
+  { k: "Hydration safe", v: "Same content on server + first client render. Defer client-only logic to useEffect. Use useId for stable IDs." },
+  { k: "Font-display", v: "swap (visible immediately, swap on load). Preload critical fonts with <link rel='preload' as='font' crossorigin>." },
+  { k: "Images", v: "Always width + height attributes (reserve space, prevent CLS). Use AVIF/WebP. fetchpriority='high' on the LCP image." },
+  { k: "Third-party scripts", v: "Audit quarterly. Defer or async every one. Lazy-load anything not on the critical path." },
+  { k: "Layout thrash fix", v: "Batch reads, then batch writes. Never alternate getBoundingClientRect() with style writes in a loop." },
+  { k: "moment → swap to", v: "date-fns (tree-shakes, ~5KB per function) or dayjs (~7KB total)." },
+  { k: "lodash → swap to", v: "lodash-es with named imports, OR native ES methods (filter/map/reduce/some/every cover 80% of usage)." },
+  { k: "useTransition", v: "When fast input meets slow render (search box filtering a big list). Input stays sync; filter runs deferred." },
+  { k: "Memory leak fix", v: "Every useEffect returns a cleanup function that removes the listener / clears the interval / aborts the request / unsubscribes." }
+]} />
+
+**Remember this:** Profile before you optimize. The metrics that matter are LCP, INP, CLS at p75 of real users. Bundle, virtualize, lazy-load, reserve space — in that order, that's most of the wins.

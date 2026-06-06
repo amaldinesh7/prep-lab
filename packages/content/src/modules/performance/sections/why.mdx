@@ -1,0 +1,56 @@
+---
+title: Why performance is product
+---
+
+<SectionHeader kind="why" number={1} title="Why performance is product" />
+
+Performance isn't a polish task you do at the end of a quarter. It's a feature you ship every commit, and every commit either pays into it or borrows against it. The reason this matters is brutally simple: slow apps lose money, and they lose it in a way that's almost invisible on the engineering side because no user files a ticket that says "your 800ms LCP cost you a signup." They just leave.
+
+## The numbers everyone quotes for a reason
+
+The studies are old but they keep replicating. Amazon found every 100ms of latency cost them 1% in sales. Google saw a 20% drop in traffic for a half-second increase in search latency. Walmart converted 2% more for every second they cut off load time. Pinterest reduced wait by 40% and got 15% more signups. None of these are about a 5-second page vs a 30-second page — they're about 1.5 vs 2 seconds. The slope of "users tolerating slowness" is steep, and it gets steeper on mobile.
+
+A more recent number: in 2023 Deloitte measured retail sites where a 0.1s mobile speed improvement increased conversion by 8.4%. The unit of slowness isn't seconds anymore. It's hundreds of milliseconds.
+
+The thing to internalize: **users don't have a stopwatch.** They have a feeling. The feeling is "did this thing respond to me?" Every interaction that doesn't get a response within ~100ms feels broken, and the user's confidence in your product erodes. They don't notice it consciously, but they bounce.
+
+## LCP, INP, CLS as the user's stopwatch
+
+Google formalized this with Core Web Vitals (CWV) — three metrics that proxy the three things users actually feel:
+
+- **LCP (Largest Contentful Paint)** — "did the page load?" Measured when the biggest above-the-fold element finishes painting. The user's eye looks for the thing they came for; until it shows up, the page is "not loaded" no matter what your spinner says.
+- **INP (Interaction to Next Paint)** — "does it respond to me?" Measured as the worst delay between a user interaction (tap, click, key press) and the next paint that reflects the result. Replaces the old First Input Delay (FID), which only measured the first interaction.
+- **CLS (Cumulative Layout Shift)** — "is it stable?" Measured as the total unexpected movement of content during the page's life. The user tries to tap a button, an ad loads, the button jumps, they tap the ad. Maddening.
+
+These aren't arbitrary. Google's research mapped each to user-survey "did this feel fast?" responses and dropped the noise. The thresholds (LCP ≤ 2.5s, INP ≤ 200ms, CLS ≤ 0.1) are calibrated against actual humans, not engineering vibes. And because Google uses them in search ranking, every product team has a business reason to care, not just a UX reason.
+
+## The death by a thousand cuts
+
+Here's the part that catches mid-level React developers: there's almost never one big perf problem in a mature React app. There are forty small ones, and the cumulative cost is what makes the app slow. A single `useEffect` that runs on every render and triggers a fetch isn't a P0 bug. Thirty of them in different components are why your INP is 800ms.
+
+The pattern looks like this in real codebases:
+
+- A 50KB date library shipped to every page because somebody imported it at module top-level
+- A 200-row list rendered without virtualization, each row a memo'd component with its own subscribe
+- A context provider at the root holding 12 unrelated pieces of state, so every state change rerenders the whole tree
+- An analytics script loaded synchronously in `<head>` blocking the main thread for 300ms
+- A hero image without `width`/`height` causing a CLS event when fonts load
+- A `useEffect` fetch chain four levels deep — child waits for parent waits for layout waits for auth
+
+None of these is "the problem." All of them, together, are why the page feels heavy. The job of a performance-aware engineer is to notice each of them as they're being shipped, not after the user retention dashboard goes red.
+
+<Callout kind="why">
+  Performance is the only product feature that erodes silently. Users don't tell you they bounced because the page was 200ms slow — they just bounce. CWV gives you a stopwatch that approximates the user's gut feeling, and the literature has been clear for fifteen years: every 100ms costs revenue. Treat perf as a feature you ship, not a sprint you do once. The compounding cost of "we'll fix it later" is the difference between a product that converts and one that doesn't.
+</Callout>
+
+## What this module is
+
+The rest of this module gives you the mental model and the toolkit. Where time actually goes in the browser, how to profile it (DevTools and React Profiler), what the bundle is really shipping, the React patterns that move the needle, and the CWV metrics that turn "the app feels slow" into a measurable target you can ship against.
+
+The goal isn't to make you the perf person on the team. It's to make you the engineer who doesn't accidentally ship the regression in the first place.
+
+<Reading url="https://web.dev/articles/why-speed-matters" title="Why does speed matter?" kind="docs" minutes={6} />
+<Reading url="https://www.thinkwithgoogle.com/marketing-strategies/app-and-mobile/mobile-page-speed-new-industry-benchmarks/" title="Mobile page speed industry benchmarks" author="Google" kind="article" minutes={8} />
+<Reading url="https://web.dev/articles/vitals" title="Web Vitals" author="Philip Walton" kind="docs" minutes={6} />
+
+**Remember this:** Users don't file bugs about 200ms. They just leave. Treat perf as a per-commit discipline, not a quarterly project.

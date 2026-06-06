@@ -1,0 +1,94 @@
+---
+title: Where time goes
+---
+
+<SectionHeader kind="concept" number={2} title="Where time goes: load, render, commit, paint" />
+
+Most React-perf advice you'll read on the internet is about React. That's the wrong starting point. By the time React is rendering, the browser has already spent most of the page's perf budget on things that have nothing to do with your components. If you don't have the full picture, you'll spend a week memoizing a list that wasn't your problem.
+
+The right mental model: a frontend page is four sequential phases, and React owns only part of one of them.
+
+## The four phases
+
+1. **Load** — bytes travel from server to client. DNS, TCP, TLS, HTTP. The browser asks for `index.html`, gets HTML back, then asks for every `<script>` and `<link>` it finds.
+2. **Parse** — the browser turns bytes into trees. HTML → DOM. CSS → CSSOM. JavaScript → AST → bytecode. Parsing big JS bundles is expensive — Chrome's V8 has gotten faster every year, but a 1MB bundle still parses in ~150ms on a mid-tier Android.
+3. **Execute** — JavaScript runs. This is where React mounts your components, calls every hook, runs every effect, and where third-party scripts (analytics, ads, A/B testing) eat the main thread.
+4. **Paint** — the browser composes the visual output. Layout (where does everything go), Paint (what color is every pixel), Composite (stitch layers together onto the GPU).
+
+These don't happen once. They happen in a loop. Every interaction triggers some subset again: a click runs a JS handler, which might trigger React to re-render, which mutates the DOM, which forces layout, which gets painted. Sixty times per second if you want 60fps.
+
+## React's slice of the pie
+
+React lives inside phase 3 (execute). When the browser hits your `<RouterProvider>` and starts running your code, React does two things in sequence:
+
+- **Render phase** — for each component, React calls the function, runs hooks, returns JSX. This builds a tree of what the UI _should_ look like. It's a pure computation. No DOM is touched yet.
+- **Commit phase** — React takes the diff between the new tree and the previous tree, then mutates the DOM to match. This is the only point where the browser sees anything change. `useLayoutEffect` runs here, synchronously, before the browser paints.
+
+After commit, the browser takes over again — layout, paint, composite. Then `useEffect` fires (asynchronously, after paint, in a microtask).
+
+The performance implications:
+
+- **A slow render** (expensive component, big tree) holds the main thread. The user can't interact during this time.
+- **A slow commit** is rarer in React — it's mostly DOM mutations the browser has to absorb. Big lists committed at once can be a problem.
+- **A slow `useLayoutEffect`** is brutal because it runs sync between commit and paint. The user sees the previous frame frozen while it runs.
+- **A slow `useEffect`** is invisible to the first paint but can cascade — if it kicks off a fetch that triggers another render, you've added a roundtrip to the user's wait.
+
+## The 16ms main thread budget
+
+The browser wants 60 frames per second. That's 16.67ms per frame. If your JavaScript holds the main thread longer than that, you drop frames. Drop too many and the page feels janky.
+
+In practice, the budget is even tighter. Google's "long task" definition is anything ≥ 50ms — that's three dropped frames at 60fps. The browser itself uses 4-6ms per frame for layout/paint/composite. So the realistic JS budget per frame is **4-10ms**, not 16. If your event handler takes 30ms, that's a long task and INP will reflect it.
+
+The implication: a "fast" component isn't one that renders quickly once. It's one that renders quickly _every_ time the parent re-renders, which can be hundreds of times per second under stress. Your perf budget per render is closer to 1ms than 10ms once you account for many components running in sequence.
+
+## Why most React perf advice misses
+
+Open any "React Performance Tips" article from the last decade. You'll get:
+
+- Use `React.memo`
+- Wrap callbacks in `useCallback`
+- Memoize derived values with `useMemo`
+
+These are not wrong. They're just rarely the bottleneck. Spend an afternoon profiling a real app and the actual culprits are:
+
+- **A 700KB JS bundle** shipping to a 3G phone — phase 1+2 ate your perf budget before React got to run
+- **A render-blocking third-party script** in `<head>` — main thread blocked during the most expensive part of load
+- **An image without dimensions** triggering a layout shift after the hero painted
+- **A `useEffect` chain** that fetches in waterfalls, doubling time-to-interactive
+- **A context provider** changing identity on every render, invalidating the entire app
+
+`React.memo` doesn't help with any of these. The mental model trap is treating React-the-library as the unit of performance, when the unit is actually the browser's frame.
+
+<Callout kind="pattern">
+  Build the mental model in four layers. Load (network bytes), Parse (turning bytes into trees), Execute (your JS runs, React lives here), Paint (browser draws pixels). React owns the render-then-commit slice of Execute. Everything else — the bundle size, the third-party scripts, the image dimensions, the font loading — is the browser's problem to solve, and your job is to not make it harder. Most "the app is slow" reports trace to non-React causes. Profile first, optimize second.
+</Callout>
+
+## Render vs paint, in one diagram
+
+A click happens. Here's what the browser does, in order:
+
+```
+[click handler runs]      ← your JS, on main thread
+       ↓
+[React render phase]      ← components called, JSX returned
+       ↓
+[React commit phase]      ← DOM mutated to match new tree
+       ↓
+[useLayoutEffect]         ← sync, blocks paint
+       ↓
+[browser layout]          ← positions recalculated
+       ↓
+[browser paint]           ← pixels drawn
+       ↓
+[browser composite]       ← layers stitched to GPU
+       ↓
+[useEffect]               ← async, runs after paint
+```
+
+That whole chain needs to fit in 16ms to feel smooth. If you blow the budget anywhere — a heavy render, a synchronous handler, a layout-thrashing `useLayoutEffect` — the user sees jank. The job of profiling (next section) is to point at which step ate the time.
+
+<Reading url="https://web.dev/articles/rendering-performance" title="Rendering Performance" author="Paul Lewis" kind="docs" minutes={10} />
+<Reading url="https://kentcdodds.com/blog/fix-the-slow-render-before-you-fix-the-re-render" title="Fix the slow render before you fix the re-render" author="Kent C. Dodds" kind="blog" minutes={7} />
+<Reading url="https://developer.mozilla.org/en-US/docs/Web/Performance/How_browsers_work" title="Populating the page: how browsers work" kind="docs" minutes={12} />
+
+**Remember this:** React is one slice of one phase. Load, parse, paint, and third-party scripts are the rest of the perf budget — and usually the bigger half.

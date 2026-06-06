@@ -1,0 +1,164 @@
+---
+title: Production gotchas
+---
+
+<SectionHeader kind="gotcha" number={8} title="Production gotchas" />
+
+Every team running React in production hits these. They're not bugs in the tools — they're consequences of how the platform works. Knowing them saves an afternoon each. Most of them don't show up in dev — they show up the day after deploy when a user on a real network on a real phone tries to use your app.
+
+## 1. Hydration mismatches blow up TTI
+
+The setup: server renders HTML one way, client's first render disagrees, React detects the mismatch and throws the SSR work away. You paid the SSR cost AND now you're rendering from scratch. Your LCP looks good (server's HTML painted) but TTI is awful (React had to rebuild).
+
+The common causes, in order of frequency:
+
+1. **Date formatting using the local timezone.** Server is UTC; user is PST. `new Date().toLocaleString()` produces different output. Either format dates on the client only (in `useEffect`) or pass formatted strings from the server.
+2. **`Math.random()` or `crypto.randomUUID()` in render.** Generates a different value on server vs client. Use a stable ID source (React 18's `useId` hook, or pre-generated IDs).
+3. **Conditional rendering based on `window`.** `if (typeof window !== "undefined")` produces a different tree on server vs client. Render the same thing both times; if you need client-only content, mount it in `useEffect`.
+4. **Third-party scripts that mutate the DOM** before React hydrates. An analytics script injecting a `<div>` somewhere. Defer them until after hydration.
+5. **CSS-in-JS that emits different class names.** Some libraries hash class names with state that differs between server and client. Pin the library to one that handles SSR correctly (Emotion, styled-components with their SSR setup).
+
+How to spot: a console warning that says "Text content does not match server-rendered HTML" or "Hydration failed." Don't ignore these — every one is throwing away your SSR work.
+
+## 2. Render-blocking fonts without `font-display: swap`
+
+The default browser behavior for `@font-face` is `font-display: auto`, which means "block text rendering for up to 3 seconds while the font loads, then fall back to a system font." For 3 seconds, your hero text is invisible. LCP destroyed.
+
+The fix is one CSS property:
+
+<Code lang="css" file="src/styles/fonts.css">{`@font-face {
+  font-family: "Inter";
+  src: url("/fonts/Inter.woff2") format("woff2");
+  font-display: swap;  /* render fallback immediately, swap when font loads */
+}`}</Code>
+
+The tradeoff: you get a FOUT (Flash of Unstyled Text) when the font loads. Some CLS as letter spacing changes. It's almost always worth it — better to see content in a system font than no content.
+
+For zero FOUT, preload the font:
+
+<Code lang="html" file="index.html">{`<link
+  rel="preload"
+  href="/fonts/Inter.woff2"
+  as="font"
+  type="font/woff2"
+  crossorigin
+/>`}</Code>
+
+This kicks off the font download in parallel with the HTML parse. By the time the page wants to render text, the font is ready. Combined with `font-display: swap`, the FOUT becomes invisible.
+
+## 3. Third-party scripts are the #1 hidden bloat
+
+Run any large production site through WebPageTest. Look at the network waterfall. Half the requests are not yours. Analytics, A/B testing, ads, chat widgets, customer support, fraud detection, feature flags. Each is a script someone added "just this one" and forgot.
+
+The damage they do:
+
+- **Synchronously block the main thread** if they're not loaded `async`/`defer`.
+- **Execute their own JS** during the most important part of your load — INP suffers.
+- **Make additional network requests** for their own telemetry.
+- **Mutate the DOM** in ways that conflict with React (causing hydration mismatches).
+- **Bypass your CSP** and load other scripts from their own CDNs.
+
+The audit pattern: every quarter, list every third-party script in the app. For each, ask:
+
+- Is this still in use? (Half are abandoned.)
+- Does it load async/defer? (If not, fix that.)
+- Can it load after first paint? (Most can — wrap in a `requestIdleCallback`.)
+- Can it load only on the pages that need it? (Analytics on the marketing page; not on the dashboard.)
+
+The biggest single perf win available to most apps is to remove half their third-party scripts. It's also the hardest political battle because each script is owned by a different team. Make the data visible (RUM dashboard segmented by script) and the case writes itself.
+
+## 4. Layout thrashing from reading + writing layout properties
+
+The browser is lazy. It batches layout calculations. Read a layout property (`element.offsetHeight`, `getBoundingClientRect()`) and the browser is forced to flush all pending layout work synchronously. Write a layout-affecting property (`element.style.width = "..."`), and the browser invalidates the layout. Do both in a loop and the browser thrashes — recalculates layout on every iteration.
+
+The classic offender:
+
+```js
+// BAD — forces layout 100 times
+for (const el of items) {
+  el.style.width = (el.offsetWidth + 10) + "px";  // read AND write each iteration
+}
+```
+
+The fix: separate reads from writes.
+
+```js
+// GOOD — one read pass, one write pass
+const widths = items.map(el => el.offsetWidth);   // all reads first
+items.forEach((el, i) => {
+  el.style.width = (widths[i] + 10) + "px";       // all writes after
+});
+```
+
+This pattern (read all, then write all) lets the browser flush layout once instead of N times.
+
+In React, layout thrashing usually hides in `useLayoutEffect` — by design, it runs synchronously between commit and paint, and if it reads then writes layout, you're thrashing. Worse: `useLayoutEffect` blocks paint, so the user sees the previous frame frozen.
+
+How to spot: in DevTools Performance, look for alternating purple ("Recalculate Style") and green ("Layout") blocks on the main thread. Each pair is a forced layout.
+
+## 5. Controlled-input gotcha: re-rendering on every keystroke
+
+A common React mistake: you have a text input. You connect it to state with `onChange={(e) => setState(e.target.value)}`. The component now re-renders on every keystroke. If the component is heavy (it has a 1000-item list filtered by the input), every keystroke takes 50ms and INP is destroyed.
+
+The variants:
+
+- **Controlled input where the parent is heavy.** Move the input into its own component; the parent doesn't re-render on every keystroke.
+- **Form state at the page level.** Use `react-hook-form` which subscribes only fields that change; the page doesn't re-render at all.
+- **Search box driving a heavy filter.** Wrap the filter state in `useTransition` (covered in the rendering section) so the input stays responsive.
+- **Uncontrolled input becoming controlled.** Switching `value={undefined}` to `value={"foo"}` mid-life triggers a React warning AND forces a re-render. Decide controlled or uncontrolled at mount, stick with it.
+
+The diagnosis: open React Profiler, type one character in the slow input, look at the commit count. If it's > 1 per keystroke, you have unnecessary re-renders. Find the component that's re-rendering and move state down or memoize.
+
+## 6. Memory leaks from forgotten listeners and intervals
+
+The setup: a component mounts. It adds an event listener to `window`, or starts a `setInterval`, or subscribes to a store. It unmounts. Nobody cleans up. The listener/interval/subscription holds a reference to a closure that holds a reference to the component's state. Garbage collector can't reclaim. Memory grows.
+
+For a SPA that navigates between routes hundreds of times in a session, this is fatal. After an hour, the page is using 500MB and the user's browser tab feels broken.
+
+The fix is always the same: `useEffect` returns a cleanup function. Use it.
+
+<Code lang="tsx" file="src/hooks/use-window-size.ts">{`import { useEffect, useState } from "react";
+
+export function useWindowSize() {
+  const [size, setSize] = useState({ w: window.innerWidth, h: window.innerHeight });
+
+  useEffect(() => {
+    function onResize() {
+      setSize({ w: window.innerWidth, h: window.innerHeight });
+    }
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);  // cleanup
+  }, []);
+
+  return size;
+}`}</Code>
+
+Same pattern for `setInterval` (return a function that calls `clearInterval`), for `IntersectionObserver` (return `observer.disconnect()`), for AbortController (return `controller.abort()`), for store subscriptions (return the unsubscribe function the store gave you).
+
+How to spot: take a heap snapshot in DevTools Memory tab. Navigate to a page, navigate away, take another snapshot. If "Detached DOM nodes" or "Closure" count grew without bound, something's holding a reference.
+
+## 7. Image sizing — the silent CLS killer
+
+Every `<img>` without `width`/`height` attributes causes CLS when it loads. The browser doesn't know how tall the image will be until it downloads, so it renders the page with the image at 0 height, then snaps to full size, pushing everything below it. CLS hit, every time.
+
+The fix is the boring HTML attribute you stopped writing in 2015:
+
+```html
+<img src="/photo.jpg" alt="..." width="800" height="600" />
+```
+
+The width/height attributes can be the intrinsic image dimensions; CSS still resizes the rendered output. Modern browsers use these attributes to compute aspect ratio and reserve the right amount of vertical space.
+
+This isn't a "nice to have." It's the single most common CLS regression in React apps because component authors write `<img src={url} />` and forget the attributes.
+
+<Callout kind="gotcha">
+  These gotchas have a common shape: behavior that's invisible in development becomes visible in production. Dev runs on localhost over fast Wi-Fi, no third-party scripts, font cached, images preloaded. Production runs on 4G with thirty extensions and a cold cache. Test on a real phone over a real network at least once a sprint. Most of the worst regressions ship because nobody ran the app on the device the user actually has.
+</Callout>
+
+<Reading url="https://react.dev/reference/react-dom/client/hydrateRoot#hydration-error" title="Hydration errors (React docs)" kind="docs" minutes={5} />
+<Reading url="https://web.dev/articles/font-display" title="Controlling font performance with font-display" kind="docs" minutes={6} />
+<Reading url="https://web.dev/articles/avoid-large-complex-layouts-and-layout-thrashing" title="Avoid large, complex layouts and layout thrashing" kind="docs" minutes={8} />
+<Reading url="https://kentcdodds.com/blog/dont-sync-state-derive-it" title="Don't sync state. Derive it." author="Kent C. Dodds" kind="blog" minutes={6} />
+<Reading url="https://web.dev/articles/optimize-cls" title="Optimize CLS" kind="docs" minutes={10} />
+
+**Remember this:** Dev hides production reality. Hydrate cleanly, defer third-party scripts, swap fonts, size your images, clean up your effects. The bugs that ship are the ones you didn't see locally.

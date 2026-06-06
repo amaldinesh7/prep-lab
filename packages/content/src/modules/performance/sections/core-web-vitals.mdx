@@ -1,0 +1,128 @@
+---
+title: Core Web Vitals
+---
+
+<SectionHeader kind="concept" number={6} title="Core Web Vitals (CWV)" />
+
+Core Web Vitals (CWV) are Google's attempt to compress "how does this page feel to a human" into three numbers that engineers can target. They're not a perfect proxy, but they're the closest the industry has gotten, and Google uses them for search ranking — so the business has a reason to care about them whether your team does or not.
+
+The three metrics: LCP (Largest Contentful Paint), INP (Interaction to Next Paint), CLS (Cumulative Layout Shift). Each measures a different stage of the user's experience. Each has a "good" threshold that you should aim for at p75 of your real users.
+
+## LCP — Largest Contentful Paint
+
+**What it measures.** The time from navigation start to the moment the largest above-the-fold element finishes painting. "Largest" is by visible pixel area; "contentful" is text, image, video poster, or background-image. The browser keeps re-evaluating during load and reports the final answer when the page becomes stable.
+
+**Thresholds.**
+- Good: ≤ 2.5s
+- Needs improvement: ≤ 4.0s
+- Poor: > 4.0s
+
+**Why it matters.** It's the closest thing to "the page loaded" from the user's eye. They came for content; LCP marks when that content arrives. Below 2.5s feels fast. Above 4s feels broken.
+
+**The usual LCP element.** On a marketing page, it's the hero image or hero headline. On a SaaS dashboard, it's the first chart or table the user came to see. Run Lighthouse — it tells you which element is the LCP candidate.
+
+**The fixes, in order of payoff:**
+
+1. **Server-render or pre-render the LCP element's container.** If the LCP element is an image, the `<img>` tag must be in the initial HTML. Otherwise the browser has to wait for React to mount before it even knows the image exists. SPAs with no SSR pay an unavoidable LCP penalty here — the LCP can't fire until React has rendered.
+
+2. **Preload the LCP asset.** If the LCP is a hero image, tell the browser about it in the HTML head so it can start downloading in parallel with parsing JS:
+
+   <Code lang="html" file="index.html">{`<link rel="preload" as="image" href="/hero.webp" fetchpriority="high" />`}</Code>
+
+   `fetchpriority="high"` is the newer companion — it tells the browser this resource matters more than others.
+
+3. **Use modern image formats.** AVIF is ~50% smaller than JPEG at the same quality. WebP is ~30% smaller and ubiquitous. Both with `<picture>` fallbacks:
+
+   <Code lang="html" file="index.html">{`<picture>
+  <source srcset="/hero.avif" type="image/avif" />
+  <source srcset="/hero.webp" type="image/webp" />
+  <img src="/hero.jpg" alt="..." width="1200" height="600" />
+</picture>`}</Code>
+
+4. **`font-display: swap` on web fonts.** The default `font-display: auto` blocks text rendering until the font loads — your LCP text might be invisible for a second. `swap` shows a fallback font immediately and swaps in the web font when it arrives. Some CLS in exchange for far better LCP.
+
+5. **Eliminate render-blocking resources.** A `<script>` without `async`/`defer` blocks parsing. A `<link rel="stylesheet">` blocks rendering. Defer everything that's not critical to the LCP element. Critical CSS (the styles needed for above-the-fold) can be inlined.
+
+## INP — Interaction to Next Paint
+
+**What it measures.** Across the entire page lifetime, the slowest interaction (click, tap, key press, drag) measured as: time from event start to the next paint that reflects the result. INP replaced FID (First Input Delay) in March 2024 — FID only measured the first interaction, INP measures the worst one.
+
+**Thresholds.**
+- Good: ≤ 200ms
+- Needs improvement: ≤ 500ms
+- Poor: > 500ms
+
+**Why it matters.** It's the closest thing to "the app responds to me." LCP measures arrival; INP measures responsiveness. Sluggish INP is the #1 reason "this React app feels slow" — users tap, nothing happens for 300ms, they tap again, you double-fire.
+
+**What ruins INP.**
+
+1. **Long tasks on the main thread** during the interaction. A click handler that takes 250ms to run keeps the browser from painting until it's done. The classic offender: a state update that triggers a massive re-render.
+2. **Layout thrashing** in the event handler — reading then writing then reading layout properties. The browser has to recompute layout multiple times.
+3. **Third-party scripts** scheduling their own work on the main thread, competing with your handler.
+4. **Hydration mismatch** — if React's first render in the browser differs from the server-rendered HTML, React has to throw away and re-render, blocking the main thread.
+
+**The fixes:**
+
+1. **Break up long tasks.** If your click handler needs to do 500ms of work, split it. Yield to the main thread between chunks with `await new Promise(resolve => setTimeout(resolve, 0))` or the newer `scheduler.yield()`. The browser can paint between chunks.
+
+2. **Use `useTransition` for expensive renders.** Wrap the state update that triggers the heavy render in `startTransition`. The input stays responsive; the render happens when the main thread is free.
+
+3. **Debounce input-driven recomputation.** The user typing fires `onChange` on every keystroke; you don't have to do expensive work every time.
+
+4. **Lazy-load heavy code.** Don't run a 100KB analytics script synchronously when the user clicks "submit." Defer.
+
+5. **`requestIdleCallback`** for non-urgent work — analytics, telemetry, cache warming.
+
+The mental model: every interaction has a budget of ~200ms before the user notices. Spend it on the work the user can see, not on the work you could do later.
+
+## CLS — Cumulative Layout Shift
+
+**What it measures.** Sum of unexpected layout shifts during the page's life. Each shift is scored by `impact fraction * distance fraction` — how much of the viewport moved, times how far. User-initiated shifts (a click that opens a panel) don't count; the metric only catches shifts that happen without user input within 500ms.
+
+**Thresholds.**
+- Good: ≤ 0.1
+- Needs improvement: ≤ 0.25
+- Poor: > 0.25
+
+**Why it matters.** Layout shifts are infuriating. The user tries to tap a button; an ad loads, the button moves; they tap the ad. The user starts reading; an image loads above the fold and pushes the text down. CLS measures how often this happens.
+
+**The fixes, all variations of "reserve space":**
+
+1. **Set `width` and `height` on every image and video.** Even if you size them with CSS, the HTML attributes give the browser the aspect ratio so it can reserve the space:
+
+   <Code lang="html" file="src/components/Hero.tsx">{`<img src="/hero.jpg" alt="..." width="1200" height="600" style={{ width: "100%", height: "auto" }} />`}</Code>
+
+2. **Use `aspect-ratio` CSS for responsive media.** When the dimensions vary, use `aspect-ratio: 16 / 9` to reserve space proportional to the container.
+
+3. **Reserve space for ads and embeds.** If you have a 300x250 ad slot, set `min-height: 250px` on the slot before the ad loads. Same for embedded tweets, YouTube iframes, etc.
+
+4. **Avoid inserting content above existing content** without user interaction. A cookie banner that pushes the page down is a CLS hit. Render it as an overlay (`position: fixed`) instead.
+
+5. **Reserve space for dynamic content.** A skeleton loader matched to the eventual content's dimensions doesn't shift when the data arrives.
+
+6. **Use `font-display: optional`** if CLS from font swaps is your biggest problem (it usually isn't). `optional` skips the swap entirely if the font isn't cached — less CLS, slightly worse typography until the user revisits.
+
+## The thresholds, why they're where they are
+
+Google didn't pull these out of thin air. They calibrated against user-survey data — sites scoring "good" had measurably better engagement, sites scoring "poor" had measurably worse. The thresholds correspond to the inflection points where user satisfaction drops sharply.
+
+A summary:
+
+<Cheatsheet rows={[
+  { k: "LCP — good", v: "≤ 2.5s — page feels loaded" },
+  { k: "LCP — poor", v: "> 4.0s — user perceives the page as broken" },
+  { k: "INP — good", v: "≤ 200ms — interaction feels instant" },
+  { k: "INP — poor", v: "> 500ms — interaction feels laggy or broken" },
+  { k: "CLS — good", v: "≤ 0.1 — page feels stable" },
+  { k: "CLS — poor", v: "> 0.25 — content jumps under the user" },
+]} />
+
+The aggregate target: all three at "good" at the p75 of your users. Hitting "good" on 50% of users isn't a passing grade — by definition that means 50% of users had a "needs improvement" or worse experience. p75 is the bar because below that, you've got a real chunk of your audience in pain.
+
+<Reading url="https://web.dev/articles/vitals" title="Web Vitals — overview" kind="docs" minutes={6} />
+<Reading url="https://web.dev/articles/lcp" title="Largest Contentful Paint (LCP)" kind="docs" minutes={10} />
+<Reading url="https://web.dev/articles/inp" title="Interaction to Next Paint (INP)" kind="docs" minutes={10} />
+<Reading url="https://web.dev/articles/cls" title="Cumulative Layout Shift (CLS)" kind="docs" minutes={9} />
+<Reading url="https://web.dev/articles/optimize-inp" title="Optimize INP" author="Jeremy Wagner" kind="docs" minutes={12} />
+
+**Remember this:** Three metrics, three thresholds. LCP ≤ 2.5s (it loaded), INP ≤ 200ms (it responds), CLS ≤ 0.1 (it doesn't jump). Hit them at p75 of real users, not on your laptop.

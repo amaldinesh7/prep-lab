@@ -1,0 +1,208 @@
+---
+title: React rendering patterns
+---
+
+<SectionHeader kind="pattern" number={5} title="React rendering patterns" />
+
+Now that we've established React is one slice of the perf budget, here's the slice itself. The patterns below are the ones that actually move metrics in production React apps. Notable absences: I'm not going to tell you to wrap everything in `useMemo`. That's the kind of advice that makes codebases worse, and we'll talk about why.
+
+## `React.memo`, `useMemo`, `useCallback` — when each is worth it
+
+These three are the most over-applied tools in React. The defaults you should internalize:
+
+- **`useMemo` and `useCallback` do NOT make your app faster by default.** They add a closure, a dependency check, and a comparison every render. For a value that's cheap to compute, that's a net loss.
+- **`React.memo` does NOT prevent renders by default.** It compares props shallowly. If a parent passes a new object or function each render (the default for inline `{}` and `() => {}`), `memo` doesn't help — it short-circuits the comparison and re-renders anyway.
+
+The actual rule for each:
+
+**`useMemo`** earns its keep when the computation is genuinely expensive (sort a 10k-item list, derive a complex object) OR when the returned reference identity matters because something downstream depends on it (a dependency of another `useMemo`, an effect's dep array, a memoized component's prop). Default: don't reach for it.
+
+**`useCallback`** is `useMemo` for functions. Same rules. Wrap a callback only if it's a dependency of a memoized child OR an effect, AND the callback's identity matters. Most callbacks don't need it.
+
+**`React.memo`** is worth it when ALL of these are true:
+1. The parent re-renders frequently
+2. The child receives the same props on most of those re-renders
+3. The child's own render is expensive enough to notice (otherwise the comparison overhead exceeds the savings)
+
+A common case where all three hit: a list item inside a frequently-updating list parent, where most items don't change per update.
+
+<Code lang="tsx" file="src/components/Row.tsx">{`import { memo } from "react";
+
+type RowProps = { id: string; label: string; onSelect: (id: string) => void };
+
+// memo wraps the component, comparing props shallowly.
+// If parent re-renders 100x but only 1 row's props change, only 1 row re-renders.
+export const Row = memo(function Row({ id, label, onSelect }: RowProps) {
+  return (
+    <li onClick={() => onSelect(id)}>
+      {label}
+    </li>
+  );
+});`}</Code>
+
+For this to actually work, the parent must pass a stable `onSelect`. Inline `onSelect={(id) => doThing(id)}` creates a new function each render and defeats the memo. So you wrap the parent's callback in `useCallback` — and now the optimization is real.
+
+This is the trap: **partial application of these tools is worse than not using them.** You add the cost (extra comparisons) without the benefit (preventing renders). Either commit to memoizing the full path, or don't memoize at all.
+
+## List virtualization
+
+The single biggest single React perf win for any list over ~100 items. The browser doesn't care that it _could_ display 10,000 rows — it cares that you _did_ render 10,000 DOM nodes, each with its own listeners and styles.
+
+The pattern: render only the rows the user can see, plus a small overscan buffer. As they scroll, swap in new rows and recycle the off-screen ones. The DOM stays at ~20-40 nodes regardless of list length.
+
+The libraries you'd actually use:
+
+- **`@tanstack/react-virtual`** — current standard, headless, works with any layout. Tanner's library.
+- **`react-window`** — older but simpler API, Brian Vaughn (former React core). Fine if you have fixed-height rows.
+- **`react-virtuoso`** — heavier abstraction, handles auto-sizing rows well.
+
+A minimal example with `@tanstack/react-virtual`:
+
+<Code lang="tsx" file="src/components/VirtualList.tsx">{`import { useRef } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+
+export function VirtualList({ items }: { items: string[] }) {
+  const parentRef = useRef<HTMLDivElement>(null);
+
+  const virtualizer = useVirtualizer({
+    count: items.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 40,    // px per row; doesn't have to be exact
+    overscan: 8,                // render a few above/below for smoother scroll
+  });
+
+  return (
+    <div ref={parentRef} style={{ height: 600, overflow: "auto" }}>
+      <div
+        style={{
+          height: virtualizer.getTotalSize(),
+          position: "relative",
+        }}
+      >
+        {virtualizer.getVirtualItems().map((vi) => (
+          <div
+            key={vi.key}
+            style={{
+              position: "absolute",
+              top: 0,
+              left: 0,
+              right: 0,
+              transform: \`translateY(\${vi.start}px)\`,
+              height: vi.size,
+            }}
+          >
+            {items[vi.index]}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}`}</Code>
+
+A 10k-item list goes from "scrolling jank, slow initial render, 200MB memory" to "scrolls at 60fps, mounts instantly." Worth doing on day one for any list that might grow.
+
+## Co-locate state — move it down
+
+This is a Kent C. Dodds principle that pays compound interest. Every piece of state lives at some level of the tree. The level you put it at determines what re-renders when it changes.
+
+The trap: developers default to lifting state to the highest common ancestor "just in case" something else needs it. Now a `useState` in your root component, updated on every keystroke of an input, re-renders the entire app on every keystroke.
+
+The fix: state lives at the lowest component that needs it. If only `<SearchBox>` needs the search string, the state is in `<SearchBox>`. If `<SearchBox>` and `<ResultList>` both need it, lift it to their common parent — but no higher. If the whole app needs it, _then_ it goes higher (or into a store).
+
+A common refactor: a form's state lives in the form, not the page. Each input either uses its own `useState` (locally controlled) or you use a form library (`react-hook-form` is excellent because it intentionally subscribes only fields that change). The page that contains the form doesn't re-render on every keystroke.
+
+## Context vs Zustand/Jotai
+
+React Context is the wrong tool for state that changes frequently. Here's why: when a context value changes, **every component that consumes it re-renders**, regardless of whether the part they care about changed. Big context with many fields = re-render storm on any field change.
+
+The wrong pattern:
+
+```tsx
+// AppContext holds user, theme, cart, notifications, sidebar state...
+const AppContext = createContext<AppState>(...);
+// Every component that does useContext(AppContext) re-renders
+// when ANY field of AppState changes.
+```
+
+The right tools, in order of complexity:
+
+1. **Split the context** by what changes together. `<UserContext>`, `<ThemeContext>`, `<CartContext>` separately. Components subscribe only to what they need. Theme change doesn't re-render the cart.
+
+2. **Zustand** for app-wide state that needs selectors. You define a store outside React, components subscribe with `useStore((state) => state.cart)`, and they re-render _only_ when the selected slice changes. No provider needed.
+
+<Code lang="ts" file="src/stores/cart.ts">{`import { create } from "zustand";
+
+interface CartState {
+  items: { id: string; qty: number }[];
+  add: (id: string) => void;
+  clear: () => void;
+}
+
+export const useCart = create<CartState>((set) => ({
+  items: [],
+  add: (id) => set((s) => ({ items: [...s.items, { id, qty: 1 }] })),
+  clear: () => set({ items: [] }),
+}));
+
+// Usage in a component — re-renders only when items change:
+//   const items = useCart((s) => s.items);
+// The button below doesn't re-render when items change:
+//   const add = useCart((s) => s.add);`}</Code>
+
+3. **Jotai** when you want fine-grained atoms instead of a single store. Good for forms or when state derives reactively from other state.
+
+The decision tree: state used by one component → `useState`. State shared by a subtree that rarely changes → Context. State shared widely that changes often → Zustand or Jotai. State that comes from the server → Tanstack Query (it's a state manager too).
+
+## Concurrent rendering: `useTransition` and `useDeferredValue`
+
+React 18 added a way to mark renders as low-priority. The use case: a user types in a search box, and as they type, an expensive list filters. Without concurrent rendering, every keystroke blocks the main thread while React re-renders the list, and the input feels laggy.
+
+`useTransition` lets you mark a state update as a "transition" — React will keep the input responsive and render the list update when the main thread is free.
+
+<Code lang="tsx" file="src/components/SearchBox.tsx">{`import { useState, useTransition } from "react";
+import { Results } from "./Results";
+
+export function SearchBox({ items }: { items: string[] }) {
+  const [query, setQuery] = useState("");        // sync: drives the input
+  const [filter, setFilter] = useState("");      // deferred: drives the results
+  const [isPending, startTransition] = useTransition();
+
+  return (
+    <>
+      <input
+        value={query}
+        onChange={(e) => {
+          setQuery(e.target.value);              // immediate — input stays snappy
+          startTransition(() => {
+            setFilter(e.target.value);           // deferred — results lag but don't block input
+          });
+        }}
+      />
+      {isPending && <span>Filtering…</span>}
+      <Results items={items} filter={filter} />
+    </>
+  );
+}`}</Code>
+
+`useDeferredValue` is the simpler cousin — it gives you a "deferred" version of a value that lags behind during heavy renders:
+
+```tsx
+const filter = useDeferredValue(query);
+// <Results items={items} filter={filter} /> is allowed to lag
+```
+
+Both tools answer the same question: "what should stay responsive when the app gets busy?" The input is always the answer. The results can wait.
+
+The wins are real but specific — they help when the expensive render is in response to a fast-firing input. They don't help with slow data fetches (use Suspense), slow effects (refactor the effect), or render storms from bad context architecture (fix the context).
+
+<Callout kind="pattern">
+  The hierarchy that matters: co-locate state at the lowest needed level, virtualize lists over a hundred items, split contexts or use a store with selectors for app-wide state, and reach for `useTransition` when fast input meets slow renders. `React.memo` and `useMemo` are surgical tools — they only help when their preconditions are all true, and they hurt readability if applied prophylactically. Profile to confirm the win every time.
+</Callout>
+
+<Reading url="https://kentcdodds.com/blog/usememo-and-usecallback" title="When to useMemo and useCallback" author="Kent C. Dodds" kind="blog" minutes={9} />
+<Reading url="https://kentcdodds.com/blog/state-colocation-will-make-your-react-app-faster" title="State colocation will make your React app faster" author="Kent C. Dodds" kind="blog" minutes={6} />
+<Reading url="https://react.dev/reference/react/useTransition" title="useTransition (React docs)" kind="docs" minutes={8} />
+<Reading url="https://tanstack.com/virtual/latest" title="TanStack Virtual" kind="docs" minutes={5} />
+<Reading url="https://tkdodo.eu/blog/working-with-zustand" title="Working with Zustand" author="Dominik Dorfmeister" kind="blog" minutes={7} />
+
+**Remember this:** Memo isn't free. Virtualize early. State lives where it's used. The biggest React wins are usually about where state lives, not what's memoized.

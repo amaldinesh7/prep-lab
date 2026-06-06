@@ -1,0 +1,171 @@
+---
+title: Bundle anatomy
+---
+
+<SectionHeader kind="concept" number={4} title="Bundle anatomy" />
+
+Every kilobyte you ship is a kilobyte the browser has to download, parse, and execute before your app can show anything. The bundle is the single biggest lever for LCP (Largest Contentful Paint) and TTI (Time To Interactive) on slow networks, and it's the one most teams ignore because Webpack output is intimidating to read. Once you can read it, you can usually cut 30-50% in an afternoon.
+
+## The budget
+
+The HTTP Archive runs continuous measurements of real sites. As of 2025, the median JS payload for sites that score "good" on CWV is around 350-400KB minified, 100-150KB gzipped. For a site to feel fast on the global p75 device (mid-tier Android, 3G/4G), the working target is:
+
+- **Initial JS bundle** — ≤ 170KB gzipped (≤ 500KB minified)
+- **Initial CSS** — ≤ 50KB gzipped
+- **Critical path total** — ≤ 250KB gzipped
+
+These are stretches, not commandments. A B2B dashboard whose users are on corporate networks with M1 laptops can tolerate more. A consumer app in India on a Redmi cannot. Know your audience and set a budget; track it in CI.
+
+Why 170KB? It's the canonical "fast 3G can deliver this in ~1 second" number Addy Osmani popularized. Real 3G hasn't existed in most markets for years, but the budget remains a useful anchor — under it, you have headroom for everything else; over it, you're betting the user has a good connection.
+
+## Tree-shaking realities
+
+The promise of tree-shaking: import what you use, ship only what you import. The reality: it works only when three things are all true.
+
+1. **The module is ESM (ECMAScript Modules) with no side effects.** CommonJS modules can't be statically analyzed, so bundlers ship the whole module to be safe.
+2. **The library marked `"sideEffects": false` in its package.json**, or specifically marked which files are side-effect-free.
+3. **You imported by name**, not the whole namespace.
+
+This third point bites everyone. These two lines look identical and behave nothing alike at bundle time:
+
+```ts
+// Tree-shakes — bundler can see which named exports you use
+import { debounce } from "lodash-es";
+
+// Does NOT tree-shake — entire lodash bundle ships
+import _ from "lodash";
+_.debounce(...);
+```
+
+The first form ships ~3KB. The second ships ~70KB. Same code, twentyfold difference. This is also why `lodash` and `lodash-es` are different packages — `lodash` is CommonJS without a `sideEffects: false` flag and ships in full; `lodash-es` is ESM, tree-shakes, and is what you want.
+
+The diagnostic for "is this library tree-shaking?" is to look at the bundle visualizer (next section). If you imported one function and see the whole library, it's not tree-shaking, and you need to either swap libraries or import differently.
+
+## Code splitting with dynamic imports
+
+The bundler ships everything imported by your entry point in the initial bundle. Anything imported via `import()` (dynamic import, returns a Promise) gets split into a separate chunk that loads on demand. React's `lazy` is the ergonomic wrapper for components:
+
+<Code lang="tsx" file="src/routes/admin.tsx">{`import { lazy, Suspense } from "react";
+
+const AdminPanel = lazy(() => import("../components/AdminPanel"));
+
+export function AdminRoute() {
+  return (
+    <Suspense fallback={<div>Loading admin…</div>}>
+      <AdminPanel />
+    </Suspense>
+  );
+}`}</Code>
+
+`AdminPanel.tsx` (and its transitive imports) becomes a separate chunk. The browser only downloads it when this route renders. The user pays the cost when they need the feature, not on first page load.
+
+Good candidates for splitting:
+
+- **Routes** — every route that isn't the landing page
+- **Heavy components used rarely** — chart libraries, rich-text editors, modal dialogs gated behind a button
+- **Vendor-heavy features** — anything pulling in a library > 50KB that only one feature needs
+
+Bad candidates:
+
+- The above-the-fold content (you'll trade LCP for INP — splitting forces an extra roundtrip on the critical path)
+- Components inside a tight loop (you'll have a Suspense boundary firing dozens of times)
+
+The TSR plugin's `autoCodeSplitting: true` does this for every route file automatically. Most modern frameworks have an equivalent.
+
+## Vendor chunking
+
+When you split, you face a choice: every dynamic chunk includes its own copy of shared dependencies (React, lodash, date-fns), or the bundler extracts shared code into a "vendor" chunk that loads once. Vite and Rollup default to a smart heuristic — modules in `node_modules` used by multiple chunks get hoisted into a shared chunk.
+
+You can override with `build.rollupOptions.output.manualChunks` in `vite.config.ts`:
+
+<Code lang="ts" file="vite.config.ts">{`import { defineConfig } from "vite";
+
+export default defineConfig({
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          // Group large stable libraries together — good cache behavior
+          react: ["react", "react-dom"],
+          tanstack: ["@tanstack/react-router", "@tanstack/react-query"],
+        },
+      },
+    },
+  },
+});`}</Code>
+
+Why bother? **Caching.** If you ship one giant vendor chunk with React + your app code, every deploy invalidates everything. If you split React into its own chunk, that chunk's hash stays stable across deploys and users keep it cached. Only the app code chunk re-downloads.
+
+The tradeoff: more chunks = more HTTP requests. HTTP/2 makes this cheap (multiplexed), but going from 3 chunks to 30 still adds overhead. Aim for 3-10 vendor groupings, not one chunk per library.
+
+## Inspecting the bundle
+
+You cannot fix what you cannot see. Install a visualizer and look at every production build.
+
+For Vite:
+
+<Code lang="bash" file="terminal">{`bun add -D rollup-plugin-visualizer
+# or
+bun add -D vite-bundle-visualizer`}</Code>
+
+<Code lang="ts" file="vite.config.ts">{`import { defineConfig } from "vite";
+import { visualizer } from "rollup-plugin-visualizer";
+
+export default defineConfig({
+  plugins: [
+    visualizer({
+      filename: "dist/stats.html",
+      open: true,         // pops the report after build
+      gzipSize: true,
+      brotliSize: true,
+    }),
+  ],
+});`}</Code>
+
+Run `bun run build`, the report opens. You'll see a treemap of every module in every chunk, sized by bytes. The big squares are your problem children.
+
+Common bloat sources you'll spot:
+
+- **`moment.js`** — ships all locales by default. ~67KB gzipped. **Replace with `date-fns` or `dayjs`** (~10KB each, tree-shakeable). The migration is mechanical: `moment().format(...)` → `format(date, ...)`. Worth a day of work in any app over six months old.
+- **Full `lodash`** instead of `lodash-es` — see above. Swap the package, change `import _ from "lodash"` to per-function imports.
+- **Full icon libraries** (`react-icons`, `@mui/icons-material`) — these often ship every icon. Use the per-icon imports: `import StarIcon from "@mui/icons-material/Star"` not `import { StarIcon } from "@mui/icons-material"`.
+- **`@sentry/browser` or other observability SDKs** — often 100KB+. Use the smaller `@sentry/browser` (vs full Sentry) or lazy-load them after first paint.
+- **Polyfills you don't need** — `core-js` shipping for browsers you don't support. Check your `browserslist` config.
+- **Duplicate React** — when a dep accidentally bundles its own React. Visible in the visualizer as two `react.js` files. Fix with a Vite `resolve.dedupe: ["react", "react-dom"]`.
+
+## Bundle budgets in CI
+
+Once you've optimized once, the regression will sneak back. Some new dep, a moment of `import { everything } from "huge-lib"`. Lock it in with a CI check.
+
+A minimal pattern: after `bun run build`, fail the build if the entry chunk exceeds your budget.
+
+<Code lang="ts" file="scripts/check-bundle-size.ts">{`import { readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { gzipSync } from "node:zlib";
+import { readFileSync } from "node:fs";
+
+const DIST = "dist/assets";
+const ENTRY_BUDGET_BYTES = 170 * 1024;
+
+const files = readdirSync(DIST).filter((f) => f.endsWith(".js"));
+const entry = files.find((f) => f.startsWith("index-")) ?? files[0];
+const gz = gzipSync(readFileSync(join(DIST, entry))).byteLength;
+
+console.log(\`entry: \${entry} \${Math.round(gz / 1024)}KB gzipped\`);
+if (gz > ENTRY_BUDGET_BYTES) {
+  console.error(\`BUDGET FAILED: \${gz} > \${ENTRY_BUDGET_BYTES}\`);
+  process.exit(1);
+}`}</Code>
+
+Run this as a CI step. The PR that doubles the entry chunk fails the build, the author has to explain or fix. Without this guardrail, bundle creep is monotonic.
+
+<Callout kind="pattern">
+  Treat the bundle as an asset you ship deliberately. Set a budget (170KB gzipped is a good default), inspect every production build with a visualizer, code-split routes and heavy features behind dynamic imports, and replace bloated libraries (moment → date-fns, full lodash → lodash-es with named imports). Enforce the budget in CI. Bundle size is the perf problem that comes back if you don't have a guardrail — every dep someone adds is a chance to regress.
+</Callout>
+
+<Reading url="https://web.dev/articles/reduce-javascript-payloads-with-tree-shaking" title="Reduce JavaScript payloads with tree shaking" kind="docs" minutes={8} />
+<Reading url="https://web.dev/articles/code-splitting-suspense" title="Code splitting with React.lazy and Suspense" kind="docs" minutes={6} />
+<Reading url="https://github.com/btd/rollup-plugin-visualizer" title="rollup-plugin-visualizer" kind="docs" minutes={3} />
+<Reading url="https://medium.com/dev-channel/the-cost-of-javascript-in-2019-d63ccd1be4cd" title="The Cost of JavaScript" author="Addy Osmani" kind="article" minutes={15} />
+
+**Remember this:** You can't tree-shake what you can't see. Run a bundle visualizer on every release. The biggest wins are usually one library swap, not architectural rewrites.

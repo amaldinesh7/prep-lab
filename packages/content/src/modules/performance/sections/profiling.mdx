@@ -1,0 +1,119 @@
+---
+title: Profiling tools
+---
+
+<SectionHeader kind="concept" number={3} title="Profiling tools" />
+
+Rule one of performance work: don't guess. Every team has a story about the engineer who spent two weeks memoizing components only to discover the actual bottleneck was a 3MB hero image. The tools below tell you where the time really went. Learn them in this order — DevTools first, React Profiler second, then synthetic and RUM (Real User Monitoring) once you ship.
+
+## Chrome DevTools Performance tab
+
+This is the single most valuable perf tool. It's also the most overwhelming on first open. Here's the survival guide.
+
+**Recording a profile.** Open DevTools, Performance tab, hit record (or use `Ctrl+E`), do the slow thing, stop. Use the throttling presets — "CPU: 4x slowdown" and "Network: Slow 3G" — to simulate real users. Your M1 Pro is not your user.
+
+**The lanes that matter.**
+
+- **Frames** (top) — every rectangle is a frame the browser tried to paint. Green = made it. Red bar above = dropped. If you see lots of red, you're blowing the 16ms budget.
+- **Main** — the main thread. Every block here is a function call. Stacks go down (parent calls child). Width = time spent. Look for wide blocks. Yellow = scripting (your JS), purple = layout/style, green = paint.
+- **Network** — the bytes-coming-in waterfall. See blocking scripts, long requests, render-blocking CSS.
+- **Interactions** — clicks, taps, key presses. Each shows its INP-style delay.
+
+**The three things to look for, in order:**
+
+1. **Long tasks** (≥ 50ms) on the main thread. These are red-cornered blocks. Click one — the call stack tells you what code ran.
+2. **Render-blocking resources** in the Network lane. A `<script>` without `async`/`defer` that takes 400ms is 400ms the user stares at white.
+3. **Layout thrashing** — alternating purple ("Recalculate Style") and green ("Layout") blocks. Means JS is reading and writing layout properties in a tight loop. We cover the fix in the gotchas section.
+
+**The "Bottom-Up" view** in the summary panel is where you find the actual culprit. It groups all the time by which function ate it. You'll often see a third-party script you forgot you installed at the top.
+
+## React DevTools Profiler
+
+DevTools Performance shows you what the _browser_ did. React DevTools Profiler shows you what _React_ did inside that. They're complementary — you usually need both.
+
+Install the React DevTools extension. The Profiler tab shows up when you're on a React app in development. Production builds work but show minified component names; use a dev/staging build for clarity.
+
+**Recording.** Click record, interact, stop. You get a flame graph for every commit React performed during the recording. Each bar is a component. Width = time spent rendering. Color = how much time relative to its siblings (yellow = fast, red = slow).
+
+**The two views.**
+
+- **Flamegraph** — the component tree for one commit. Click a bar, see why it rendered (props change, state change, parent re-rendered, hook fired).
+- **Ranked** — flat list of components sorted by render time for that commit. Best for spotting the one slow component in a tree of fast ones.
+
+**The "Why did this render?" panel** (right side, with the gear → "Record why each component rendered" enabled) is the most valuable feature. It tells you which prop or state change triggered the render. Half the time the answer is "Hook 1 changed" — and then your job is to figure out which hook is hook 1. Trace it back to a context that's updating too often, or a parent re-rendering with new object identities every time.
+
+**A workflow that works:**
+
+1. Reproduce the slowness with React Profiler recording.
+2. Look at the commit count. If you got 12 commits for one click, you have a re-render storm.
+3. Switch to Ranked view. Find the widest bar. That's your culprit component.
+4. Use "Why did this render?" to find the trigger. Fix the trigger, not the component.
+
+## Lighthouse and WebPageTest
+
+These are synthetic — they simulate a single page load in a controlled environment. They're good for trends over time and for catching regressions in CI; they're bad for matching what your real users experience (their devices, networks, and browser extensions vary wildly).
+
+**Lighthouse** runs from DevTools or CI. Scores your page 0-100 on Performance, Accessibility, Best Practices, SEO. The performance score is a weighted average of metrics (LCP, INP-proxy, CLS, TBT, Speed Index). What matters is the underlying metrics, not the score. A 95 score on a marketing page can still feel slow on a real phone.
+
+**WebPageTest** (webpagetest.org) gives you waterfall views, filmstrips of how the page renders frame by frame, and "Speed Index" — when the visible part of the page becomes meaningful. The filmstrip is invaluable for explaining slowness to non-engineers: "look, the page is blank for 3 seconds."
+
+Use Lighthouse in CI to fail builds on regressions. Use WebPageTest manually when you need to understand a specific slow load. Neither replaces the next category.
+
+## Real User Monitoring with `web-vitals`
+
+Synthetic tools test one page on one network. Real users hit your site on a Chromebook in Jakarta over LTE with 12 extensions installed. RUM gathers the actual metrics from actual sessions and ships them to your analytics. The official tool is the `web-vitals` library, maintained by Google's Chrome team.
+
+A minimal reporter:
+
+<Code lang="ts" file="src/lib/report-web-vitals.ts">{`import { onLCP, onINP, onCLS, onFCP, onTTFB, type Metric } from "web-vitals";
+
+function send(metric: Metric) {
+  // In real apps, POST to your analytics endpoint.
+  // Use sendBeacon so it survives the page unload.
+  const body = JSON.stringify({
+    name: metric.name,
+    value: metric.value,
+    rating: metric.rating, // "good" | "needs-improvement" | "poor"
+    id: metric.id,
+    navigationType: metric.navigationType,
+    path: location.pathname,
+  });
+
+  if (navigator.sendBeacon) {
+    navigator.sendBeacon("/api/vitals", body);
+  } else {
+    fetch("/api/vitals", { body, method: "POST", keepalive: true });
+  }
+
+  // Console fallback for local dev
+  console.log("[web-vitals]", metric.name, Math.round(metric.value), metric.rating);
+}
+
+export function reportWebVitals() {
+  onLCP(send);
+  onINP(send);
+  onCLS(send);
+  onFCP(send);
+  onTTFB(send);
+}`}</Code>
+
+Call `reportWebVitals()` once at app startup. The library handles the platform quirks (BFCache, page visibility, navigation timing) for you. On the receiving end, dashboard the p75 of each metric per route — p75 is what Google uses for ranking, and it's the most honest signal that your slowest quartile of users are OK.
+
+**Why p75 and not average?** Averages hide the tail. A page with p50=1s and p99=15s averages out to look fine, but 1% of your users are having a terrible time. CWV thresholds are at p75 because that's "most of your users had a good experience" — losing 25% to bad experiences is the threshold of "this is a problem."
+
+## The profiling-first rule
+
+Engineers who skip profiling end up doing what I call "performance theatre" — they wrap things in `useMemo`, sprinkle `React.memo`, switch from Redux to Zustand, and the page feels exactly the same because none of it was the bottleneck. Then they declare perf done.
+
+The rule: **never optimize without a profile in hand showing the thing you're about to optimize.** Profile, find the longest bar, fix the longest bar, re-profile, repeat. When the longest bar is acceptable, you're done.
+
+<Callout kind="pattern">
+  Always start with a profile. DevTools Performance tells you where the browser spent time (load, parse, paint, third-party). React Profiler tells you which components rendered and why. Lighthouse tracks trends in CI. `web-vitals` measures actual users. The discipline is to never optimize anything you didn't first measure — performance theatre wastes weeks and changes nothing the user feels.
+</Callout>
+
+<Reading url="https://developer.chrome.com/docs/devtools/performance" title="Performance features reference" kind="docs" minutes={15} />
+<Reading url="https://react.dev/reference/react/Profiler" title="React Profiler (programmatic)" kind="docs" minutes={5} />
+<Reading url="https://github.com/GoogleChrome/web-vitals" title="web-vitals library" author="Google Chrome" kind="docs" minutes={8} />
+<Reading url="https://kentcdodds.com/blog/profile-a-react-app-for-performance" title="Profile a React App for Performance" author="Kent C. Dodds" kind="blog" minutes={10} />
+
+**Remember this:** Profile first, optimize second. The most common performance mistake is fixing the thing you assumed was slow instead of the thing the profile says was slow.

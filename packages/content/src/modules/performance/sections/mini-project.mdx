@@ -1,0 +1,314 @@
+---
+title: Profile + optimize a slow app
+---
+
+<SectionHeader kind="mini_project" number={9} title="Profile + optimize a slow app" />
+
+Three hours. You're going to take a deliberately-slow React app, profile it with all the tools from the profiling section, find the top three perf problems, fix them, and prove the fix worked with before/after metrics.
+
+This is the most important exercise in the module. Reading about `useMemo` doesn't teach you when to reach for it; finding the long task on the main thread and fixing it does. Do this once and your mental model of "what slow looks like" will be permanent.
+
+<ProjectCard hours="3" starter="./perf-lab-starter">
+
+## The slow app
+
+You have two options. Either clone the starter (`./perf-lab-starter` in this module) or build one in 15 minutes from the spec below. Building it yourself is better — you'll know exactly what's wrong because you put it there.
+
+If building from scratch, scaffold this:
+
+```bash
+bun create vite perf-lab --template react-ts
+cd perf-lab
+bun add moment lodash react-chartjs-2 chart.js
+```
+
+Build a single page that does five things badly:
+
+1. Imports `moment` and uses it to format a timestamp on every render.
+2. Imports the full `lodash` (not `lodash-es`) and uses `_.debounce`.
+3. Renders a 1000-item list without virtualization — each row a `<div>` with text and a button.
+4. Above the list, has a search input controlled by state at the page level. Every keystroke re-renders the list.
+5. Lazy-loads nothing. Imports a heavy chart component at the top of the file even though it only renders below the fold.
+
+`src/App.tsx`:
+
+```tsx
+import { useState } from "react";
+import moment from "moment";
+import _ from "lodash";
+import { Line } from "react-chartjs-2";
+import {
+  Chart, CategoryScale, LinearScale, PointElement, LineElement, Title,
+} from "chart.js";
+
+Chart.register(CategoryScale, LinearScale, PointElement, LineElement, Title);
+
+const ITEMS = Array.from({ length: 1000 }, (_, i) => ({
+  id: i,
+  label: \`Item \${i}\`,
+  ts: Date.now() - i * 60_000,
+}));
+
+export default function App() {
+  const [q, setQ] = useState("");
+
+  const filtered = q
+    ? _.filter(ITEMS, (it) => it.label.toLowerCase().includes(q.toLowerCase()))
+    : ITEMS;
+
+  return (
+    <main style={{ padding: 16 }}>
+      <h1>Perf lab</h1>
+      <input
+        placeholder="search…"
+        value={q}
+        onChange={(e) => setQ(e.target.value)}
+      />
+      <ul>
+        {filtered.map((it) => (
+          <li key={it.id}>
+            {it.label} — {moment(it.ts).fromNow()}
+          </li>
+        ))}
+      </ul>
+      <section>
+        <h2>Trend</h2>
+        <Line
+          data={{
+            labels: ITEMS.slice(0, 50).map((it) => it.id),
+            datasets: [{ data: ITEMS.slice(0, 50).map((it) => it.id * 7) }],
+          }}
+        />
+      </section>
+    </main>
+  );
+}
+```
+
+Build it: `bun run build`. You're ready.
+
+## Step 1 — Baseline
+
+Before changing anything, capture the baseline. Future-you needs proof the work mattered.
+
+**Lighthouse cold-load.** Open DevTools, Lighthouse tab, "Mobile" + "Performance" only, "Clear storage" checked. Run. Screenshot the scores and the metrics (LCP, INP/TBT, CLS).
+
+Expected: LCP somewhere around 4-6s on simulated mobile, TBT (Total Blocking Time, a Lighthouse INP proxy) > 500ms, Performance score in the 40-70 range.
+
+**Bundle visualizer.** Add `rollup-plugin-visualizer`:
+
+```bash
+bun add -D rollup-plugin-visualizer
+```
+
+Update `vite.config.ts`:
+
+```ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import { visualizer } from "rollup-plugin-visualizer";
+
+export default defineConfig({
+  plugins: [
+    react(),
+    visualizer({ filename: "dist/stats.html", open: true, gzipSize: true }),
+  ],
+});
+```
+
+Run `bun run build`. The visualizer opens. Screenshot the treemap. You should see big squares for `moment`, `lodash`, and `chart.js`.
+
+**DevTools Performance recording.** Open the production build (`bun run preview`), DevTools Performance tab, set CPU throttling to "4x slowdown" and network to "Slow 3G." Record while loading the page, then while typing 5 characters in the search box. Stop.
+
+In the recording, find:
+- The longest task on the main thread during load. Note its duration.
+- The longest task during typing. Note its duration.
+- The render-blocking scripts in the Network lane.
+
+Write down (or screenshot) all three baseline measurements. You'll compare against them after each fix.
+
+## Step 2 — Fix the bundle
+
+The bundle visualizer told you the bloat. Three swaps:
+
+**Swap moment → date-fns:**
+
+```bash
+bun remove moment
+bun add date-fns
+```
+
+```tsx
+// before:
+import moment from "moment";
+{moment(it.ts).fromNow()}
+
+// after:
+import { formatDistanceToNow } from "date-fns";
+{formatDistanceToNow(new Date(it.ts), { addSuffix: true })}
+```
+
+`moment` was ~67KB gzipped. `formatDistanceToNow` from `date-fns` is ~5KB. ~60KB saved.
+
+**Swap lodash → tree-shaken usage:**
+
+```bash
+bun remove lodash
+bun add lodash-es
+bun add -D @types/lodash-es
+```
+
+```tsx
+// before:
+import _ from "lodash";
+_.filter(ITEMS, predicate)
+
+// after — but actually we don't even need lodash for this
+ITEMS.filter(predicate)
+```
+
+Native `Array.prototype.filter` is fine for this. Drop lodash entirely. ~70KB saved.
+
+(If you needed lodash for something complex: `import { groupBy } from "lodash-es"` ships only that function, ~3KB.)
+
+**Lazy-load the chart:**
+
+```tsx
+import { lazy, Suspense } from "react";
+
+const TrendChart = lazy(() => import("./TrendChart"));
+
+// ...later in JSX:
+<Suspense fallback={<div>Loading chart…</div>}>
+  <TrendChart items={ITEMS.slice(0, 50)} />
+</Suspense>
+```
+
+Move the chart's imports and render into `TrendChart.tsx`. Now `chart.js` and `react-chartjs-2` don't ship in the initial bundle. ~80KB saved off the entry.
+
+Rebuild. Open the visualizer. The big squares should be much smaller. Re-run Lighthouse. LCP should drop by 1-2 seconds.
+
+## Step 3 — Virtualize the list
+
+Open DevTools Performance, record while scrolling the list. You'll see a long task and dropped frames as the browser tries to recalculate layout for 1000 nodes.
+
+```bash
+bun add @tanstack/react-virtual
+```
+
+```tsx
+import { useRef } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+
+function VirtualList({ items }: { items: typeof ITEMS }) {
+  const parentRef = useRef<HTMLDivElement>(null);
+  const virtualizer = useVirtualizer({
+    count: items.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 32,
+    overscan: 10,
+  });
+
+  return (
+    <div ref={parentRef} style={{ height: 500, overflow: "auto" }}>
+      <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
+        {virtualizer.getVirtualItems().map((vi) => {
+          const it = items[vi.index];
+          return (
+            <div
+              key={vi.key}
+              style={{
+                position: "absolute", top: 0, left: 0, right: 0,
+                transform: \`translateY(\${vi.start}px)\`,
+                height: vi.size,
+              }}
+            >
+              {it.label} — {formatDistanceToNow(new Date(it.ts), { addSuffix: true })}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+```
+
+The list now renders ~20 DOM nodes instead of 1000. Scroll is buttery; initial render is instant.
+
+## Step 4 — Stop re-rendering on every keystroke (`useTransition`)
+
+The search box still triggers a heavy filter on every keystroke. Even with virtualization, the parent re-renders on each character, and on a slow phone that's a 30-50ms task per keystroke.
+
+```tsx
+import { useState, useTransition, useDeferredValue } from "react";
+
+const [q, setQ] = useState("");
+const deferredQ = useDeferredValue(q);
+
+const filtered = deferredQ
+  ? ITEMS.filter((it) => it.label.toLowerCase().includes(deferredQ.toLowerCase()))
+  : ITEMS;
+
+// input uses q (immediate); filtered uses deferredQ (lags during heavy renders)
+<input value={q} onChange={(e) => setQ(e.target.value)} />
+```
+
+The input stays responsive. The list catches up when the main thread is free. INP improves dramatically.
+
+## Step 5 — Re-measure
+
+Run Lighthouse again. Same conditions: cold cache, mobile, throttled. Screenshot the new scores.
+
+Expected improvements:
+- **Performance score**: from ~50 to ~90+
+- **LCP**: from ~5s to ~1.5-2s
+- **TBT**: from ~800ms to ~100ms
+- **Bundle (entry chunk)**: from ~400KB to ~80KB gzipped
+
+Take the before/after screenshots side by side. This is the proof you fixed things.
+
+## Stretch — add web-vitals reporting
+
+Wire up the `web-vitals` library to log metrics to the console. This is what you'd ship to RUM in production.
+
+```bash
+bun add web-vitals
+```
+
+`src/lib/report-web-vitals.ts`:
+
+```ts
+import { onLCP, onINP, onCLS, type Metric } from "web-vitals";
+
+function report(metric: Metric) {
+  console.log(
+    \`[web-vitals] \${metric.name}: \${Math.round(metric.value)}ms — \${metric.rating}\`,
+  );
+}
+
+export function reportWebVitals() {
+  onLCP(report);
+  onINP(report);
+  onCLS(report);
+}
+```
+
+Call `reportWebVitals()` once in `main.tsx`. Now you see LCP, INP, CLS in the console for real loads — try clicking around, watch INP get reported. This is the foundation of a real RUM pipeline: replace `console.log` with `navigator.sendBeacon` to your analytics endpoint.
+
+## What to internalize
+
+When you finish, you should be able to answer:
+
+- Which tool told you the bundle was bloated? (Visualizer treemap.)
+- Which tool told you the list was slow? (DevTools Performance — long task during scroll.)
+- Why does `useTransition`/`useDeferredValue` keep the input responsive? (Marks the filter render as low-priority; the input update is high-priority.)
+- Why was the chart lazy-loaded? (It's below the fold, not in the LCP path; deferring it shrinks the entry chunk without hurting first paint.)
+- What would you measure next? (p75 of real users; this lab was synthetic.)
+
+If those answers feel obvious, the module landed. You're now the engineer who profiles before optimizing.
+
+</ProjectCard>
+
+<Reading url="https://web.dev/articles/optimize-vitals-lighthouse" title="Optimize CWV with Lighthouse" kind="docs" minutes={8} />
+<Reading url="https://github.com/GoogleChrome/web-vitals" title="web-vitals library" kind="docs" minutes={6} />
+<Reading url="https://tanstack.com/virtual/latest/docs/introduction" title="TanStack Virtual — Introduction" kind="docs" minutes={5} />

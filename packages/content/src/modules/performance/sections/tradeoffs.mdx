@@ -1,0 +1,76 @@
+---
+title: Tradeoffs
+---
+
+<SectionHeader kind="tradeoff" number={7} title="Tradeoffs" />
+
+Every performance technique has a cost. Most articles you'll read sell the technique without the cost; this section pays the cost back. The patterns below are real wins applied in the right place and real harm applied everywhere.
+
+## Premature `useMemo` makes code worse, not faster
+
+The first reflex of a "performance-conscious" React developer is to wrap things. `useMemo`, `useCallback`, `React.memo`, sprinkled liberally. The cost shows up in three ways:
+
+- **Readability.** A function component with five `useMemo`s and three `useCallback`s is a wall of dependency arrays. The next engineer has to mentally execute every dep array to understand control flow.
+- **Bug surface.** A stale dep array (you forgot to add a value) gives you a value that doesn't update. The bug is hard to spot — the component looks correct.
+- **Actual CPU cost.** Each memo does a dependency comparison every render. For a value that takes 10μs to compute and 5μs to compare, you're paying 5μs in overhead to save nothing.
+
+The honest rule: don't `useMemo` until profiling says you need to. The threshold is something like "this computation is over 1ms" or "this value's identity is consumed by another memoized thing." Below that, the wrapper is a net loss.
+
+Same with `React.memo` — applied to every component, it's overhead without benefit because the comparison fails (props change identity) more often than it succeeds. Applied to a hot list item where most updates skip it, it's a real win. The skill is knowing which is which, and the only way to know is to profile.
+
+## Code-splitting beyond a point makes things slower
+
+Splitting a heavy route into its own chunk: clear win. Splitting every component into its own chunk: clear loss. The cost of code-splitting is network roundtrips and parse overhead per chunk. HTTP/2 multiplexes, but each chunk still has a request, a response, a parse step, and a Suspense boundary that has to render twice (once with the fallback, once with the loaded content).
+
+The break-even is roughly: a chunk is worth splitting if it's > 30KB minified AND is loaded on a path the user might not take. A 5KB component that always renders should not be split — the roundtrip costs more than the savings.
+
+The over-split symptoms: a long network waterfall in DevTools, dozens of small chunks, Suspense fallbacks flashing during normal navigation. The fix is to merge small chunks back into the parent — Vite's `manualChunks` is your tool.
+
+## SSR/SSG: bought LCP, paid in complexity
+
+Server-side rendering is the single biggest LCP win available to a React app. Instead of shipping a `<div id="root"></div>` shell and waiting for JS to render, you ship fully-rendered HTML. The user sees content immediately; React hydrates in the background.
+
+The bill comes due in three places:
+
+- **Hydration mismatches.** The server renders one thing (using server-side data, time, randomness), the client renders something else, React throws an error and discards the SSR work. You're now slower than no SSR. Common causes: date formatting using server's timezone, random IDs, `window`-conditional content, third-party scripts that mutate the DOM.
+- **Double-fetching.** The server fetched the data to render. The client doesn't know about that fetch, so it fetches again on mount. Fix: pass the data through the initial HTML (a `<script>` tag with serialized state) and rehydrate React Query/SWR/etc with it.
+- **Deployment complexity.** SSR needs a Node runtime, not a static CDN. You're now operating a server, scaling it, monitoring it, paying for it.
+- **TTI vs LCP.** SSR makes LCP faster but doesn't help TTI (Time To Interactive) — JS still has to download, parse, and hydrate. The user sees content but can't click it for a moment. Sometimes the LCP win paired with the TTI plateau gives a "looks loaded but doesn't respond" feel that's worse than a unified slow load.
+
+The decision: SSR if your business is SEO-dependent (marketing pages, e-commerce, content sites) or your LCP is dominated by data fetching. Don't SSR for internal dashboards — the LCP gain is real but the complexity tax isn't worth it.
+
+Static-site generation (SSG) — pre-rendering at build time, no Node server in production — is the cheaper sibling. It works for pages that don't depend on per-user data. Marketing pages: SSG. Logged-in dashboards: client-render or server-render with caching, never SSG.
+
+## Lighthouse scores ≠ user happiness
+
+Lighthouse runs once on a simulated Moto G4 over a slow 4G connection from one of Google's data centers. Your real users are on a thousand different devices, networks, and contexts. A 95 Lighthouse score on a marketing page can coexist with miserable real-user metrics, because:
+
+- **Lighthouse runs against a cold cache.** Your real users come back; they have the JS cached; their LCP is your TTFB. Lighthouse doesn't model this.
+- **Lighthouse doesn't include third-party scripts loaded conditionally.** Your analytics and ad scripts run for real users; they didn't run in Lighthouse's test.
+- **Lighthouse's INP is synthetic** — it triggers an interaction during the load. Real users interact later, on different elements, with different state.
+- **Lighthouse can be gamed.** Inline critical CSS, defer everything, lazy-load everything, score goes up. User experience might not.
+
+Use Lighthouse as a regression detector in CI, not as the ground truth of how the site feels. The ground truth is `web-vitals` RUM data at p75 of real users on real devices.
+
+The pattern: Lighthouse should never get worse over time, but a good Lighthouse score doesn't certify that users are happy. Two different questions.
+
+## When the optimization isn't worth it
+
+A list of cases where the right move is to leave perf on the table:
+
+- **Admin tools used by 5 internal users on M1 Macs.** Optimizing LCP from 3s to 1.5s saves nobody anything that matters. Ship the feature.
+- **A debug-only feature behind a flag.** The 200KB JS payload isn't shipped to users.
+- **A feature with measured low engagement.** Spending a week on the perf of a feature 0.5% of users touch is a waste. Spend that week on the home page.
+- **An animation that "could be GPU-accelerated."** If it runs at 60fps on a Pixel 6, leave it. The day you ship to lower-end devices, revisit.
+
+The discipline of NOT optimizing is as important as the discipline of optimizing. Engineering hours have an opportunity cost.
+
+<Callout kind="tradeoff">
+  Performance work is a budget allocation problem. Memo everything: code unreadable, savings nil. Split every component: waterfalls and Suspense thrash. Add SSR: LCP wins, complexity tax, hydration bugs. Chase Lighthouse: numbers up, users unchanged. The senior move is to profile real users, find the actual bottleneck, fix that, ship, measure again. The dumbest perf code is the perf code that didn't move a metric anyone cared about.
+</Callout>
+
+<Reading url="https://overreacted.io/before-you-memo/" title="Before you memo()" author="Dan Abramov" kind="blog" minutes={6} />
+<Reading url="https://www.smashingmagazine.com/2023/02/dangers-frontend-performance-overoptimization/" title="The Dangers Of Frontend Performance Over-Optimization" kind="article" minutes={10} />
+<Reading url="https://web.dev/articles/lab-and-field-data-differences" title="Why lab and field data can be different" kind="docs" minutes={7} />
+
+**Remember this:** Optimization has a cost. Apply it where the profile points; leave it where it doesn't. The senior skill is knowing what NOT to optimize.
