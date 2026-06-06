@@ -1,0 +1,64 @@
+{
+  "questions": [
+    {
+      "id": "q1",
+      "prompt": "Which Tanstack Query mutation callback fires BEFORE the network request is sent — i.e., the right place to write the optimistic value to the cache?",
+      "options": [
+        { "id": "a", "label": "onSuccess" },
+        { "id": "b", "label": "onMutate" },
+        { "id": "c", "label": "onSettled" },
+        { "id": "d", "label": "mutationFn" }
+      ],
+      "correct": "b",
+      "explanation": "`onMutate` runs synchronously before the mutation function. It's where you cancel inflight refetches, snapshot the previous cache, and write the optimistic value. Returning a context object passes data to the other callbacks."
+    },
+    {
+      "id": "q2",
+      "prompt": "Why is `await qc.cancelQueries({ queryKey })` the first line of almost every `onMutate`?",
+      "options": [
+        { "id": "a", "label": "It pauses other mutations on the same key" },
+        { "id": "b", "label": "It clears the cache so the optimistic write starts from a clean slate" },
+        { "id": "c", "label": "It prevents an in-flight refetch from landing after the optimistic write and overwriting it with stale server data" },
+        { "id": "d", "label": "It's required for the type system to know the snapshot is safe to restore" }
+      ],
+      "correct": "c",
+      "explanation": "Without `cancelQueries`, a refetch that started 50ms before the click can land 100ms after your optimistic write and stomp it. The checkbox flips back, the user is confused, and the bug is hard to reproduce. Always cancel first."
+    },
+    {
+      "id": "q3",
+      "prompt": "A mutation hits a permanent failure (e.g., a 500 the server refuses to recover from). What's the right rollback strategy?",
+      "options": [
+        { "id": "a", "label": "Restore the snapshot from context, show a user-visible error, and let them retry" },
+        { "id": "b", "label": "Leave the optimistic value in place and silently retry forever" },
+        { "id": "c", "label": "Invalidate the query and hope the refetch repairs the UI" },
+        { "id": "d", "label": "Reload the page" }
+      ],
+      "correct": "a",
+      "explanation": "Restore the snapshot in `onError` and surface the failure with a toast or inline message. Silent failures are worse than slow success — the user needs to know their action didn't take so they can decide what to do."
+    },
+    {
+      "id": "q4",
+      "prompt": "Your `useAddTodo` creates a row with a client-generated `tmp_` ID. When do you swap it for the server-assigned real ID?",
+      "options": [
+        { "id": "a", "label": "Inside `onMutate`, before the request is sent" },
+        { "id": "b", "label": "Inside `onSuccess`, after the server responds with the canonical entity" },
+        { "id": "c", "label": "Inside `onSettled`, after both success and error paths have run" },
+        { "id": "d", "label": "Never — leave the temp ID and the next refetch will reconcile" }
+      ],
+      "correct": "b",
+      "explanation": "The temp ID exists only because you don't know the real one yet. `onSuccess` is the first moment the server's canonical entity is in your hand — that's where you replace the temp row with the real one. Pass `tempId` through the context object so `onSuccess` can find it."
+    },
+    {
+      "id": "q5",
+      "prompt": "Which class of action is the WORST fit for an optimistic UI pattern?",
+      "options": [
+        { "id": "a", "label": "Toggling a checkbox on a todo" },
+        { "id": "b", "label": "Reordering items in a list" },
+        { "id": "c", "label": "Renaming a document title" },
+        { "id": "d", "label": "Charging a customer's credit card" }
+      ],
+      "correct": "d",
+      "explanation": "Irreversible, financial, or authoritative actions — payments, AI completions, identity changes — should wait for the server response because the server's answer IS the result. Optimistically showing 'Payment succeeded' and rolling back on failure is a worse UX than honest pending state."
+    }
+  ]
+}

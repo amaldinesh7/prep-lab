@@ -1,0 +1,114 @@
+---
+title: When NOT to be optimistic
+---
+
+<SectionHeader kind="tradeoff" number={6} title="When NOT to be optimistic" />
+
+Optimistic UI isn't universally correct. It's a trade: client complexity and the risk of visible-then-wrong UI, against perceived speed. For most interactions in a productivity app, the trade is obviously worth it. For some, it isn't, and shipping optimistic UI there is actively bad product design.
+
+This section is the list of mutations to leave naive, and the reasoning for each.
+
+## Financial and irreversible actions
+
+Charge a card. Place an order. Transfer money. Submit a tax form. Send an email. Delete a customer record.
+
+The user needs to know — with certainty — what happened. The optimistic pattern is "show success, deal with failure later." That mental model is wrong for actions where "deal with failure later" means "the customer was charged twice" or "the email went to all 5,000 people, but you thought it didn't."
+
+For these, the right UX is the boring one:
+
+<Code lang="tsx" file="financial-action.tsx">{`function PayButton({ amount }: { amount: number }) {
+  const [state, setState] = useState<"idle" | "submitting" | "success" | "error">("idle");
+  const [confirmation, setConfirmation] = useState<string | null>(null);
+
+  async function onPay() {
+    setState("submitting");
+    try {
+      const { confirmationId } = await chargeCard({ amount });
+      setConfirmation(confirmationId);
+      setState("success");
+    } catch (err) {
+      setState("error");
+    }
+  }
+
+  if (state === "success") return <p>Charged. Confirmation: {confirmation}</p>;
+  if (state === "submitting") return <button disabled>Charging…</button>;
+  return <button onClick={onPay}>Pay {amount}</button>;
+}`}</Code>
+
+Disable the button. Show a spinner. Wait for the server. Show a confirmation ID the user can quote in support. Yes, the interaction is "slow." Yes, that's correct. Speed is not the priority when the consequences of being wrong include "the user gets charged twice and yells at you on Twitter."
+
+The narrow exception: when the action has a real undo window. Gmail's "undo send" is optimistic-with-a-real-undo. The email isn't actually sent for 30 seconds. If the user clicks undo, nothing left the server. That's not optimistic UI; it's a deliberately deferred action with a UI that hides the deferral. Different beast.
+
+## When the server's response IS the answer
+
+For some mutations, you don't know the result until the server tells you. There's nothing to guess. Optimistic UI offers nothing.
+
+**Search.** The user types a query. The result is "what the server matched." You can't optimistically render search results.
+
+**AI generation.** The user prompts the model. The result is "what the LLM produced." You can show a streaming placeholder ("generating…"), but you can't optimistically render the answer.
+
+**Server-side validation that the client doesn't replicate.** "Is this username available?" The server is authoritative. Showing "✓ available" optimistically and flipping to "✗ taken" feels worse than just showing the spinner.
+
+**Resource creation where the server decides whether it's allowed.** Adding a paid seat to a workspace might fail because billing is past due. Optimistically showing the seat as added, then removing it 400ms later, is worse UX than a brief spinner.
+
+For these, the loading state is the UX. Make it good. Skeleton, streaming, progress indicator — but don't pretend you know.
+
+## When the optimistic guess is likely wrong
+
+Optimistic UI is "guess; reconcile if wrong." If the guess is wrong _often_, the reconciliation becomes the dominant experience. The UI flickers. Trust erodes.
+
+Concrete cases:
+
+- **Server-driven ordering.** A "trending now" list reorders based on signals you don't see client-side. Optimistically prepending a new entry to the top is a lie that gets corrected on every refetch.
+- **Quotas and rate limits.** The server might reject the action because the user hit a quota you don't track precisely. If failures are above ~5%, the optimistic UI is more annoying than helpful.
+- **Permissions enforced server-side that the client only loosely models.** Sharing with a user might fail because of a workspace policy the client doesn't know about. If you can replicate the policy client-side, do so and gate the UI _before_ the mutation. If not, don't be optimistic about it.
+
+The rule: optimistic UI assumes the success rate is north of 95%. Below that, it's noise.
+
+## The client complexity tax
+
+Every optimistic mutation costs you, roughly:
+
+- An `onMutate` with cancel + snapshot + write
+- An `onError` with restore + UX
+- An `onSuccess` with reconciliation
+- An `onSettled` with invalidation
+- A test for each of the above
+- A mental model your future teammates need to load
+
+That's not free. For a low-traffic settings page where the user expects to wait — "change your email" — the optimistic complexity buys nothing. The user clicks Save once a year and is fine waiting 400ms.
+
+Spend the complexity on the interactions that the user makes many times per session. Toggles, list reorders, autosave, in-place edits. Those are where the trade is unambiguously good. Don't spread the cost over every form in the app.
+
+## A decision framework
+
+When you're unsure, walk this checklist:
+
+1. **Is the action reversible?** If no → don't be optimistic.
+2. **Is the success rate >95%?** If no → don't be optimistic.
+3. **Does the server invent data the client can't guess?** (Search results, AI output, server-computed orderings) If yes → don't be optimistic.
+4. **Will the user dispatch this action many times per session?** If no → don't be optimistic (not worth the complexity).
+5. **Would the consequences of "visible-then-wrong" UI confuse or upset the user?** (Payments, sends, deletes) If yes → don't be optimistic.
+
+If all five point toward optimistic, go. If any one points away, default to the boring spinner-and-wait pattern. The user will not notice that one specific action is "slow." They will notice that your toggles feel native.
+
+<Callout kind="tradeoff">
+  Optimistic UI is a tool, not a default. It pays off on high-frequency, reversible, high-success-rate interactions where client and server agree on what the answer should be. It's actively harmful on financial actions, server-authoritative responses (search, AI), and low-success-rate mutations. The mature engineer's instinct is to pick which actions get the optimistic treatment, not to apply it everywhere.
+</Callout>
+
+## A note on hybrid patterns
+
+Some interactions are partially optimistic. A common one:
+
+- **Create with deferred server validation.** New todo: optimistically append. But if the server runs a content filter and rejects, the row removes itself with a brief "this todo couldn't be saved" message. Optimistic on the 99% case, gracefully unwinds on the 1%.
+- **Optimistic UI with explicit save.** Form fields update local state instantly (no network), only persist on Save. This is "optimistic against a local cache before the network is involved." Cheaper, simpler, almost always fine.
+- **Server-confirmed optimistic.** The optimistic write shows but with a visible "saving" hint. Once confirmed, the hint disappears. Used for medium-stakes actions where you want fast feedback but also want to be honest about uncertainty.
+
+You don't have to pick one philosophy app-wide. Pick per interaction. The cheatsheet at the end has the recurring patterns.
+
+<Reading url="https://www.lukew.com/ff/entry.asp?1797" title="Mobile First (response time research)" author="Luke Wroblewski" kind="blog" minutes={6} />
+<Reading url="https://blog.gmail.com/2009/03/new-in-labs-undo-send.html" title="Gmail Undo Send (deferred action vs optimistic UI)" kind="blog" minutes={4} />
+<Reading url="https://www.fastcompany.com/3052337/the-quiet-design-trick-behind-the-best-mobile-apps" title="Perceived performance in mobile apps" kind="blog" minutes={5} />
+
+**Remember this:** Reversible + high-success + frequent + client-knowable = optimistic. Anything else = boring spinner. Don't pay the complexity tax where it doesn't earn its keep.

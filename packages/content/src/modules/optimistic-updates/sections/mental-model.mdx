@@ -1,0 +1,145 @@
+---
+title: The mental model
+---
+
+<SectionHeader kind="concept" number={2} title="The mental model" />
+
+Before you touch the API, get the state model in your head. Optimistic UI lives or dies on whether you can answer one question at any moment: **for this piece of data, what is the UI showing, and how confident am I that the server agrees?**
+
+## Three states per mutation
+
+Every mutation moves through three states, in order:
+
+1. **Pending (optimistic).** The client has written the guess to the cache. The UI is showing it. The network request is in flight. Server has not yet confirmed.
+2. **Confirmed.** The server returned success. The cache may have been updated again with the canonical server value (server IDs, server timestamps, computed fields). The UI now shows truth.
+3. **Rolled back.** The server returned failure, the request timed out, or the user went offline long enough that we gave up. The cache is reverted to its pre-mutation snapshot. The UI now shows truth — the older truth.
+
+A mutation that fails goes `pending → rolled back`. A mutation that succeeds goes `pending → confirmed`. There is no fourth state. Either you trust the guess until the server speaks, or you stop trusting it.
+
+Hold this in your head. Every API in this module — `onMutate`, `onError`, `onSuccess`, `onSettled` — maps onto this transition.
+
+## The cache is the UI's source of truth
+
+This is the single most important shift from naive React.
+
+In naive React, components own their data. `useState`, `useEffect`, props from a fetcher hook — each component renders what it personally knows. Mutations call `setState` and the component re-renders. State is scattered.
+
+In optimistic React, the **cache** is what the UI reads. Components are projections of the cache. A mutation doesn't `setState` — it writes to the cache, and every component reading that cache key re-renders. There's exactly one place that knows the current state of a todo. When you optimistically toggle it, you write to that one place, and every part of the UI showing that todo flips together.
+
+This is why Tanstack Query, Apollo, Relay, and Replicache all look similar at this layer. They're all variations on "one cache, many consumers, mutations write the cache." React's local state is the wrong tool for any data that touches the network — and it gets exponentially wrong the moment two components show the same data.
+
+## Two sources of truth, reconciled
+
+You're actually running two sources of truth in parallel:
+
+- **Client cache** — what the UI reads. Updated optimistically on mutation start, reverted on mutation failure, possibly updated again on success.
+- **Server state** — what the database says. Updated when the request lands. Authoritative.
+
+They agree most of the time. The whole optimistic UI dance is about the moments they don't.
+
+The points where they reconcile:
+
+| Moment | What happens |
+|---|---|
+| `onMutate` | Cache gets the guess; server hasn't seen anything yet. |
+| Request lands at server | Server applies (or rejects) the mutation. |
+| `onSuccess` | Cache gets the canonical server response — server IDs, timestamps, computed fields. |
+| `onError` | Cache gets the snapshot back (pre-mutation state). |
+| `onSettled` | Often: cache invalidation, triggering a background refetch that overwrites the cache with the latest server truth. |
+
+Most production bugs in optimistic UI are misalignments in this dance. Forgot to cancel an inflight refetch in `onMutate`? Your optimistic write gets stomped by stale server data. Forgot to overwrite the temp ID in `onSuccess`? The next mutation against that row sends `id: "tmp_abc"` to the server and 404s. Forgot to invalidate in `onSettled`? Computed fields drift from the database for hours.
+
+## The "guessed" vs "confirmed" diff
+
+For any optimistic write, ask: **which fields am I guessing, and which fields will the server fill in?**
+
+For a checkbox toggle, you're guessing one field: `done: true`. Server confirms the rest (the `updatedAt` it stamps, maybe a `version` number for conflict detection). Low risk; the guess is almost always right.
+
+For a new todo, you're guessing _almost everything_: the title, the ordering, the timestamps. The server fills in the ID. The guessed fields are right because the user typed them; the server-filled field (the ID) needs replacing later.
+
+For a "share with team X" mutation, you might be guessing membership ordering, permission levels, audit logs — fields the server computes from rules you don't fully replicate client-side. The guess can be visibly wrong. This is where you start using "pending" visual hints (opacity, spinner overlay) instead of pretending you're sure.
+
+The skill is calibrating your confidence. Toggle a boolean? Be confident. Create an entity? Mostly confident. Run a server-side rule engine? Show pending state and prepare for the diff.
+
+## The flow, in ASCII
+
+A successful mutation:
+
+```
+USER CLICK
+   │
+   ▼
+onMutate ──► cancelQueries() ──► snapshot ──► setQueryData(optimistic)
+   │                                                │
+   │                                                ▼
+   │                                          UI re-renders
+   │                                          (instantly)
+   ▼
+fetch(server) ───── 200 OK ─────► onSuccess
+                                     │
+                                     ▼
+                               setQueryData(server response)
+                                     │
+                                     ▼
+                                onSettled ──► invalidateQueries()
+                                                  │
+                                                  ▼
+                                            background refetch
+                                                  │
+                                                  ▼
+                                            cache reconciled
+```
+
+A failed mutation:
+
+```
+USER CLICK
+   │
+   ▼
+onMutate ──► cancelQueries() ──► snapshot ──► setQueryData(optimistic)
+   │                                                │
+   │                                                ▼
+   │                                          UI re-renders
+   │                                          (instantly)
+   ▼
+fetch(server) ───── 500 ERROR ─────► onError
+                                        │
+                                        ▼
+                                  setQueryData(snapshot)
+                                        │
+                                        ▼
+                                  UI re-renders
+                                  (snapped back)
+                                        │
+                                        ▼
+                                  toast("couldn't save")
+```
+
+The two flows share the first half. The second half — `onSuccess` vs `onError` — is where the work happens. Both end at `onSettled`, which is your "no matter what happened, do this" hook (usually invalidation).
+
+<Callout kind="why">
+  The mental model is two sources of truth — client cache and server — that you reconcile at five moments: `onMutate`, request, `onSuccess`, `onError`, `onSettled`. Every optimistic UI bug you'll hit is a misalignment at one of those five points. Internalize the lifecycle before you write the code. The code is mechanical once you can draw the diagram from memory.
+</Callout>
+
+## Pending state is part of the data model
+
+One more shift. In naive React, "is this saving?" is local component state. In optimistic React, it's part of the cached entity. Roughly:
+
+<Code lang="ts" file="todo-types.ts">{`type Todo = {
+  id: string;
+  title: string;
+  done: boolean;
+  // optional flags the client adds, server doesn't store
+  _pending?: "create" | "update" | "delete";
+  _tempId?: string; // present until server-assigned ID lands
+};`}</Code>
+
+Why on the entity and not on the mutation? Because the UI is projecting the cache. If a row is being saved, _the row_ knows. Any list, any detail view, any tooltip showing that row can render the pending hint without coordinating with whoever fired the mutation.
+
+This is the pattern Linear, Notion, and Figma converge on. The entity carries its own optimistic metadata. Components read it. Done.
+
+<Reading url="https://tanstack.com/query/latest/docs/framework/react/guides/optimistic-updates" title="Optimistic Updates — official guide" kind="docs" minutes={9} />
+<Reading url="https://tkdodo.eu/blog/mastering-mutations-in-react-query" title="Mastering Mutations in React Query" author="TkDodo" kind="blog" minutes={12} />
+<Reading url="https://www.figma.com/blog/how-figmas-multiplayer-technology-works/" title="How Figma's multiplayer technology works" kind="blog" minutes={15} />
+
+**Remember this:** Three states (pending, confirmed, rolled-back), two sources of truth (cache, server), five reconciliation points (`onMutate`, request, `onSuccess`, `onError`, `onSettled`). Draw the diagram before you write the code.

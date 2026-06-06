@@ -1,0 +1,82 @@
+import type { ModuleDef } from "../../types";
+
+export const optimisticUpdatesModule: ModuleDef = {
+  slug: "optimistic-updates",
+  track: "frontend",
+  orderIndex: 3,
+  title: "Optimistic Updates",
+  summary: "Tanstack Query mutations, rollback, and the UX of being wrong.",
+  estMinutes: 263,
+  sections: [
+    {
+      slug: "why",
+      title: "Why optimistic updates",
+      kind: "why",
+      estMinutes: 7,
+      bodyMdxPath: "modules/optimistic-updates/sections/why.mdx",
+    },
+    {
+      slug: "mental-model",
+      title: "The mental model",
+      kind: "concept",
+      estMinutes: 10,
+      bodyMdxPath: "modules/optimistic-updates/sections/mental-model.mdx",
+    },
+    {
+      slug: "tanstack-query",
+      title: "Tanstack Query mutations",
+      kind: "concept",
+      estMinutes: 14,
+      bodyMdxPath: "modules/optimistic-updates/sections/tanstack-query.mdx",
+    },
+    {
+      slug: "rollback",
+      title: "Rollback patterns",
+      kind: "pattern",
+      estMinutes: 12,
+      bodyMdxPath: "modules/optimistic-updates/sections/rollback.mdx",
+    },
+    {
+      slug: "conflict-ux",
+      title: "Conflict UX",
+      kind: "pattern",
+      estMinutes: 11,
+      bodyMdxPath: "modules/optimistic-updates/sections/conflict-ux.mdx",
+    },
+    {
+      slug: "tradeoffs",
+      title: "When NOT to be optimistic",
+      kind: "tradeoff",
+      estMinutes: 8,
+      bodyMdxPath: "modules/optimistic-updates/sections/tradeoffs.mdx",
+    },
+    {
+      slug: "gotchas",
+      title: "Production gotchas",
+      kind: "gotcha",
+      estMinutes: 10,
+      bodyMdxPath: "modules/optimistic-updates/sections/gotchas.mdx",
+    },
+    {
+      slug: "mini-project",
+      title: "Optimistic todo app",
+      kind: "mini_project",
+      estMinutes: 180,
+      bodyMdxPath: "modules/optimistic-updates/sections/mini-project.mdx",
+    },
+    {
+      slug: "quiz",
+      title: "Self-check",
+      kind: "quiz",
+      estMinutes: 7,
+      bodyMdxPath: "modules/optimistic-updates/sections/quiz.mdx",
+    },
+    {
+      slug: "cheatsheet",
+      title: "Cheatsheet",
+      kind: "cheatsheet",
+      estMinutes: 4,
+      bodyMdxPath: "modules/optimistic-updates/sections/cheatsheet.mdx",
+    },
+  ],
+};

@@ -1,0 +1,275 @@
+---
+title: Tanstack Query mutations
+---
+
+<SectionHeader kind="concept" number={3} title="Tanstack Query mutations" />
+
+Tanstack Query (TQ) is the de-facto mutation runtime for React apps in 2026. It gives you exactly the lifecycle hooks the mental model needs: `onMutate` for the optimistic write, `onError` for rollback, `onSuccess` for server reconciliation, `onSettled` for invalidation. Nothing fancier than that — but the discipline is real.
+
+This section walks through the canonical `toggleTodo` mutation end to end, then layers on the production knobs.
+
+## The four callbacks, ranked by importance
+
+1. **`onMutate(variables)`** — fires _before_ the network request. This is where the optimistic write happens. Returns a context object passed to the other callbacks.
+2. **`onError(err, variables, context)`** — fires if the mutation throws. This is where you restore the snapshot from `context`.
+3. **`onSuccess(data, variables, context)`** — fires when the mutation resolves. This is where you reconcile cache with the server's response (e.g., swap temp ID for real ID).
+4. **`onSettled(data, err, variables, context)`** — always fires last. This is where you invalidate queries to trigger a background refetch.
+
+That ordering is also the order they fire in. Build that mental clock now.
+
+## A complete toggle mutation, typed
+
+This is the pattern. Read it once at full speed, then we'll annotate.
+
+<Code lang="ts" file="src/api/todos.ts">{`export type Todo = {
+  id: string;
+  title: string;
+  done: boolean;
+};
+
+export const todosKey = ["todos"] as const;
+
+export async function fetchTodos(): Promise<Todo[]> {
+  const res = await fetch("/api/todos");
+  if (!res.ok) throw new Error("Failed to load todos");
+  return res.json();
+}
+
+export async function patchTodo(input: { id: string; done: boolean }): Promise<Todo> {
+  const res = await fetch(\`/api/todos/\${input.id}\`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ done: input.done }),
+  });
+  if (!res.ok) throw new Error(\`PATCH /todos/\${input.id} failed: \${res.status}\`);
+  return res.json();
+}`}</Code>
+
+<Code lang="ts" file="src/hooks/useToggleTodo.ts">{`import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { patchTodo, todosKey, type Todo } from "../api/todos";
+
+export function useToggleTodo() {
+  const qc = useQueryClient();
+
+  return useMutation({
+    mutationFn: patchTodo,
+
+    // 1) Optimistic write
+    onMutate: async (input) => {
+      // Stop any inflight refetch from stomping our optimistic write.
+      await qc.cancelQueries({ queryKey: todosKey });
+
+      // Snapshot the previous value so we can roll back.
+      const previous = qc.getQueryData<Todo[]>(todosKey);
+
+      // Write the guess to the cache.
+      qc.setQueryData<Todo[]>(todosKey, (old) =>
+        (old ?? []).map((t) => (t.id === input.id ? { ...t, done: input.done } : t)),
+      );
+
+      // Return context for the other callbacks.
+      return { previous };
+    },
+
+    // 2) Rollback on failure
+    onError: (_err, _input, context) => {
+      if (context?.previous) {
+        qc.setQueryData(todosKey, context.previous);
+      }
+    },
+
+    // 3) Server reconciliation (usually no-op for a toggle; the
+    //    server response is the same shape we already wrote)
+    onSuccess: (serverTodo) => {
+      qc.setQueryData<Todo[]>(todosKey, (old) =>
+        (old ?? []).map((t) => (t.id === serverTodo.id ? serverTodo : t)),
+      );
+    },
+
+    // 4) Invalidate to pick up any drift the server introduced
+    //    (updatedAt, version numbers, computed fields)
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: todosKey });
+    },
+  });
+}`}</Code>
+
+Use it like this:
+
+<Code lang="tsx" file="src/components/TodoRow.tsx">{`import { useToggleTodo } from "../hooks/useToggleTodo";
+import type { Todo } from "../api/todos";
+
+export function TodoRow({ todo }: { todo: Todo }) {
+  const toggle = useToggleTodo();
+  return (
+    <li>
+      <input
+        type="checkbox"
+        checked={todo.done}
+        onChange={() => toggle.mutate({ id: todo.id, done: !todo.done })}
+      />
+      {todo.title}
+    </li>
+  );
+}`}</Code>
+
+That's the whole thing. The component has no idea the mutation is optimistic. It dispatches the intent, the cache flips, the row re-renders. Latency stops mattering.
+
+## Why each callback exists
+
+Walk back through them, one at a time, with the bugs each one prevents.
+
+### `cancelQueries` — the silent foundation
+
+`qc.cancelQueries({ queryKey: todosKey })` cancels any in-flight `fetchTodos` request before you write the optimistic value. Without it, this sequence happens:
+
+1. A `useQuery(todos)` is mid-refetch (started 50ms ago).
+2. User clicks toggle. `onMutate` writes optimistic value.
+3. The in-flight refetch lands 100ms later with stale server data.
+4. TQ stores the stale data. The cache reverts. The checkbox flips back. The user is confused.
+
+`cancelQueries` aborts that in-flight refetch. The optimistic write stays put until your own mutation lands. This is one of the top three bugs in production optimistic code. Always cancel first.
+
+### `getQueryData` — the snapshot
+
+`qc.getQueryData<Todo[]>(todosKey)` reads the current cache synchronously. You hold onto this so you can restore it later. Pass it back via the context object.
+
+**Type the snapshot.** `getQueryData` returns `unknown` by default. The `<Todo[]>` generic narrows it. If you forget, your `onError` restore writes `unknown` back into the cache and downstream typing falls apart.
+
+### `setQueryData` — the optimistic write
+
+`qc.setQueryData(key, updater)` writes to the cache. The updater receives the previous value and returns the new one. **Always use the updater function**, never the value form, when computing from current state:
+
+<Code lang="ts" file="setQueryData-forms.ts">{`// BAD: race condition if two mutations fire in quick succession
+qc.setQueryData(todosKey, [...previous, newTodo]);
+
+// GOOD: TQ guarantees you see the current value
+qc.setQueryData<Todo[]>(todosKey, (old) => [...(old ?? []), newTodo]);`}</Code>
+
+The updater form is your insurance against two mutations stepping on each other.
+
+### `onError` — restore the snapshot
+
+`context.previous` is the value `onMutate` returned. Restore it with `setQueryData`. That's it.
+
+Two things to watch:
+- **Check `context` is defined.** It's `undefined` if `onMutate` itself threw.
+- **Don't try to "selectively undo."** Restore the whole snapshot. You can't reliably figure out what changed in the cache between `onMutate` and `onError` — other mutations might have landed.
+
+### `onSuccess` — reconcile with the server
+
+This is where you swap any guessed values for canonical server values. For a toggle, the server response usually has the same `done: true` you already wrote, plus updated `updatedAt`. Writing it again is cheap; the diff is invisible to React.
+
+For a `create` mutation, this is where you swap the temp ID for the real one. (Whole pattern in the next section.)
+
+### `onSettled` — invalidate
+
+`invalidateQueries` marks the cache as stale and triggers a background refetch. Why even bother if `onSuccess` already wrote the right value?
+
+Because the server might have changed _adjacent_ data. Toggling a todo might update a project's "completion percentage" computed field that lives on a different query. Invalidating broadly catches that drift without you having to enumerate every dependent query.
+
+In practice: invalidate the same key in `onSettled`. If you have related keys, invalidate those too. The cost is a background fetch the user never sees.
+
+## A complete create mutation with temp IDs
+
+The toggle pattern doesn't need temp IDs because the entity already has one. For creates, you need a client-generated placeholder ID that you replace when the server responds.
+
+<Code lang="ts" file="src/hooks/useAddTodo.ts">{`import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { nanoid } from "nanoid";
+import { todosKey, type Todo } from "../api/todos";
+
+async function createTodo(input: { title: string }): Promise<Todo> {
+  const res = await fetch("/api/todos", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error("Failed to create todo");
+  return res.json();
+}
+
+export function useAddTodo() {
+  const qc = useQueryClient();
+
+  return useMutation({
+    mutationFn: createTodo,
+
+    onMutate: async (input) => {
+      await qc.cancelQueries({ queryKey: todosKey });
+      const previous = qc.getQueryData<Todo[]>(todosKey);
+
+      const tempId = \`tmp_\${nanoid()}\`;
+      const optimisticTodo: Todo = {
+        id: tempId,
+        title: input.title,
+        done: false,
+      };
+
+      qc.setQueryData<Todo[]>(todosKey, (old) => [...(old ?? []), optimisticTodo]);
+
+      return { previous, tempId };
+    },
+
+    onError: (_err, _input, context) => {
+      if (context?.previous) qc.setQueryData(todosKey, context.previous);
+    },
+
+    onSuccess: (serverTodo, _input, context) => {
+      // Replace the temp row with the server's canonical row.
+      qc.setQueryData<Todo[]>(todosKey, (old) =>
+        (old ?? []).map((t) => (t.id === context?.tempId ? serverTodo : t)),
+      );
+    },
+
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: todosKey });
+    },
+  });
+}`}</Code>
+
+Notice `tempId` flows from `onMutate` through context into `onSuccess`. The component never sees it. The cache briefly contains an entity with an ID like `tmp_aBcD123` — that's fine as long as no one mutates it before `onSuccess` lands. (More on that race in gotchas.)
+
+## The `useMutationState` hook — observing pending mutations
+
+Sometimes a component _other than_ the one that fired the mutation wants to show pending state. A header counter showing "saving 3 changes…" doesn't know which mutations are in flight. `useMutationState` gives you that:
+
+<Code lang="tsx" file="src/components/SaveIndicator.tsx">{`import { useMutationState } from "@tanstack/react-query";
+
+export function SaveIndicator() {
+  const pending = useMutationState({
+    filters: { status: "pending" },
+  });
+  if (pending.length === 0) return null;
+  return <span>Saving {pending.length}…</span>;
+}`}</Code>
+
+You can filter by mutation key (set `mutationKey` on each `useMutation`) to scope to a specific feature.
+
+## Set a default mutation cache handler — optional, powerful
+
+For a large app, wiring `onError → toast` into every mutation gets tedious. `MutationCache` lets you set a global hook:
+
+<Code lang="ts" file="src/main.tsx">{`import { QueryClient, MutationCache } from "@tanstack/react-query";
+import { toast } from "sonner";
+
+export const queryClient = new QueryClient({
+  mutationCache: new MutationCache({
+    onError: (err, _vars, _ctx, mutation) => {
+      // Per-mutation onError already ran. This is for app-wide UX.
+      toast.error(err instanceof Error ? err.message : "Something went wrong");
+    },
+  }),
+});`}</Code>
+
+Now every mutation that doesn't override gets a default toast on failure. Individual mutations can still set their own `onError` (it runs first, then the cache-level one).
+
+<Callout kind="pattern">
+  The discipline: every optimistic mutation needs all four callbacks, in this order. `onMutate` cancels, snapshots, writes. `onError` restores. `onSuccess` reconciles (especially for server-assigned fields). `onSettled` invalidates. Skip any of them and you have a bug, even if the demo looks fine. Make it muscle memory.
+</Callout>
+
+<Reading url="https://tanstack.com/query/latest/docs/framework/react/guides/mutations" title="Tanstack Query — Mutations" kind="docs" minutes={10} />
+<Reading url="https://tanstack.com/query/latest/docs/framework/react/guides/optimistic-updates" title="Tanstack Query — Optimistic Updates" kind="docs" minutes={8} />
+<Reading url="https://tkdodo.eu/blog/mastering-mutations-in-react-query" title="Mastering Mutations in React Query" author="TkDodo" kind="blog" minutes={12} />
+<Reading url="https://tkdodo.eu/blog/optimistic-updates-in-react-query" title="Optimistic Updates in React Query" author="TkDodo" kind="blog" minutes={10} />
+
+**Remember this:** `onMutate` → cancel, snapshot, write. `onError` → restore. `onSuccess` → reconcile (especially temp IDs). `onSettled` → invalidate. Four callbacks, one pattern, every mutation.

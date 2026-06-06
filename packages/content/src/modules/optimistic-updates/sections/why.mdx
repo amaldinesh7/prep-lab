@@ -1,0 +1,91 @@
+---
+title: Why optimistic updates
+---
+
+<SectionHeader kind="why" number={1} title="Why optimistic updates" />
+
+There's a wall in user-facing software at around 100 milliseconds. Under it, interactions feel like part of the user's body — the click _is_ the result. Over it, the user notices the delay. Over 300ms, the interface feels slow. Over a second, it feels broken, and your users start double-clicking, refreshing, and filing tickets.
+
+Almost no production API responds in under 100ms once you account for the round trip, the load balancer, the service mesh, the database, and the wire back to the browser. A "fast" mutation in 2026 is 200–400ms on a good day and 1–2 seconds on a bad one. The naive React pattern — call the mutation, show a spinner, wait, update state — loses every time on every interaction.
+
+## The naive flow loses
+
+Look at the default React pattern for a toggle:
+
+<Code lang="tsx" file="naive-toggle.tsx">{`function TodoRow({ todo }: { todo: Todo }) {
+  const [pending, setPending] = useState(false);
+
+  async function onToggle() {
+    setPending(true);
+    await fetch(\`/api/todos/\${todo.id}/toggle\`, { method: "POST" });
+    await refetchTodos();
+    setPending(false);
+  }
+
+  return (
+    <li>
+      <input type="checkbox" checked={todo.done} disabled={pending} onChange={onToggle} />
+      {todo.title}
+    </li>
+  );
+}`}</Code>
+
+What the user experiences: click, checkbox freezes in its old position, 400ms of nothing, checkbox flips. That 400ms gap is the gap between Notion and a 2014 admin panel. It's the gap between "feels native" and "feels like a website."
+
+Worse, the user isn't sure what just happened. Did the click register? Should they click again? They click again. Now you have a race.
+
+## The optimistic move
+
+Optimistic updates flip the order. You assume the server will say yes, update the UI immediately, fire the request in the background, and reconcile if reality disagrees. The same toggle, optimistically:
+
+<Code lang="tsx" file="optimistic-toggle.tsx">{`function TodoRow({ todo }: { todo: Todo }) {
+  const toggle = useToggleTodo(); // typed mutation, see next section
+
+  return (
+    <li>
+      <input
+        type="checkbox"
+        checked={todo.done}
+        onChange={() => toggle.mutate(todo.id)}
+      />
+      {todo.title}
+    </li>
+  );
+}`}</Code>
+
+The checkbox flips on click. The network request is invisible. The user moves on. If the server returns 200, nothing changes. If the server returns 500, the checkbox flips back and a small toast says "couldn't save — try again." The 99% case feels instant; the 1% case is honestly handled.
+
+That's the trade. You give up "guaranteed-correct UI at every frame" and buy "interactions feel instant 99% of the time."
+
+## Why this isn't just "show a spinner faster"
+
+Three things make optimistic UI fundamentally different from speeding up loading states:
+
+1. **The cache is the source of truth that the UI reads.** You stop binding components to mutation state. You bind them to cached data. Mutations write to the cache; components re-render. Latency stops leaking into the UI.
+2. **There's a guess and a confirmation.** You're betting on an outcome. That bet has a rollback when it loses. You can't just "handle the error" — you have to undo the optimistic write.
+3. **The user's mental model becomes the model of truth.** They saw the checkbox flip. They believe it flipped. If you have to walk that back, the UX is _how_ you walk it back, not whether you do.
+
+Almost all of the "optimistic update" code in the wild gets the first two right and ignores the third. That's why most of it is subtly broken.
+
+<Callout kind="why">
+  Optimistic updates exist because network latency is a tax on every interaction, and the tax is unaffordable above ~100ms. You pay the cost in client-side complexity — a cache that knows about pending state, a rollback story, a way to reconcile when the server's truth differs from your guess. In return, your product stops feeling like a website and starts feeling like an app. For agentic and collaborative software, where users issue many small actions per minute, this isn't a polish item. It's the difference between adoption and abandonment.
+</Callout>
+
+## What you're signing up to learn
+
+The rest of this module covers, in order:
+
+- The state model — pending, confirmed, rolled-back — that you need in your head before you write a line of code.
+- Tanstack Query's mutation API — `onMutate`, `onError`, `onSettled`, `setQueryData`, `cancelQueries` — and how they map to that state model.
+- Rollback patterns, including the production trick of replacing client-generated temporary IDs with server-assigned ones.
+- Conflict UX — toast vs inline vs modal — and the four outcomes every mutation can land in.
+- When _not_ to be optimistic (payments, AI completions, search).
+- The race conditions and stomping bugs that bite teams in production.
+
+By the end you'll know why most of the "optimistic" code in the wild looks fine in a demo and breaks in week three.
+
+<Reading url="https://www.nngroup.com/articles/response-times-3-important-limits/" title="Response Times: The 3 Important Limits" author="Jakob Nielsen" kind="blog" minutes={6} />
+<Reading url="https://tkdodo.eu/blog/optimistic-updates-in-react-query" title="Optimistic Updates in React Query" author="Dominik Dorfmeister (TkDodo)" kind="blog" minutes={10} />
+<Reading url="https://linear.app/blog/scaling-the-linear-sync-engine" title="Scaling the Linear Sync Engine" kind="blog" minutes={14} />
+
+**Remember this:** Latency is the enemy. Optimistic updates trade client-side complexity for an interface that feels instant. The complexity isn't optional — but it is bounded, and the patterns repeat.

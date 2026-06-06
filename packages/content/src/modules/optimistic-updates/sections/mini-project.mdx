@@ -1,0 +1,410 @@
+---
+title: Optimistic todo app
+---
+
+<SectionHeader kind="mini_project" number={8} title="Optimistic todo app" />
+
+A 3-hour build that exercises every part of the module: optimistic add (with temp IDs), optimistic toggle (with snapshot rollback), optimistic delete (with a 5s undo grace period), and a forced conflict scenario where the server has a newer version than your client.
+
+The trick is the fake server. Instead of a real backend, you'll build a Tanstack Query-friendly in-memory store with two production-feeling behaviors: an 800ms artificial delay and a 10% random failure rate. Every interaction you ship at work has those two characteristics; most demos don't, and that's why most demos lie.
+
+<ProjectCard hours="3" starter="./starter">
+
+## Goal
+
+Build a single-page todo app where every interaction feels instant — even though every mutation actually takes 800ms and 1 in 10 fails. You should be able to:
+
+- Add a todo and keep typing the next one while the first is still saving.
+- Toggle a row and see it flip immediately. When it fails (occasionally), see it flip back with a toast.
+- Delete a row with a 5-second undo window. Clicking undo restores it. Letting the timer expire commits the delete.
+- Trigger a "conflict" — the server returns a newer version of a row than your optimistic write — and resolve it without losing data.
+
+## Steps
+
+### 1. Scaffold
+
+```bash
+bun create vite optimistic-todos --template react-ts
+cd optimistic-todos
+bun add @tanstack/react-query nanoid sonner
+bun add -D @tanstack/react-query-devtools
+```
+
+### 2. The fake server
+
+Build the latency + failure layer first. Everything else stacks on top.
+
+```ts
+// src/api/fakeServer.ts
+import { nanoid } from "nanoid";
+
+export type Todo = {
+  id: string;
+  title: string;
+  done: boolean;
+  version: number; // for conflict detection
+};
+
+let store: Todo[] = [
+  { id: "seed_1", title: "Read the optimistic updates module", done: true, version: 1 },
+  { id: "seed_2", title: "Build this todo app", done: false, version: 1 },
+];
+
+const LATENCY_MS = 800;
+const FAILURE_RATE = 0.1;
+
+function flaky<T>(work: () => T): Promise<T> {
+  return new Promise((resolve, reject) => {
+    setTimeout(() => {
+      if (Math.random() < FAILURE_RATE) {
+        reject(new Error("Simulated server failure"));
+        return;
+      }
+      try {
+        resolve(work());
+      } catch (e) {
+        reject(e);
+      }
+    }, LATENCY_MS);
+  });
+}
+
+export const api = {
+  list: () => flaky(() => [...store]),
+
+  create: (input: { title: string }) =>
+    flaky(() => {
+      const todo: Todo = {
+        id: nanoid(),
+        title: input.title,
+        done: false,
+        version: 1,
+      };
+      store = [...store, todo];
+      return todo;
+    }),
+
+  patch: (input: { id: string; done: boolean; ifVersion: number }) =>
+    flaky(() => {
+      const existing = store.find((t) => t.id === input.id);
+      if (!existing) throw new Error("Not found");
+      if (existing.version !== input.ifVersion) {
+        const err = new Error("Conflict") as Error & { code?: string; server?: Todo };
+        err.code = "CONFLICT";
+        err.server = existing;
+        throw err;
+      }
+      const next: Todo = { ...existing, done: input.done, version: existing.version + 1 };
+      store = store.map((t) => (t.id === input.id ? next : t));
+      return next;
+    }),
+
+  remove: (input: { id: string }) =>
+    flaky(() => {
+      store = store.filter((t) => t.id !== input.id);
+      return { id: input.id };
+    }),
+
+  // Test helper — force a row to advance on the server without telling the client.
+  // Use this from the devtools to simulate a collaborator's edit.
+  bumpVersion: (id: string) => {
+    store = store.map((t) =>
+      t.id === id ? { ...t, version: t.version + 1, done: !t.done } : t,
+    );
+  },
+};
+```
+
+Note `ifVersion`: every PATCH must declare the version it expects to be writing to. The server compares; if drift, it 409s. This is the optimistic concurrency pattern from the conflict UX section, in twelve lines.
+
+### 3. Wire Tanstack Query
+
+```tsx
+// src/main.tsx
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { QueryClient, QueryClientProvider, MutationCache } from "@tanstack/react-query";
+import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
+import { Toaster, toast } from "sonner";
+import { App } from "./App";
+
+export const queryClient = new QueryClient({
+  mutationCache: new MutationCache({
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : "Something went wrong");
+    },
+  }),
+  defaultOptions: {
+    queries: { staleTime: 30_000, refetchOnWindowFocus: false },
+  },
+});
+
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <App />
+      <Toaster richColors position="bottom-right" />
+      <ReactQueryDevtools />
+    </QueryClientProvider>
+  </StrictMode>,
+);
+```
+
+`refetchOnWindowFocus: false` keeps the focus-stomp gotcha out of the project. Turn it back on at the end to see the bug.
+
+### 4. `addTodo` — temp ID + replace flow
+
+```ts
+// src/hooks/useAddTodo.ts
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { api, type Todo } from "../api/fakeServer";
+
+export const todosKey = ["todos"] as const;
+
+export function useAddTodo() {
+  const qc = useQueryClient();
+
+  return useMutation({
+    mutationFn: api.create,
+
+    onMutate: async (input) => {
+      await qc.cancelQueries({ queryKey: todosKey });
+      const previous = qc.getQueryData<Todo[]>(todosKey);
+
+      const tempId = `tmp_${crypto.randomUUID()}`;
+      const optimistic: Todo = {
+        id: tempId,
+        title: input.title,
+        done: false,
+        version: 0, // 0 means "not yet persisted"
+      };
+      qc.setQueryData<Todo[]>(todosKey, (old) => [...(old ?? []), optimistic]);
+
+      return { previous, tempId };
+    },
+
+    onError: (_err, _input, ctx) => {
+      if (ctx?.previous) qc.setQueryData(todosKey, ctx.previous);
+    },
+
+    onSuccess: (serverTodo, _input, ctx) => {
+      qc.setQueryData<Todo[]>(todosKey, (old) =>
+        (old ?? []).map((t) => (t.id === ctx?.tempId ? serverTodo : t)),
+      );
+    },
+
+    onSettled: () => qc.invalidateQueries({ queryKey: todosKey }),
+  });
+}
+```
+
+Test it: type a title, hit enter. The row appears instantly with a `tmp_` ID. 800ms later, the ID swaps. Type a second title before the first lands — both should resolve cleanly.
+
+### 5. `toggleTodo` — snapshot rollback + conflict surfacing
+
+```ts
+// src/hooks/useToggleTodo.ts
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { api, type Todo } from "../api/fakeServer";
+import { toast } from "sonner";
+import { todosKey } from "./useAddTodo";
+
+export function useToggleTodo() {
+  const qc = useQueryClient();
+
+  return useMutation({
+    mutationFn: (input: { id: string; done: boolean; ifVersion: number }) =>
+      api.patch(input),
+
+    onMutate: async (input) => {
+      await qc.cancelQueries({ queryKey: todosKey });
+      const previous = qc.getQueryData<Todo[]>(todosKey);
+      qc.setQueryData<Todo[]>(todosKey, (old) =>
+        (old ?? []).map((t) => (t.id === input.id ? { ...t, done: input.done } : t)),
+      );
+      return { previous };
+    },
+
+    onError: (err, _input, ctx) => {
+      // Conflict gets surfaced specially. Other errors just roll back.
+      const conflict = err as Error & { code?: string; server?: Todo };
+      if (conflict.code === "CONFLICT" && conflict.server) {
+        qc.setQueryData<Todo[]>(todosKey, (old) =>
+          (old ?? []).map((t) => (t.id === conflict.server!.id ? conflict.server! : t)),
+        );
+        toast("Updated on the server — refreshed your view", { duration: 4000 });
+        return;
+      }
+      if (ctx?.previous) qc.setQueryData(todosKey, ctx.previous);
+    },
+
+    onSuccess: (serverTodo) => {
+      qc.setQueryData<Todo[]>(todosKey, (old) =>
+        (old ?? []).map((t) => (t.id === serverTodo.id ? serverTodo : t)),
+      );
+    },
+
+    onSettled: () => qc.invalidateQueries({ queryKey: todosKey }),
+  });
+}
+```
+
+The conflict branch is the production move. Server has a newer version → don't roll back, replace with the server's truth and tell the user what happened. Refetching isn't enough here — the user just clicked, and the response should land on their action.
+
+### 6. `deleteTodo` — undo toast with 5s grace period
+
+This one doesn't use `useMutation` directly because the network call is deferred. The hook returns a callable.
+
+```ts
+// src/hooks/useDeleteTodoWithUndo.ts
+import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+import { api, type Todo } from "../api/fakeServer";
+import { todosKey } from "./useAddTodo";
+
+const UNDO_MS = 5000;
+
+export function useDeleteTodoWithUndo() {
+  const qc = useQueryClient();
+
+  return (todo: Todo) => {
+    const previous = qc.getQueryData<Todo[]>(todosKey);
+    qc.setQueryData<Todo[]>(todosKey, (old) =>
+      (old ?? []).filter((t) => t.id !== todo.id),
+    );
+
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      if (cancelled) return;
+      try {
+        await api.remove({ id: todo.id });
+        qc.invalidateQueries({ queryKey: todosKey });
+      } catch (err) {
+        qc.setQueryData(todosKey, previous);
+        toast.error("Couldn't delete — restored");
+      }
+    }, UNDO_MS);
+
+    toast(`Deleted "${todo.title}"`, {
+      duration: UNDO_MS,
+      action: {
+        label: "Undo",
+        onClick: () => {
+          cancelled = true;
+          clearTimeout(timer);
+          qc.setQueryData(todosKey, previous);
+        },
+      },
+    });
+  };
+}
+```
+
+The mutation fires only after the grace period elapses without an undo. If the network call fails after the toast is gone, restore quietly and re-toast — the user already moved on.
+
+### 7. Compose the UI
+
+```tsx
+// src/App.tsx
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { api, type Todo } from "./api/fakeServer";
+import { todosKey, useAddTodo } from "./hooks/useAddTodo";
+import { useToggleTodo } from "./hooks/useToggleTodo";
+import { useDeleteTodoWithUndo } from "./hooks/useDeleteTodoWithUndo";
+
+export function App() {
+  const { data: todos = [] } = useQuery({ queryKey: todosKey, queryFn: api.list });
+  const add = useAddTodo();
+  const toggle = useToggleTodo();
+  const remove = useDeleteTodoWithUndo();
+  const [draft, setDraft] = useState("");
+
+  return (
+    <main style={{ padding: 24, maxWidth: 520, margin: "0 auto" }}>
+      <h1>Optimistic todos</h1>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!draft.trim()) return;
+          add.mutate({ title: draft.trim() });
+          setDraft("");
+        }}
+      >
+        <input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder="What needs doing?"
+        />
+        <button type="submit">Add</button>
+      </form>
+
+      <ul>
+        {todos.map((t) => {
+          const pending = t.id.startsWith("tmp_");
+          return (
+            <li key={t.id} style={{ opacity: pending ? 0.6 : 1 }}>
+              <input
+                type="checkbox"
+                checked={t.done}
+                disabled={pending}
+                onChange={() =>
+                  toggle.mutate({ id: t.id, done: !t.done, ifVersion: t.version })
+                }
+              />
+              <span style={{ textDecoration: t.done ? "line-through" : "none" }}>
+                {t.title}
+              </span>
+              <button onClick={() => remove(t)} disabled={pending}>
+                Delete
+              </button>
+              {pending && <small style={{ marginLeft: 8 }}>saving…</small>}
+            </li>
+          );
+        })}
+      </ul>
+    </main>
+  );
+}
+```
+
+The pending hint (opacity + "saving…") is the small UX detail that separates "looks instant" from "is honest about state."
+
+### 8. Force a conflict
+
+Open the React Query devtools. In a console:
+
+```js
+// While the page is open
+window.__bump = (id) => import("./src/api/fakeServer").then((m) => m.api.bumpVersion(id));
+```
+
+(or expose `api` on `window` directly in dev). Pick an existing todo ID from the devtools cache view. Call `__bump("seed_2")`. The server now has `version: 2`. Toggle that row in the UI — your client sends `ifVersion: 1`. The server 409s. The `onError` handler detects `CONFLICT`, swaps in the server's version, and toasts. The row reflects truth without you reloading.
+
+This is the whole point of the conflict pattern. The action wasn't wasted; the user wasn't lied to.
+
+## Stretch goals
+
+- **Persist the pending queue to IndexedDB.** Use `idb-keyval`. On `onMutate`, write a record `{ kind, input, ts }`. On `onSuccess`/`onError`, remove it. On app start, replay any leftover records. Now if the user closes the tab mid-mutation, their work survives. (This is roughly how Linear, Things, and Notion implement local-first.)
+- **Pending count in the header.** Use `useMutationState({ filters: { status: "pending" } })` to render "Saving 2 changes…" while any mutation is in flight.
+- **Mutation scope.** Add `scope: { id: \`todo-\${todoId}\` }` to `useToggleTodo` so two clicks on the same row queue instead of racing. Verify by clicking a checkbox five times rapidly — should resolve to the final state, not flicker.
+- **Convert delete to use `useMutation` properly.** Move the network call into a mutation and use `mutationKey` to dedupe. The undo timer becomes the "should I actually call `mutate`?" gate.
+- **Failure-rate slider.** Add a dev panel to set `FAILURE_RATE` live. Push it to 50% and watch every UX seam strain.
+
+## What to internalize
+
+When you finish, you should be able to answer without looking:
+
+- Which callback writes the optimistic value? Which one rolls it back? Which one fires the invalidation?
+- Why does `addTodo` need a temp ID but `toggleTodo` doesn't?
+- What does the `ifVersion` parameter buy you, and what would break without it?
+- Why is the delete network call deferred 5 seconds instead of fired immediately with rollback?
+- If `onMutate` throws, what's the state of `context` in `onError`?
+
+If those answers feel obvious, you have the muscle memory the module was trying to install.
+
+</ProjectCard>
+
+<Reading url="https://tanstack.com/query/latest/docs/framework/react/guides/optimistic-updates" title="Tanstack Query — Optimistic Updates" kind="docs" minutes={8} />
+<Reading url="https://tkdodo.eu/blog/optimistic-updates-in-react-query" title="Optimistic Updates in React Query" author="TkDodo" kind="blog" minutes={10} />
+<Reading url="https://sonner.emilkowal.ski/" title="Sonner — toasts with actions" kind="docs" minutes={4} />

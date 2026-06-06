@@ -1,0 +1,24 @@
+---
+title: Cheatsheet
+---
+
+<SectionHeader kind="cheatsheet" number={10} title="Cheatsheet" />
+
+Keep this open while writing your first dozen mutations. The patterns repeat.
+
+<Cheatsheet rows={[
+  { k: "Cache write", v: "qc.setQueryData(key, (old) => next) — always use the updater form" },
+  { k: "Snapshot for rollback", v: "const previous = qc.getQueryData<Todo[]>(key) — type the generic" },
+  { k: "Cancel inflight refetch", v: "await qc.cancelQueries({ queryKey }) — first line of onMutate, always" },
+  { k: "Rollback", v: "Restore the snapshot from context in onError; don't try to selectively undo" },
+  { k: "Invalidate", v: "qc.invalidateQueries({ queryKey }) in onSettled — catches adjacent drift" },
+  { k: "Temp IDs", v: "Client-generate (nanoid / crypto.randomUUID); replace in onSuccess via context.tempId" },
+  { k: "Undo window", v: "Defer the network call 5s; restore from snapshot on undo click" },
+  { k: "Race protection", v: "scope: { id: `todo-${id}` } on useMutation — serializes same-entity mutations" },
+  { k: "Conflict signal", v: "Server returns 409 + current entity; client replaces optimistic value with server truth + toast" },
+  { k: "Skip optimism for", v: "Payments, AI completions, identity changes — anything where the server response IS the answer" },
+  { k: "Pending hint UI", v: "opacity: 0.6 + inline 'saving…' or spinner on the affected row" },
+  { k: "Toast on failure", v: "Describe what got rolled back — 'Couldn\\'t save toggle — restored' beats generic 'Error'" }
+]} />
+
+**Remember this:** Every optimistic mutation is four callbacks in one order. `onMutate` cancels, snapshots, writes. `onError` restores. `onSuccess` reconciles. `onSettled` invalidates. Skip any of them and you have a bug, even if the demo looks fine.

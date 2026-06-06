@@ -1,0 +1,228 @@
+---
+title: Conflict UX
+---
+
+<SectionHeader kind="pattern" number={5} title="Conflict UX" />
+
+The mechanics of rollback are decided. The UX of rollback is where products earn or lose trust. A user who saw a checkbox flip and then flip back, with no explanation, learns to distrust your interface. A user who sees the same thing accompanied by "couldn't save — try again" learns the system is honest. Same mechanic, different relationship.
+
+This section is about deciding, per mutation, what the user sees when reality disagrees with the optimistic write.
+
+## The four outcomes
+
+Every mutation lands in one of four buckets. The UX differs per bucket.
+
+| Outcome | Cause | User-visible action |
+|---|---|---|
+| **Success** | 2xx response | Nothing. The optimistic UI was right. |
+| **Temporary failure** | 5xx, timeout, offline | Retry silently. If retries exhaust, treat as permanent. |
+| **Permanent failure** | 4xx (400, 403, 404, 422) | Rollback + visible error. |
+| **Conflict** | 409, or 200 with stale-version response | Rollback + show the new server value, let the user reconcile. |
+
+The skill is recognizing which bucket you're in from the HTTP response, and writing UX that matches. Treating all errors as "permanent failure" is the lazy default; it's also why so many apps annoy users with toasts for transient blips.
+
+## Retry transient failures silently
+
+A 503 because your service mesh hiccupped is not the user's problem. Retry it.
+
+<Code lang="ts" file="retry-transient.ts">{`import { useMutation } from "@tanstack/react-query";
+
+useMutation({
+  mutationFn: patchTodo,
+  retry: (failureCount, error) => {
+    if (failureCount >= 3) return false;
+    if (error instanceof HttpError && error.status >= 400 && error.status < 500) {
+      return false; // 4xx is permanent — don't retry
+    }
+    return true; // 5xx, network errors — retry
+  },
+  retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 8000), // exponential backoff, cap 8s
+});`}</Code>
+
+TQ's `retry` runs _before_ `onError` fires. The user sees nothing during retries — the optimistic UI is still there, the mutation is just slower. If retries exhaust, `onError` runs and you handle as permanent.
+
+Pair this with an `HttpError` class so you can branch on `status`. Don't string-match error messages.
+
+## Toast vs inline vs modal — when each
+
+The three error UI patterns, in order of intrusiveness:
+
+### Toast (low-stakes, fire-and-forget)
+
+For mutations the user dispatched and moved on from. They toggled a checkbox, started typing in another row, scrolled away. A toast says "couldn't save — try again" in the corner. They can ignore it; they can click it to retry.
+
+Use for: toggles, autosave, reorders, label changes, low-value updates. Anything where the user won't sit and stare at the row that failed.
+
+<Code lang="tsx" file="toast-on-error.tsx">{`import { toast } from "sonner";
+
+useMutation({
+  mutationFn: patchTodo,
+  onMutate: optimisticPatch,
+  onError: (err, input, ctx) => {
+    rollback(ctx);
+    toast.error("Couldn't update todo", {
+      action: { label: "Retry", onClick: () => mutate(input) },
+    });
+  },
+});`}</Code>
+
+### Inline (the user is looking at the failing row)
+
+For mutations where the failure affects something the user is currently focused on. A form they're filling, a row they're editing, a dialog they have open. The error sits on the thing that failed, not in a corner.
+
+Use for: form submissions, in-place edits, anything the user is actively working on.
+
+<Code lang="tsx" file="inline-error.tsx">{`function TodoRow({ todo }: { todo: Todo }) {
+  const [error, setError] = useState<string | null>(null);
+  const patch = useMutation({
+    mutationFn: patchTodo,
+    onMutate: optimisticPatch,
+    onError: (err, _input, ctx) => {
+      rollback(ctx);
+      setError(err instanceof Error ? err.message : "Couldn't save");
+    },
+    onSuccess: () => setError(null),
+  });
+
+  return (
+    <li>
+      <input
+        type="checkbox"
+        checked={todo.done}
+        onChange={() => patch.mutate({ id: todo.id, done: !todo.done })}
+      />
+      {todo.title}
+      {error && <span role="alert" style={{ color: "red", marginLeft: 8 }}>{error}</span>}
+    </li>
+  );
+}`}</Code>
+
+### Modal (irreversible or needs user decision)
+
+For mutations that need explicit acknowledgment, usually conflicts or destructive failures. A modal blocks. Use sparingly.
+
+Use for: edit conflicts ("someone else changed this — keep yours or theirs?"), destructive failures the user must address before continuing, payments that landed weirdly.
+
+<Code lang="tsx" file="conflict-modal.tsx">{`function ConflictModal({ yours, theirs, onResolve }: {
+  yours: Todo;
+  theirs: Todo;
+  onResolve: (winner: Todo) => void;
+}) {
+  return (
+    <Dialog open>
+      <h2>Someone else edited this todo</h2>
+      <p>Your version vs the latest from the server:</p>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+        <button onClick={() => onResolve(yours)}>
+          <strong>Keep yours:</strong> {yours.title}
+        </button>
+        <button onClick={() => onResolve(theirs)}>
+          <strong>Use theirs:</strong> {theirs.title}
+        </button>
+      </div>
+    </Dialog>
+  );
+}`}</Code>
+
+## The 409 conflict pattern
+
+Conflicts deserve their own treatment. A 409 means: "your mutation was based on a version of the data that's no longer current." Examples:
+
+- Two users editing the same doc; you saved last; their version is gone.
+- You and a teammate both checked off the same task; one of you "won."
+- The row was deleted between your read and your write.
+
+The server typically returns the new server-side value alongside the 409. The handling:
+
+<Code lang="ts" file="conflict-handler.ts">{`type ConflictResponse = { current: Todo };
+
+async function patchTodo(input: PatchTodoInput): Promise<Todo> {
+  const res = await fetch(\`/api/todos/\${input.id}\`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", "If-Match": input.version },
+    body: JSON.stringify(input.patch),
+  });
+  if (res.status === 409) {
+    const body = (await res.json()) as ConflictResponse;
+    throw new ConflictError("stale version", body.current);
+  }
+  if (!res.ok) throw new HttpError(\`PATCH failed: \${res.status}\`, res.status);
+  return res.json();
+}
+
+useMutation({
+  mutationFn: patchTodo,
+  onMutate: optimisticPatch,
+  onError: (err, _input, ctx) => {
+    rollback(ctx);
+    if (err instanceof ConflictError) {
+      // Update cache with the server's current value...
+      qc.setQueryData(["todo", err.current.id], err.current);
+      // ...and prompt the user to reconcile.
+      openConflictModal({ yours: ctx.optimisticPatch, theirs: err.current });
+    } else {
+      toast.error("Couldn't save");
+    }
+  },
+});`}</Code>
+
+The point: a conflict isn't a generic error. The server told you exactly what changed. Show the user. Let them choose.
+
+For features with high conflict frequency (collaborative editing), the right answer isn't 409 modals at all — it's CRDTs or operational transforms. But for 90% of CRUD-ish features, "rollback, fetch current, show user" is enough.
+
+## Don't punish the user with the rollback animation
+
+This is the subtle one. The mechanics work: optimistic write, server fails, restore snapshot. The UI flips back. Done.
+
+But _how_ the UI flips back matters. A 300ms "swoosh" animation between the optimistic state and the rolled-back state draws the eye, says "look at me, something failed," and makes the user feel like they made a mistake. They didn't. The server did.
+
+Better: snap the UI back instantly, show the error message with a brief fade-in. The rollback is a non-event; the error message is the event.
+
+<Code lang="tsx" file="rollback-without-fanfare.tsx">{`// BAD: animates the rollback
+<input
+  type="checkbox"
+  checked={todo.done}
+  className="transition-all duration-300"
+  onChange={onToggle}
+/>
+
+// GOOD: optimistic state is instant, rollback is instant, only the toast animates
+<input
+  type="checkbox"
+  checked={todo.done}
+  onChange={onToggle}
+/>`}</Code>
+
+The general principle: animations are for confirming what the user did. They're not for confirming what the server did to the user.
+
+## A pending visual hint that doesn't lie
+
+You'll often want to indicate that a row is mid-save. The goal is informational, not punitive. Opacity 0.6 plus maybe a small spinner is the production default:
+
+<Code lang="tsx" file="pending-hint.tsx">{`function TodoRow({ todo, isPending }: { todo: Todo; isPending: boolean }) {
+  return (
+    <li
+      style={{
+        opacity: isPending ? 0.6 : 1,
+        transition: "opacity 120ms ease",
+      }}
+    >
+      {/* ... */}
+      {isPending && <Spinner size={12} />}
+    </li>
+  );
+}`}</Code>
+
+Source `isPending` from `useMutationState` (filter by mutation key) or from a flag on the entity itself (`todo._pending === "update"`). Either works; the entity-flag approach scales better across views.
+
+What _not_ to do: disable the input while pending. The user just touched it; if they want to change it again, let them. Stacking mutations is fine as long as your race protection is in place (next section).
+
+<Callout kind="pattern">
+  Four outcomes, four UX patterns. Retry transient. Toast for low-stakes permanent failures. Inline for focused work. Modal for conflicts or destructive failures. Don't animate rollbacks. Don't disable inputs you just optimistically wrote to. The user's mental model is "I did the thing." Your UX should support that model when you're right and explain honestly when you're wrong.
+</Callout>
+
+<Reading url="https://tanstack.com/query/latest/docs/framework/react/guides/mutations#retry" title="TQ — Mutation Retry" kind="docs" minutes={4} />
+<Reading url="https://www.smashingmagazine.com/2018/08/scalable-react-design-systems/" title="Scalable error UI patterns" kind="blog" minutes={9} />
+<Reading url="https://daverupert.com/2017/11/happy-paths/" title="Happy paths and unhappy paths" author="Dave Rupert" kind="blog" minutes={5} />
+
+**Remember this:** Failures aren't all the same. Transient → retry silently. Permanent → toast or inline depending on focus. Conflict → fetch the server's value and let the user reconcile. Snap rollbacks instantly; animate only the message.

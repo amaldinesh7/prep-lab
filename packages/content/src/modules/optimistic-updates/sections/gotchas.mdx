@@ -1,0 +1,197 @@
+---
+title: Production gotchas
+---
+
+<SectionHeader kind="gotcha" number={7} title="Production gotchas" />
+
+These are the bugs every team hits in their first quarter shipping optimistic UI. Each one is a race condition, a forgotten step, or a misunderstood lifecycle. Knowing them lets you skip the afternoon-of-debugging tax.
+
+## 1. Forgetting `cancelQueries` — the silent stomp
+
+The bug: your optimistic write is correct. The cache flips. 50ms later, an in-flight refetch (started before the mutation) lands with stale server data. TQ writes it. Your optimistic value is gone. The checkbox flips back. The user is confused.
+
+Symptoms:
+- Optimistic UI "sometimes" reverts before the mutation lands
+- Worst on slow connections (refetches take longer; more chance to overlap)
+- Reproduces if you trigger a manual `refetch` then immediately click a toggle
+
+The fix: always `await qc.cancelQueries({ queryKey })` at the top of `onMutate`. Always. Make it the first line, before the snapshot, before the write.
+
+<Code lang="ts" file="cancel-first.ts">{`onMutate: async (input) => {
+  await qc.cancelQueries({ queryKey: todosKey }); // <-- first, always
+  const previous = qc.getQueryData<Todo[]>(todosKey);
+  qc.setQueryData<Todo[]>(todosKey, applyOptimistic(input));
+  return { previous };
+},`}</Code>
+
+If you're using `useQuery` with `refetchOnWindowFocus: true` (the default), this matters even more — switching tabs and back will fire a refetch that can stomp a pending mutation.
+
+## 2. Two mutations racing on the same key
+
+The bug: user clicks toggle twice fast. Two mutations fire. Each `onMutate` runs in order, but each snapshots the state at the moment _it_ ran. If the second mutation reads the cache after the first wrote but before the first resolved, the second's snapshot _includes the first's optimistic value_. Now if the second fails and restores, it restores the post-first-mutation state — not the original. The first mutation's optimistic value is preserved even though it might also be in flight.
+
+This gets gnarlier if mutation A succeeds and mutation B fails. B's `onError` restores B's snapshot — which is the state after A's optimistic write. Looks fine. Then A's `onSuccess` lands and reconciles. Still looks fine.
+
+Now flip it: A fails, B succeeds. A's `onError` restores A's snapshot — the original. But B already wrote optimistically based on A's result. Restoring A's snapshot blows away B's write. B's `onSuccess` then writes the server value. The UI flickers through three states.
+
+The defenses, in order:
+
+**Use the updater form of `setQueryData`.** Always. The updater sees the current cache, not a captured value.
+
+**Key mutations by entity + version.** If the server supports optimistic concurrency (a `version` or `If-Match` header), the second mutation 409s instead of stomping silently.
+
+**For high-conflict UI, serialize mutations per entity.** Use `useMutation`'s `mutationKey` and `scope` so TQ runs them one at a time per key:
+
+<Code lang="ts" file="serialized-mutations.ts">{`useMutation({
+  mutationFn: patchTodo,
+  mutationKey: ["patchTodo", todoId],
+  scope: { id: \`todo-\${todoId}\` }, // mutations with the same scope run sequentially
+  onMutate, onError, onSuccess, onSettled,
+});`}</Code>
+
+`scope.id` is the production trick. Same scope = same queue = no races. Different entities still parallelize.
+
+## 3. Optimistic delete + undo ordering
+
+The flow: user clicks delete. You optimistically remove the row. You show a toast: "Deleted. Undo." for 5 seconds. The mutation fires immediately — and the server deletes the row before the user can click undo.
+
+Two bugs in that paragraph. First, the mutation fires before the undo window expires. Second, even if you delay the network call, hitting "Undo" means writing the row back into the cache, but the entity reference might be lost.
+
+The right shape:
+
+<Code lang="ts" file="undo-delete.ts">{`function useDeleteTodoWithUndo() {
+  const qc = useQueryClient();
+
+  return (todo: Todo) => {
+    // 1) Optimistically remove from cache
+    const previous = qc.getQueryData<Todo[]>(todosKey);
+    qc.setQueryData<Todo[]>(todosKey, (old) =>
+      (old ?? []).filter((t) => t.id !== todo.id),
+    );
+
+    // 2) Schedule the actual deletion 5s out
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      if (cancelled) return;
+      try {
+        await fetch(\`/api/todos/\${todo.id}\`, { method: "DELETE" });
+        qc.invalidateQueries({ queryKey: todosKey });
+      } catch {
+        // Restore on failure
+        qc.setQueryData(todosKey, previous);
+        toast.error("Couldn't delete — restored");
+      }
+    }, 5000);
+
+    // 3) Toast with undo
+    toast("Deleted", {
+      duration: 5000,
+      action: {
+        label: "Undo",
+        onClick: () => {
+          cancelled = true;
+          clearTimeout(timer);
+          qc.setQueryData(todosKey, previous);
+        },
+      },
+    });
+  };
+}`}</Code>
+
+Three things to notice:
+
+- The network call is deferred 5s. The UI is immediate. The user has a real undo window.
+- The undo restores from the snapshot, not by re-creating the entity (which would lose any server-assigned fields the entity had).
+- If the user navigates away before the 5s expires, the timer still fires. (For a polished version: persist the pending delete to IndexedDB so it survives refresh — stretch goal in the mini-project.)
+
+## 4. Refetch-on-window-focus stomping optimistic state
+
+TQ's `refetchOnWindowFocus: true` is great for keeping data fresh. It's also the second-most-common stomp source.
+
+Scenario: user clicks toggle, switches tabs to check Slack, comes back. On focus, TQ refetches `todos`. The refetch was kicked off after the optimistic write, so `cancelQueries` from `onMutate` didn't catch it. The refetch lands with the pre-toggle server state. The UI reverts.
+
+Two mitigations:
+
+**Lower `staleTime` on queries that have frequent mutations.** Actually higher is better here — `staleTime: 30_000` means TQ doesn't auto-refetch on focus for 30 seconds after the last successful fetch. Adjust per query.
+
+**In the focus refetch flow, trust the cache.** If your mutation is still pending when focus fires, the right thing is for the refetch to be deferred. TQ does this internally if `mutationKey` shares the prefix with `queryKey`, but it's worth verifying for any tight-mutation flow. For the most stomp-prone queries, set `refetchOnWindowFocus: false` and rely on `invalidateQueries` after mutations for freshness.
+
+## 5. Server-assigned IDs leaking into the UI
+
+The bug: user creates a todo. Optimistic row appears with `id: "tmp_abc"`. Before `onSuccess` lands, the user clicks "Share" on the new row. Your share component opens with a URL containing `tmp_abc`. They copy the URL. They paste it in Slack. The recipient clicks. 404. The recipient blames you.
+
+The shape of the fix: every place that exposes an ID to the user or to a URL must check whether it's a temp ID and either disable the action or wait.
+
+<Code lang="tsx" file="hide-pending-actions.tsx">{`function TodoActions({ todo }: { todo: Todo }) {
+  const pending = todo.id.startsWith("tmp_");
+
+  return (
+    <div>
+      <button disabled={pending} onClick={() => copyShareLink(todo.id)}>
+        {pending ? "Saving…" : "Share"}
+      </button>
+      <button disabled={pending} onClick={() => assignTo(todo.id, currentUser)}>
+        Assign
+      </button>
+    </div>
+  );
+}`}</Code>
+
+Or, more rigorously, keep a "pending" flag on the entity and check that instead of string-prefixing the ID. Both work; the flag scales better.
+
+The strict version: don't expose temp IDs to URL routes at all. After creation, when the real ID lands in `onSuccess`, if the user has navigated to a detail view at `/todos/tmp_abc`, swap the URL with `router.navigate({ to: "/todos/$id", params: { id: realId }, replace: true })`. The user never sees the temp ID in the URL.
+
+## 6. Reconciling against the wrong shape
+
+The bug: your `PATCH /api/todos/:id` endpoint returns just the patched fields (`{ done: true, updatedAt: "..." }`), not the whole entity. Your `onSuccess` tries to write that as a `Todo` and loses `title`, `id`, everything else.
+
+The two fixes:
+
+**Make the endpoint return the whole entity.** This is the right fix and saves you cache-merging logic everywhere. Talk to your backend team.
+
+**If you can't, merge in `onSuccess`:**
+
+<Code lang="ts" file="merge-onsuccess.ts">{`onSuccess: (patch, _input, ctx) => {
+  qc.setQueryData<Todo[]>(todosKey, (old) =>
+    (old ?? []).map((t) =>
+      t.id === patch.id || t.id === ctx?.tempId ? { ...t, ...patch } : t,
+    ),
+  );
+},`}</Code>
+
+Order matters: `{ ...t, ...patch }` puts the server's fields last. If the optimistic write set `done: true` and the server returns `done: true, updatedAt: "..."`, the merge gives you both. If you wrote them in the other order, the optimistic value wins. That's a subtle bug; don't introduce it.
+
+## 7. Forgetting to type the snapshot
+
+`qc.getQueryData(key)` returns `unknown`. If you skip the generic, you get `unknown` back, you cast it, and the type system gives up.
+
+<Code lang="ts" file="type-snapshot.ts">{`// BAD
+const previous = qc.getQueryData(todosKey);
+
+// GOOD
+const previous = qc.getQueryData<Todo[]>(todosKey);`}</Code>
+
+Better: use TQ's `queryOptions` pattern so both the read and the write are typed centrally:
+
+<Code lang="ts" file="query-options.ts">{`import { queryOptions } from "@tanstack/react-query";
+
+export const todosQuery = queryOptions({
+  queryKey: ["todos"] as const,
+  queryFn: fetchTodos,
+});
+
+// Now both of these are typed:
+const previous = qc.getQueryData(todosQuery.queryKey);
+qc.setQueryData(todosQuery.queryKey, (old) => /* typed */);`}</Code>
+
+This is the production pattern. Centralize query options. Reference them everywhere.
+
+<Callout kind="gotcha">
+  The worst gotcha — the one that costs an afternoon every time — is two mutations racing on the same entity with stomping snapshots. It looks fine in dev (mutations resolve fast), shows up under load (mutations stack), and reproduces unreliably (depends on timing). The defense is `scope.id` on the mutation, the updater form of `setQueryData`, and server-side optimistic concurrency (`If-Match` headers). Set those up before the racy interaction ships, not after.
+</Callout>
+
+<Reading url="https://tanstack.com/query/latest/docs/framework/react/guides/query-cancellation" title="TQ — Query Cancellation" kind="docs" minutes={5} />
+<Reading url="https://tanstack.com/query/latest/docs/framework/react/guides/mutations#mutation-scopes" title="TQ — Mutation Scopes" kind="docs" minutes={4} />
+<Reading url="https://tkdodo.eu/blog/practical-react-query" title="Practical React Query" author="TkDodo" kind="blog" minutes={11} />
+
+**Remember this:** The bugs cluster around six things — missing `cancelQueries`, racing mutations, undo timing, focus refetches, temp-ID leaks, and reconciliation merges. Each has a one-line fix once you know it. Add them to your team's PR checklist.

@@ -1,0 +1,213 @@
+---
+title: Rollback patterns
+---
+
+<SectionHeader kind="pattern" number={4} title="Rollback patterns" />
+
+Rollback is the part most code gets wrong. The happy path is mechanical; the unhappy path is where the bugs hide. This section is about doing rollback in a way that survives real apps with real concurrency, real server-assigned data, and real users hitting buttons faster than your network.
+
+## The simplest rollback: snapshot and restore
+
+You saw this in the last section. The full pattern:
+
+<Code lang="ts" file="snapshot-rollback.ts">{`onMutate: async (input) => {
+  await qc.cancelQueries({ queryKey });
+  const previous = qc.getQueryData(queryKey);
+  qc.setQueryData(queryKey, (old) => applyOptimistic(old, input));
+  return { previous };
+},
+onError: (_err, _input, ctx) => {
+  if (ctx?.previous !== undefined) {
+    qc.setQueryData(queryKey, ctx.previous);
+  }
+},`}</Code>
+
+This works for any mutation that touches a single query and doesn't depend on the server inventing data. Toggle a boolean, rename a row, reorder a list within one query — snapshot-restore covers it.
+
+The thing to internalize: **the snapshot is the entire query value, not just the bit you changed.** Don't try to be clever and snapshot only the row you're editing. Snapshot the whole `Todo[]`. If two mutations race and the second one rolls back, restoring just one row reintroduces stale data for everything else.
+
+`getQueryData` returns a structural reference, not a copy. TQ's cache is internally immutable (mutations return new arrays/objects), so the reference you snapshot remains valid even as later mutations write new values. You're capturing a pointer to "what the cache looked like at this exact moment," which is exactly what you want.
+
+## Multi-query rollback
+
+Some mutations touch several queries. Toggling a task in Linear updates the task itself, the project's task list, the user's "assigned to me" list, and the project's completion percentage. If you snapshot one, you need to snapshot all.
+
+<Code lang="ts" file="multi-query-rollback.ts">{`onMutate: async (input) => {
+  const keysToTouch = [
+    ["task", input.id] as const,
+    ["tasks", "project", input.projectId] as const,
+    ["tasks", "assignee", input.assigneeId] as const,
+  ];
+
+  // Cancel them all in parallel.
+  await Promise.all(
+    keysToTouch.map((k) => qc.cancelQueries({ queryKey: k })),
+  );
+
+  // Snapshot each one.
+  const snapshots = keysToTouch.map((k) => ({ key: k, value: qc.getQueryData(k) }));
+
+  // Apply optimistic writes.
+  qc.setQueryData(["task", input.id], (t: Task | undefined) =>
+    t ? { ...t, done: input.done } : t,
+  );
+  qc.setQueryData(["tasks", "project", input.projectId], (list: Task[] | undefined) =>
+    list?.map((t) => (t.id === input.id ? { ...t, done: input.done } : t)),
+  );
+  qc.setQueryData(["tasks", "assignee", input.assigneeId], (list: Task[] | undefined) =>
+    list?.map((t) => (t.id === input.id ? { ...t, done: input.done } : t)),
+  );
+
+  return { snapshots };
+},
+onError: (_err, _input, ctx) => {
+  ctx?.snapshots.forEach(({ key, value }) => {
+    qc.setQueryData(key, value);
+  });
+},`}</Code>
+
+The pattern: snapshot all relevant keys up front, apply all writes, restore all snapshots on failure. The bookkeeping is annoying. Centralize it in a helper if you do it more than twice.
+
+## Inverse operations — when snapshot-restore doesn't fit
+
+Snapshots scale to a few queries. They don't scale to "this mutation might touch any of fifty cache entries depending on which workspaces, projects, and labels are loaded." For sufficiently complex updates, switch to an inverse-operation model.
+
+The idea: each optimistic write is described as an operation. The operation has an `apply` and an `invert`. To roll back, run the inverse.
+
+<Code lang="ts" file="inverse-ops.ts">{`type Op =
+  | { kind: "patchTodo"; id: string; before: Partial<Todo>; after: Partial<Todo> }
+  | { kind: "addTodo"; tempId: string; todo: Todo }
+  | { kind: "removeTodo"; id: string; before: Todo };
+
+function apply(qc: QueryClient, op: Op) {
+  switch (op.kind) {
+    case "patchTodo":
+      qc.setQueryData<Todo[]>(todosKey, (old) =>
+        (old ?? []).map((t) => (t.id === op.id ? { ...t, ...op.after } : t)),
+      );
+      return;
+    case "addTodo":
+      qc.setQueryData<Todo[]>(todosKey, (old) => [...(old ?? []), op.todo]);
+      return;
+    case "removeTodo":
+      qc.setQueryData<Todo[]>(todosKey, (old) =>
+        (old ?? []).filter((t) => t.id !== op.id),
+      );
+      return;
+  }
+}
+
+function invert(op: Op): Op {
+  switch (op.kind) {
+    case "patchTodo":
+      return { kind: "patchTodo", id: op.id, before: op.after, after: op.before };
+    case "addTodo":
+      return { kind: "removeTodo", id: op.tempId, before: op.todo };
+    case "removeTodo":
+      return { kind: "addTodo", tempId: op.before.id, todo: op.before };
+  }
+}`}</Code>
+
+Now your mutation runs `apply(qc, op)` in `onMutate` and `apply(qc, invert(op))` in `onError`. The win: you can replay this log later (think: persisting a pending queue to IndexedDB so refresh doesn't lose unsent mutations). The cost: it's only worth it once snapshot-restore stops fitting.
+
+This is the architecture Linear and Notion use internally. You don't need it on day one. You need to know it exists for the day "snapshot everything" doesn't scale.
+
+## Server-assigned IDs — the canonical pattern
+
+The single most common production bug: optimistic creates that use a temp ID, then the user clicks something on the new row before `onSuccess` swaps in the real ID. Now they're trying to toggle `tmp_aBcD123`, which the server has never heard of.
+
+The pattern:
+
+1. In `onMutate`, generate a temp ID (`tmp_${nanoid()}`) and write the new entity to the cache with it.
+2. In `onSuccess`, replace the entity with the server's response (which has the real ID).
+3. **In every mutation that operates on entities, accept that the ID might be a temp ID, and defer the mutation if so.**
+
+The third point is the one teams forget. Here's how to handle it:
+
+<Code lang="ts" file="defer-on-temp-id.ts">{`function useToggleTodo() {
+  const qc = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (input: { id: string; done: boolean }) => {
+      if (input.id.startsWith("tmp_")) {
+        // The entity hasn't been persisted yet. Wait for the create to land.
+        await qc.getMutationCache().find({ mutationKey: ["addTodo", input.id] })
+          ?.continue?.();
+        // Now look up the real ID from the cache.
+        const current = qc
+          .getQueryData<Todo[]>(todosKey)
+          ?.find((t) => t.id === input.id || t._tempId === input.id);
+        if (!current) throw new Error("Lost the optimistic row");
+        input = { ...input, id: current.id };
+      }
+      return patchTodo(input);
+    },
+    // ... onMutate, onError, onSuccess, onSettled as before
+  });
+}`}</Code>
+
+That snippet is more complex than what you'd write day one — most apps just disable interactions on optimistic rows. The simpler version:
+
+<Code lang="tsx" file="disable-on-pending.tsx">{`function TodoRow({ todo }: { todo: Todo }) {
+  const pending = todo.id.startsWith("tmp_");
+  const toggle = useToggleTodo();
+
+  return (
+    <li style={{ opacity: pending ? 0.6 : 1 }}>
+      <input
+        type="checkbox"
+        checked={todo.done}
+        disabled={pending}
+        onChange={() => toggle.mutate({ id: todo.id, done: !todo.done })}
+      />
+      {todo.title}
+      {pending && <span> · saving</span>}
+    </li>
+  );
+}`}</Code>
+
+Subtle UI cost (the row looks "pending" for ~400ms), zero correctness cost. Most apps live here forever and it's fine.
+
+## Reconciliation drift
+
+The server's truth is rarely _exactly_ what you guessed. Common drifts:
+
+- **Timestamps.** You wrote `updatedAt: Date.now()`. The server wrote `2026-06-05T14:32:11.847Z`. Off by milliseconds — usually invisible, occasionally visible in a sort.
+- **Computed fields.** A todo's `position` was guessed as "end of list." Server, applying its own ordering rules, put it third.
+- **Server-side defaults.** The server filled in `archived: false`, `assigneeId: null`, fields the client didn't think to write.
+- **Normalization.** You wrote `title: "  Buy milk  "`. The server trimmed it to `"Buy milk"`.
+
+The `onSuccess` write handles all of these — that's why it exists. The pattern:
+
+<Code lang="ts" file="reconcile-on-success.ts">{`onSuccess: (serverTodo, _input, context) => {
+  qc.setQueryData<Todo[]>(todosKey, (old) =>
+    (old ?? []).map((t) =>
+      // Match either the real ID (toggle/update) or the temp ID (create)
+      t.id === serverTodo.id || t.id === context?.tempId
+        ? serverTodo  // Take the server's canonical value, whole
+        : t,
+    ),
+  );
+},`}</Code>
+
+**Take the whole server entity.** Don't merge fields. Don't try to preserve your optimistic value for fields the server didn't return. The server is authoritative; the cache should reflect it.
+
+The one exception: if the server response is partial (`PATCH` sometimes returns only the changed fields), you have to merge. Prefer endpoints that return the whole entity for this reason.
+
+## Background refetch as a safety net
+
+Even with careful reconciliation, drift happens. The cache slowly diverges from the database over time — another user edited the row, a webhook ran, a background job recalculated something.
+
+`onSettled: () => qc.invalidateQueries({ queryKey })` is your safety net. After every mutation, the cache is marked stale and TQ refetches. The user never sees the refetch (the optimistic write already painted), but the cache converges back to truth within a few hundred ms.
+
+You'll occasionally see code that skips the invalidation as an optimization. Don't. The cost is one extra fetch you weren't going to notice. The benefit is "the UI is eventually consistent with the database, always." Pay the cost.
+
+<Callout kind="pattern">
+  The production trick: take the whole server entity in `onSuccess` and overwrite the optimistic row, matching by either the real ID or the temp ID. This is the one line that lets server-assigned fields (IDs, timestamps, computed values) reconcile cleanly without merge logic. Skip it and you'll spend a week debugging why some field is "wrong" after a successful save.
+</Callout>
+
+<Reading url="https://tanstack.com/query/latest/docs/framework/react/guides/optimistic-updates#updating-a-list-of-todos-when-adding-a-new-todo" title="TQ — Updating a list when adding" kind="docs" minutes={7} />
+<Reading url="https://tkdodo.eu/blog/the-query-options-api" title="The Query Options API" author="TkDodo" kind="blog" minutes={8} />
+<Reading url="https://linear.app/blog/scaling-the-linear-sync-engine" title="Linear's sync engine (inverse-ops at scale)" kind="blog" minutes={14} />
+
+**Remember this:** Snapshot-restore covers 90% of mutations. For multi-query updates, snapshot every key. For server-assigned IDs, swap in `onSuccess` and disable interactions on `tmp_` rows. Always take the whole server entity, never merge. Always invalidate in `onSettled`.
