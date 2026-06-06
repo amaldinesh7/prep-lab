@@ -1,0 +1,107 @@
+---
+title: Stretch goals
+---
+
+<SectionHeader kind="pattern" number={4} title="Stretch goals" />
+
+You've shipped v1. The exit criteria of milestone 6 are green. Don't start a stretch until that's true — they're sirens, not extensions.
+
+Each stretch is independent. Pick one or two; ignore the rest. The goal is depth, not surface area.
+
+## 1. WebRTC transport (replace y-websocket with y-webrtc)
+
+**6-10 hours.** The most curriculum-aligned stretch.
+
+`y-webrtc` is a drop-in replacement provider for the WebSocket one. Same Yjs APIs, peer-to-peer transport. You'll need a signaling server (the y-webrtc default works; or run your own — it's ~50 lines on Hono with a single `WebSocket` route).
+
+What you'll learn:
+
+- The DTLS handshake from the WebRTC module becomes observable. Open `chrome://webrtc-internals` while two tabs sync.
+- The mesh topology problem: with 4 peers, you have 6 connections. Build a "presence" view that shows the mesh.
+- TURN servers. You don't have one. Test the app on two laptops behind different NATs and watch it fail. Spin up coturn or use Twilio's TURN credentials. Suddenly it works.
+- Hybrid mode: keep `y-websocket` as a fallback so the agent worker (which can't run WebRTC in Node) still participates.
+
+Don't expect this to fully replace the websocket transport — agents won't speak WebRTC. The point is the depth of feel for the protocol.
+
+## 2. React Native companion app
+
+**10-15 hours.** Expo + a thin "review-only" UI for mobile.
+
+What lands:
+
+- `apps/mobile` — Expo with TypeScript.
+- Same `Y.Doc` schema. Use `@y/websocket-server` client in React Native; Yjs runs there.
+- Read-only views: task list, task detail, agent run timeline.
+- Push notifications when an agent finishes (Expo Notifications + a web-push trigger from your server).
+- Auth via the same fake-or-real auth as web.
+
+The point: prove to yourself that the Y.Doc model is platform-agnostic. The same merge semantics work on a phone. The same WebSocket protocol works in RN.
+
+Don't try to make the mobile app a full editor on the first pass. Read-only + comments is enough to demo. A full editor is another 10 hours.
+
+## 3. Electron desktop wrapper with menubar agent
+
+**6-8 hours.** Native menubar indicator for agent runs in progress.
+
+What lands:
+
+- `apps/desktop` — Electron + Vite.
+- Loads the same web app (point it at `localhost:5173` in dev, your deployed URL in prod).
+- A menubar `Tray` icon that animates when an agent is running, badges with run count, shows a dropdown with recent runs.
+- Native notifications via `new Notification(...)` (Electron uses the OS notification system).
+- Global hotkey to focus the app (`⌘⇧T`).
+
+The lesson: Electron is mostly a thin layer. Most of your code is still the web app. The 10% that's native is where the value of Electron lives — menubar, notifications, hotkeys, native file dialogs.
+
+If you've never shipped a notarized Mac binary, the codesigning pipeline alone is a 2-hour rabbit hole. Worth doing once.
+
+## 4. Performance — Lighthouse 90+ cold, <250KB initial bundle
+
+**4-8 hours.** Easy to make worse, hard to make great.
+
+What lands:
+
+- `rollup-plugin-visualizer` in the build. Find the heaviest chunks.
+- Lazy-load Yjs and the WebSocket provider — they only matter on `/tasks`, not on `/settings`.
+- Lazy-load the editor (Tiptap or whatever you used for task descriptions).
+- Image budget: zero images on the cold path. Use `lucide-react` for icons; tree-shake aggressively.
+- Real User Monitoring (RUM): a tiny `web-vitals` hook posting to your own `/rpc/vitals` endpoint. Aggregate in Postgres, view in a table.
+- Run Lighthouse on a throttled "Slow 4G" profile. Aim for 90+ on Performance, Best Practices, Accessibility.
+
+Where you'll struggle: Yjs adds ~80KB minified. There's no fix for that on `/tasks`; route-split it so it's not on `/settings` either.
+
+The wrong target: a 99 Lighthouse score on your M3 over fiber. The right target: a 90+ on a throttled mid-tier Android profile.
+
+## 5. Agent observability dashboard
+
+**4-6 hours.** The dashboard you'll wish you had after the first time a tool loop costs $4.
+
+What lands:
+
+- A `/admin/agents` route. Token usage by day. Average run duration. Tool call distribution. Cost per run (compute from token counts + Anthropic pricing).
+- Histograms with `recharts` or plain SVG.
+- Filter by user, by date range, by task tag.
+- An alert: if any user spends >$X/day on agent runs, show a banner on their next visit.
+- Export to CSV.
+
+You'll learn: how cheap aggregations are in Postgres when you index correctly. How expensive they are when you don't. `EXPLAIN ANALYZE` is your friend.
+
+<Callout kind="pattern">
+  The stretches are not a checklist. Pick the one that scratches the itch you most want to scratch. The point of the capstone was always the v1 — these are training wheels coming off, in directions you choose.
+</Callout>
+
+## Anti-stretches (things that look like stretches but aren't)
+
+- **Add more agents (research agent, coding agent, summarizer agent).** This is product work, not engineering depth. You won't learn anything new.
+- **Migrate to React Server Components.** TSR doesn't support RSC well as of writing. You'll spend the budget fighting the framework.
+- **Add a vector DB for semantic task search.** Fun, but irrelevant to the curriculum.
+- **Rewrite the backend in Rust / Go.** Don't. You're a frontend engineer shipping a frontend-shaped app.
+
+If you find yourself reaching for one of these, that's the signal to stop and start the next module — or start a new project.
+
+<Reading url="https://github.com/yjs/y-webrtc" title="y-webrtc — peer-to-peer Yjs transport" kind="docs" minutes={6} />
+<Reading url="https://docs.expo.dev/" title="Expo docs — start here for React Native" kind="docs" minutes={10} />
+<Reading url="https://www.electronjs.org/docs/latest/tutorial/tray" title="Electron Tray API — the menubar primitive" kind="docs" minutes={5} />
+<Reading url="https://web.dev/articles/vitals" title="Core Web Vitals — what Lighthouse actually measures" kind="docs" minutes={8} />
+
+**Remember this:** the v1 is the curriculum. The stretches are bonuses. If you do one stretch well, you've extended the curriculum. If you start three and finish none, you've wasted the capstone.

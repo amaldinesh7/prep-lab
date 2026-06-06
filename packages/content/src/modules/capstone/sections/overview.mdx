@@ -1,0 +1,55 @@
+---
+title: The project
+---
+
+<SectionHeader kind="concept" number={1} title="The project: collaborative agent task list" />
+
+You've read ten modules. You know what Tanstack Router gives you, why a CRDT beats `lastWriteWins`, what a service worker does to a stale cache, why React Native is the rational mobile choice. None of that becomes muscle memory until you ship something that uses all of it at once.
+
+This is that thing.
+
+## The pitch
+
+A multi-user task list — Linear-shaped, not Trello-shaped — where the assignee of a task can be a human teammate **or an AI agent**. When you assign a task to an agent, a worker picks it up, runs a Claude tool loop against it (read the description, plan, call tools, write a result), and posts back. The human watches the run unfold in real time, can interject, can re-assign.
+
+Two tabs open in the same browser stay in lockstep. Two laptops on the same wifi stay in lockstep. Drop wifi, keep editing, reconnect — the merge just works. Tap "assign to agent" and the assignee column updates before the network confirms; nothing flashes.
+
+It's an internal tool you could actually deploy to your team on Monday. That's the bar.
+
+## Why this is the right capstone
+
+Every concept in the curriculum maps to one feature in this app. Not as a contrived hello-world — as the natural way to build the thing.
+
+- **Tanstack Router** — three top-level routes (tasks, agent runs, settings), nested detail views, type-safe params for `taskId`, validated search for filters. You'll hit file-based routing, loaders, and prefetch-on-hover within the first afternoon.
+- **Performance** — bundle visualizer the moment you add Yjs (CRDTs are not small). Route-level code splitting earns its keep. You'll learn the difference between "fast on your M-series" and "fast on the intern's old ThinkPad."
+- **Optimistic updates** — the "assign to agent" button needs to feel instant. Tanstack Query mutations with `onMutate` rollback, for non-CRDT writes (auth, settings, agent run cancellation).
+- **Service workers** — vite-plugin-pwa precaches the shell, stale-while-revalidates the agent run history. The app boots offline.
+- **Sync engines** — Yjs is your sync engine. You'll wire `y-websocket`, persist `Y.Doc` updates to Postgres, hydrate on reconnect. The choice of "server is dumb log, client is source of truth" lands.
+- **CRDTs** — task fields are `Y.Map` entries. Concurrent edits to the same task title merge without prompting the user. The tradeoffs you read about become decisions you make.
+- **OT** — you'll appreciate why you chose CRDT over OT once you try to imagine implementing the same merge over OT. Skip OT here; the curriculum already taught you why.
+- **WebRTC** — the stretch is to swap `y-websocket` for `y-webrtc` and watch two browsers talk peer-to-peer with no backend. The DTLS handshake you read about becomes a thing you observe in `chrome://webrtc-internals`.
+- **React Native** — Expo companion app for reviewing agent runs on your phone. Same `Y.Doc` model, same backend.
+- **Electron** — desktop wrapper with a menubar agent indicator. Native notifications when an agent finishes.
+
+<Callout kind="pattern">
+  The point of a capstone isn't to invent something novel — it's to put yourself in a position where every architectural decision is forced by the problem, not by the tutorial. By the time you're debugging "why does the task title flicker when two agents update it concurrently," you've internalized the curriculum.
+</Callout>
+
+## High-level features
+
+What the v1 ships with, in order of when you'll build it:
+
+1. **Tasks board** — list, detail, create, edit, delete. Three statuses (todo, doing, done). Assignee (user or agent). Tags.
+2. **Multi-user live editing** — open the app in two tabs, edit the same task, see updates land in <100ms. No conflicts, no overwrites.
+3. **Offline mode** — kill wifi, keep typing. Reconnect — your changes merge with whatever happened while you were gone.
+4. **Agent runs** — assign a task to `@agent`. A worker picks it up, runs a tool loop, posts intermediate steps and a final result. You can watch it run.
+5. **Run history** — every agent run is logged with token usage, duration, tool calls. Non-CRDT data, fetched via Tanstack Query, optimistic on cancellation.
+6. **Settings** — your name, your color, your Anthropic API key (stored encrypted server-side). Per-user, not shared.
+
+That's it. Don't add a billing page. Don't add SSO. Don't add a marketing site. Ship the thing that exercises the curriculum.
+
+<Reading url="https://linear.app/method" title="Linear's product principles (what you're aiming at, shape-wise)" kind="blog" minutes={8} />
+<Reading url="https://docs.yjs.dev/" title="Yjs — the docs you'll live in" kind="docs" minutes={15} />
+<Reading url="https://www.anthropic.com/news/tool-use-ga" title="Anthropic — tool use (your agent loop's primitive)" kind="docs" minutes={10} />
+
+**Remember this:** the goal isn't a portfolio piece. The goal is a tool you'd actually use, built well enough that you'd defend its architecture in a senior interview. Everything in the spec is in service of that.

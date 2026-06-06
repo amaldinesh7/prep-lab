@@ -1,0 +1,50 @@
+---
+title: Done. What's next?
+---
+
+<SectionHeader kind="cheatsheet" number={5} title="Done. What's next?" />
+
+You read eleven modules and shipped one substantial app. The thing you have on `localhost:5173` is not a tutorial output — it's a tool you could put in front of your team on Monday. Take that seriously. Most engineers with six years of React don't have a single project on disk that uses CRDTs in anger.
+
+The plan from here is short. Use the cheatsheet to ground the architecture in your head, then keep iterating on the capstone — or apply the patterns to the next thing you ship at work.
+
+<Cheatsheet rows={[
+  { k: "Project type", v: "Real, shippable internal tool — not a portfolio toy" },
+  { k: "Stack", v: "Vite + Tanstack Router + Yjs + Hono + Drizzle + Postgres" },
+  { k: "Time", v: "30-40 focused hours across 6 milestones" },
+  { k: "Real-time", v: "Yjs over y-websocket — server is a dumb log + fanout" },
+  { k: "Persistence", v: "Y.Doc updates → ydoc_updates table, periodic snapshots" },
+  { k: "Offline", v: "vite-plugin-pwa + Background Sync queue + y-indexeddb" },
+  { k: "Agents", v: "Bun worker polls FOR UPDATE SKIP LOCKED, joins Y.Doc as a peer" },
+  { k: "Optimistic UI", v: "Tanstack Query with onMutate/rollback for non-CRDT writes" },
+  { k: "Routing", v: "Tanstack Router file-based, validateSearch, prefetch on intent" },
+  { k: "Perf", v: "rollup-plugin-visualizer + route-split Yjs + RUM via web-vitals" },
+  { k: "Mobile (stretch)", v: "Expo + same Y.Doc model, read-only + push" },
+  { k: "Desktop (stretch)", v: "Electron + Tray menubar + native notifications" },
+  { k: "Source of truth", v: "Y.Doc for collaborative state, Postgres for everything else" },
+  { k: "Agent-as-peer", v: "Not a special case — same WS, same Y.Doc, same merge rules" },
+  { k: "When done", v: "Keep iterating; ship to your team; pitch it as a real tool" }
+]} />
+
+## What you can claim now
+
+The reason a capstone matters is the answers it lets you give in interviews and architecture reviews. After shipping this, you can speak honestly to:
+
+- **"How would you handle real-time collaboration?"** You've shipped it. You can compare Yjs to Replicache to Convex without hand-waving.
+- **"What does offline-first cost?"** You've measured it. You know the service worker caches the wrong thing if you don't tell it not to.
+- **"How do you integrate AI agents into an existing product?"** You've architected it. Agent-as-peer is a non-obvious pattern that you've actually used.
+- **"How do you keep a SPA's bundle small?"** You've fought it. You know where Yjs goes on the route map.
+
+That's the difference between reading the curriculum and shipping the capstone. The first gives you vocabulary. The second gives you opinions.
+
+## Where to go next
+
+If you've gotten this far, three concrete next steps are worth considering, in roughly increasing scope:
+
+1. **Use the app for a week.** Track your real tasks in it. You'll find a UX paper cut every hour. Fix three. The discipline of dogfooding is its own module.
+2. **Pick one stretch goal and ship it.** WebRTC, mobile, desktop, or the observability dashboard. Going from v1 to v1.1 with a serious feature is where you internalize the patterns.
+3. **Apply one pattern at work.** The next time your team builds something with a "two tabs disagree" failure mode, propose Yjs. Bring the capstone to the design review. The architecture you've shipped is the case study.
+
+There's no eleventh module after this. The curriculum ends here on purpose. The next thing you build should be in the wild — at work, for users, with stakes.
+
+**Remember this:** you didn't finish a course. You shipped a tool. Keep treating it like one.

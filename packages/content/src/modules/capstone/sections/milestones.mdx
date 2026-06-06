@@ -1,0 +1,131 @@
+---
+title: Build in milestones
+---
+
+<SectionHeader kind="pattern" number={3} title="Build in milestones" />
+
+Ship one milestone, get it working end-to-end, commit, and only then start the next. Don't pre-architect for milestone 6 while you're on milestone 1 — you'll over-engineer the wrong thing.
+
+Total estimated time: **30-40 focused hours**. Spread it over 2-3 weekends if you have a day job. Don't drag it past four; the architecture stops being in your head and you'll lose the thread.
+
+## Milestone 1 — Single-user shell
+
+**4-6 hours.** Get the bones right. No auth, no backend, no sync. Just Vite + Tanstack Router + Tailwind, with three top-level routes and local state.
+
+What lands:
+
+- `bun create vite`, drop in Tanstack Router + plugin, Tailwind, oRPC client stubs (used in M3+).
+- File-based routes: `/`, `/tasks`, `/tasks/$taskId`, `/agent-runs`, `/agent-runs/$runId`, `/settings`.
+- Pathless `_app.tsx` layout with a sidebar nav.
+- Tasks held in `useState` in the route — fine for now. Three statuses, fake data.
+- Tanstack Router devtools rendered, `defaultPreload: "intent"`, route-level `pendingComponent`s.
+- Tailwind theme set up: one accent color, one mono font, three semantic colors for the statuses.
+
+Exit criteria: you can click around the app, the URL updates correctly, refresh restores the route, the Network tab shows zero failed requests.
+
+Don't even think about backend code yet. If you do, you'll skip the routing patterns the curriculum asked you to internalize.
+
+## Milestone 2 — Multi-user CRDT
+
+**6-8 hours.** Replace local state with a `Y.Doc`. Wire `y-websocket`. Run the demo server.
+
+What lands:
+
+- `bun add yjs y-websocket y-indexeddb`.
+- A `useYDoc()` hook that returns the doc for the current workspace, persists to IndexedDB locally, and connects to `ws://localhost:1234` via `WebsocketProvider`.
+- Run `npx y-websocket` as your dev server for now. (You'll replace it in M3.)
+- A `useYMap<Task>("tasks")` hook that returns a snapshot of the Y.Map and re-renders on observe.
+- Convert the task list and detail views to read/write through the Y.Doc.
+- Tasks are `Y.Map` entries keyed by id, with primitive fields. The task title is a `Y.Text` so concurrent character-level edits merge.
+
+Exit criteria: open two browser tabs side by side. Edit a task title in one. Watch it appear in the other within 100ms. Close one tab, edit in the other, reopen — your edit is there.
+
+The bug you'll hit: forgetting to `observe` the Y.Map and getting stale React state. The fix is a tiny pub/sub hook. Write it once, use it everywhere.
+
+## Milestone 3 — Server persistence
+
+**4-6 hours.** Kill the dev `y-websocket` server. Stand up your own.
+
+What lands:
+
+- `apps/server` — Bun + Hono.
+- A WebSocket route at `/ws/:workspaceId` that uses `y-websocket`'s server utilities to handle the protocol.
+- On connect: read all `ydoc_updates` rows for the workspace, apply them to a server-side `Y.Doc`, send the diff to the client.
+- On every update message: append the update bytes to `ydoc_updates`. Don't try to be clever — just append.
+- Drizzle migrations for `users`, `workspaces`, `ydoc_updates`, `ydoc_snapshots`. Postgres in Docker for dev.
+- A compaction job (run on a cron or manually for now): read updates older than N minutes, merge them into a snapshot, delete the updates.
+
+Exit criteria: kill the server, restart it, refresh the browser — your tasks are still there. Open two browsers, edit concurrently, no data loss.
+
+The bug you'll hit: forgetting to set `Content-Type` on the WebSocket upgrade, or letting Hono's body parser try to consume the upgrade request. Read the Hono WS docs twice.
+
+## Milestone 4 — Optimistic UI for non-CRDT writes
+
+**3-4 hours.** Wire Tanstack Query for the things that aren't in the Y.Doc.
+
+What lands:
+
+- oRPC server + client wired up. Routes: `getMe`, `updateProfile`, `listAgentRuns`, `cancelAgentRun`.
+- `cancelAgentRun` mutation uses `onMutate` to mark the run as `cancelling` in the cache immediately, with rollback on error.
+- Profile edit page uses optimistic updates for name/color changes.
+- Tanstack Router loaders use `context.queryClient.ensureQueryData` so route-level prefetch warms the same cache the components read.
+
+Exit criteria: click "cancel run." The status flips to `cancelling` before the network confirms. Disconnect, click cancel — UI flips, then rolls back when the request fails.
+
+This milestone is short because you already know how to do this from the optimistic-updates module. It's here mostly to wire the patterns into the project.
+
+## Milestone 5 — Offline + service worker
+
+**3-4 hours.** `vite-plugin-pwa`. Precache the shell. Queue mutations.
+
+What lands:
+
+- `vite-plugin-pwa` configured with `injectManifest` strategy (you want control over the worker).
+- A custom worker that precaches the app shell + a stale-while-revalidate cache for the `/rpc/listAgentRuns` endpoint.
+- Background Sync API for queuing oRPC mutations when offline. Replays on reconnect.
+- A small "offline" indicator in the sidebar (read from `navigator.onLine` + WebSocket connection state).
+- IndexedDB persistence for the Y.Doc was already wired in M2; just confirm it works offline.
+
+Exit criteria: open the app, kill wifi, navigate around, edit tasks, restart wifi — everything you did syncs. No errors in the console.
+
+The bug you'll hit: the service worker caches your dev bundle and refuses to update. Add a "Update available" toast that calls `skipWaiting` on click. Or `unregister()` in dev. Either way, set this up before it bites you.
+
+## Milestone 6 — Agent runner
+
+**8-10 hours.** The biggest milestone, and the most fun.
+
+What lands:
+
+- `apps/agent-worker` — separate Bun process. Polls `agent_runs WHERE status='queued' FOR UPDATE SKIP LOCKED` every 500ms.
+- On picking up a run: connect to the workspace's Y.Doc via the same `/ws` route the browser uses. The agent is a peer.
+- Anthropic SDK client. Define tools: `read_task`, `set_task_status`, `add_comment`, `web_fetch` (use a fetch with a 10-second timeout and a domain allowlist).
+- Tool loop: send messages, handle `tool_use` blocks, execute the tool, return `tool_result`, repeat until `end_turn` or 20 iterations.
+- Each tool call writes a row to `agent_run_steps` so the UI can stream the run.
+- The browser subscribes to `agent_run_steps` via Server-Sent Events from the Hono server (or just polls every 500ms — fine for v1).
+- "Assign to agent" in the UI: writes the assignee to the Y.Doc + creates a row in `agent_runs` via oRPC. The Y.Doc write makes the assignment visible to everyone; the `agent_runs` row triggers the worker.
+
+Exit criteria: create a task ("research what Yjs is and post a 3-paragraph summary as a comment"). Assign to `@agent`. Watch a run appear, watch tool calls stream in, watch a comment land in the task. Open a second browser — same view, in real time.
+
+The bug you'll hit: the agent's WebSocket connection drops mid-tool-loop and you don't notice. Add a heartbeat. Also: an infinite loop where the agent keeps calling the same tool. Cap iterations and surface "max steps reached" as a run status.
+
+<Callout kind="pattern">
+  After each milestone, stop and play with the app for ten minutes. Don't add features — just use it. You'll find the bug that the next milestone would have papered over. Half the value of milestone-based building is the forced pauses.
+</Callout>
+
+## What you do not build
+
+Things that will tempt you, that you should refuse:
+
+- **Auth.** A `localStorage`-based fake user is fine for v1. Add real auth (Clerk, Auth.js) only if you ship to your team.
+- **Permissions.** Everyone in a workspace can do everything. Roles are a milestone 7 problem.
+- **Email notifications.** You wrote a service worker. Use web push if you must.
+- **A landing page.** It's an internal tool.
+- **A mobile-responsive design.** Build for laptop. Add mobile only if you're doing the Expo stretch.
+
+Each of those is a week of work that teaches you nothing the curriculum hasn't already covered.
+
+<Reading url="https://docs.anthropic.com/en/docs/build-with-claude/tool-use/overview" title="Anthropic — tool use loop" kind="docs" minutes={12} />
+<Reading url="https://github.com/yjs/y-indexeddb" title="y-indexeddb — local persistence" kind="docs" minutes={5} />
+<Reading url="https://vite-pwa-org.netlify.app/guide/" title="vite-plugin-pwa — guide" kind="docs" minutes={10} />
+
+**Remember this:** each milestone has a single exit criterion you can demo. If you can't demo it, you're not done. Move on only when you can.

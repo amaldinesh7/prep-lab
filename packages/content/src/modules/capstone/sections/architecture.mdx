@@ -1,0 +1,131 @@
+---
+title: Architecture
+---
+
+<SectionHeader kind="pattern" number={2} title="Architecture" />
+
+The whole stack fits in your head if you draw it once. Do that before you write a line of code — the choices below are load-bearing, and changing them after milestone 3 is painful.
+
+## Frontend
+
+```
+Vite + React 19
+├── Tanstack Router         routes, loaders, prefetch
+├── Tanstack Query          server cache for non-CRDT data
+├── Yjs                     CRDT state for tasks
+│   └── y-websocket         provider, talks to backend
+├── vite-plugin-pwa         service worker, precache, queue
+└── Tailwind                because you're not paying the design-system tax on a capstone
+```
+
+The split that matters: **anything two users can edit at the same time lives in the Y.Doc.** Anything single-owner or write-once-read-many lives in Tanstack Query (which goes to Postgres via oRPC).
+
+Tasks → Y.Doc. Agent runs → Postgres (an agent run isn't collaborative; it's a log). User profile → Postgres. Settings → Postgres. The task's assignee field → Y.Doc (because two people can race to assign).
+
+If you don't draw this line clearly, you'll end up with two sources of truth and a sync bug you can't reason about.
+
+## Sync
+
+`y-websocket` is the boring choice and the right one for milestone 2-3. It's a thin protocol: client sends update bytes, server fans out to other clients in the same room, optionally persists. You write the persistence; the rest is library code.
+
+You could use Replicache instead. Replicache gives you a more opinionated server contract (push/pull endpoints, mutators) and better offline UX out of the box. Don't. Replicache is a great product, but it's a separate model from Yjs, and the curriculum invested in Yjs. Pick one source of truth and let it own the merge.
+
+## Backend
+
+```
+Bun runtime
+└── Hono                    HTTP server
+    ├── oRPC                typed RPC for non-CRDT data
+    ├── y-websocket server  WebSocket upgrade handler
+    └── Drizzle ORM         Postgres
+        └── tables:
+            ├── users
+            ├── workspaces
+            ├── ydoc_updates    (append-only log of Y.Doc binary updates)
+            ├── ydoc_snapshots  (periodic compactions)
+            ├── agent_runs
+            └── agent_run_steps
+```
+
+`ydoc_updates` is the only weird table. You're not storing a "tasks" table with rows; you're storing the binary updates that Yjs emits, append-only, indexed by workspace. On connect, the server reads them, applies them to a server-side `Y.Doc`, and pushes the resulting state to the client. Periodically, you compact a range of updates into a single `ydoc_snapshots` row to keep load times bounded.
+
+If "no tasks table" makes you uncomfortable, that's the lesson. The Y.Doc is the database for collaborative state. Postgres is the durable log.
+
+## Agents
+
+The agent worker is a separate process. Not a route, not a serverless function, not a queue consumer — a long-running Bun process.
+
+```
+bun run apps/agent-worker/src/index.ts
+
+loop:
+  1. SELECT * FROM agent_runs WHERE status = 'queued' LIMIT 1 FOR UPDATE SKIP LOCKED
+  2. Mark status = 'running', emit start event
+  3. Open the task's Y.Doc, read description + context
+  4. Run Anthropic tool loop:
+       - tools: read_task, post_comment, set_status, web_fetch
+       - max iterations: 20
+       - on each step: INSERT INTO agent_run_steps
+  5. Mark status = 'done' (or 'failed'), emit done event
+  6. Sleep 500ms, loop
+```
+
+`FOR UPDATE SKIP LOCKED` is how you get a poor man's job queue out of Postgres without adding Redis. It scales to "a couple agents on one machine" — exactly your need. When you need more, swap it for something real; until then, don't.
+
+The worker doesn't talk to clients directly. It writes to Postgres (`agent_run_steps`) and, when it needs to update task state, opens a `y-websocket` connection to the backend like any other client. The agent is just another participant in the Y.Doc.
+
+That last bit is the elegant part. **An agent is a peer, not a special case.** Every concurrency property the CRDT gives you between humans, it gives you between human and agent for free.
+
+## Data flow (the one diagram)
+
+```
+                  ┌─────────────────────────┐
+                  │  Browser (React + Yjs)  │◀────┐
+                  └────────────┬────────────┘     │
+                  ws updates   │   ws fanout      │
+                               ▼                  │
+        ┌──────────────────────────────────────┐  │
+        │ Bun + Hono                           │  │
+        │  ├── /ws  (y-websocket)              │──┘
+        │  ├── /rpc (oRPC, agent runs, auth)   │
+        │  └── persists Y updates → Postgres   │
+        └────────────┬─────────────────────────┘
+                     │
+                     ▼
+        ┌──────────────────────────────────────┐
+        │ Postgres (Drizzle)                   │
+        │  ydoc_updates · ydoc_snapshots       │
+        │  users · agent_runs · agent_run_steps│
+        └────────────┬─────────────────────────┘
+                     │ polls FOR UPDATE SKIP LOCKED
+                     ▼
+        ┌──────────────────────────────────────┐
+        │ Agent worker (Bun process)           │
+        │  - opens Y.Doc via /ws as a peer     │
+        │  - runs Anthropic tool loop          │
+        │  - writes steps back to Postgres     │
+        └──────────────────────────────────────┘
+```
+
+The browser never talks to the agent worker. The agent worker is, from the browser's perspective, indistinguishable from a remote user.
+
+<Callout kind="pattern">
+  The architecture call: **CRDT for collaborative state, RPC for everything else, agents-as-peers.** Every other decision falls out of that. If you find yourself bolting "an agent update channel" on top of the WebSocket, you're rebuilding what the CRDT already gives you. Stop and re-read this section.
+</Callout>
+
+## Why not...
+
+A short list of plausible alternatives and why they're worse here, specifically:
+
+- **Liveblocks / PartyKit** — both are great. Both replace milestones 2-3 with library code. That defeats the point of the capstone; you're trying to feel the sync layer, not abstract over it.
+- **Convex / Firestore** — managed backends. Same critique. Also lock you into a query model that fights Yjs.
+- **Socket.IO instead of native WebSockets** — Socket.IO's reconnection logic is fine, but `y-websocket` already handles reconnection at the Yjs layer. Two reconnection systems is one too many.
+- **Redis pub/sub between server instances** — not until you're running more than one server. Single-box first.
+- **GraphQL** — for the non-CRDT data, you have maybe a dozen RPC calls. oRPC ships a typed client with one config file. GraphQL is correct at a bigger scale than this.
+
+<Reading url="https://docs.yjs.dev/getting-started/working-with-shared-types" title="Yjs — shared types (Y.Map vs Y.Array vs Y.Text)" kind="docs" minutes={10} />
+<Reading url="https://github.com/yjs/y-websocket" title="y-websocket protocol & persistence hooks" kind="docs" minutes={8} />
+<Reading url="https://hono.dev/docs/getting-started/bun" title="Hono on Bun — the 10-minute server" kind="docs" minutes={6} />
+<Reading url="https://orpc.unnoq.com/" title="oRPC — typed RPC without a build step" kind="docs" minutes={8} />
+
+**Remember this:** the Y.Doc is the source of truth for collaborative state. Postgres is durable storage for the log of updates plus everything non-collaborative. The agent is just another peer on the WebSocket. Hold those three sentences while you build.
