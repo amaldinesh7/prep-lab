@@ -1,0 +1,58 @@
+---
+title: Why CRDTs
+---
+
+<SectionHeader kind="why" number={1} title="Why CRDTs" />
+
+Two users open the same document. They both start typing. One adds a sentence to the top, the other deletes a word from the middle. The network blips for half a second. Now what?
+
+That question is the entire reason conflict-free replicated data types (CRDTs) exist. It sounds small. It is not.
+
+## The collaborative editing problem
+
+The naive version of the problem looks easy. You have a string. Two clients each have a copy. They each mutate it. You want both copies to end up the same — and to match what a single user would have gotten if all those edits had happened serially on one machine.
+
+The trap is that "the same" is doing a lot of work. The two clients sent operations to the server in some order. The server sent them out in some order. The network reordered some of them. One client was offline for thirty seconds and is now replaying ten edits at once. There is no canonical timeline of "what happened" — every replica saw events in a different order.
+
+Three things you cannot do here:
+
+1. **Last-write-wins on the whole string.** User A's "fix typo on line 5" arrives 200ms after User B's three-paragraph rewrite. A's edit clobbers B's entire work. This is how shared Google Sheets felt in 2008 and why nobody used them.
+2. **Lock the document.** You can serialize writes by handing out a lock. Now collaboration isn't real-time — it's turn-taking with a UI that lies about it. Figma, Linear, Notion, Google Docs — none of them work this way, because users won't tolerate it.
+3. **Pretend conflicts don't happen.** They do. Two users typing in the same paragraph at the same instant is a normal Tuesday, not an edge case.
+
+## Why operational transform (OT) is hard
+
+The first serious answer to this was operational transform (OT), the algorithm Google Docs runs on. The idea is elegant on paper: every edit is an operation (`insert "x" at position 5`), and when concurrent ops arrive, you _transform_ each one against the others so the end state matches what a single-timeline replay would have produced.
+
+In practice OT is a minefield. The transform function has to satisfy two algebraic properties (called TP1 and TP2) for every pair of operation types. Get one transform function wrong and replicas diverge silently — the bug surfaces hours later as "why does your doc say something different from mine." Google's OT paper has known errata. Most published OT algorithms have been shown to violate TP2 in some configuration. There is no way to write a small, self-contained OT system you can trust — you either run a central server that serializes every edit (Google Docs' actual architecture) or you accept that your peer-to-peer system will eventually drift.
+
+OT is what you reach for when you have a central server, deep expertise, and a budget for the algorithm being subtly broken for years.
+
+## CRDTs are the structural answer
+
+CRDTs change the question. Instead of asking "how do I transform op A so it composes correctly with op B," they ask "can I design my data structure so that the merge function is automatically correct, regardless of order?"
+
+The answer turns out to be yes — if you build the data structure carefully. The core property is _strong eventual consistency_: any two replicas that have seen the same set of operations (in any order) end up in the same state. No coordination required. No central server in the critical path. Two laptops on a plane with no internet can each make a hundred edits, meet over Bluetooth, and converge.
+
+This is the move that unlocked the current generation of collaborative tools — Figma, Linear's offline mode, Notion's multiplayer, every shipping local-first app. Some use real CRDTs (Yjs, Automerge). Some use CRDT-flavored custom protocols. The bet is the same: design the data structure so the network doesn't need to be the source of truth.
+
+<Callout kind="why">
+  CRDTs exist because the alternatives don't compose. Last-write-wins loses data. Locks kill the user experience. Operational transform works only with a central server and decades of careful implementation. CRDTs trade some memory and some structural rigidity for a merge function that is correct by construction. For collaborative + offline-first products, that trade is the whole game.
+</Callout>
+
+## What you'll get from this module
+
+You're joining a team that's likely shipping something collaborative — a multiplayer editor, a real-time canvas, an offline-capable agentic UI. By the end of this module you should be able to:
+
+- Explain why a CRDT merge is correct without invoking a server
+- Read Yjs source and recognize the block model and stable IDs
+- Choose between Yjs, Automerge, OT, and last-write-wins for a given product
+- Spot the three failure modes that bite production CRDT systems (memory growth, schema drift, transport amplification)
+
+The rest of this module is theory just deep enough to debug Yjs when it breaks, then practice.
+
+<Reading url="https://crdt.tech/" title="crdt.tech — the canonical CRDT index" kind="docs" minutes={15} />
+<Reading url="https://www.inkandswitch.com/local-first/" title="Local-first software (Ink & Switch)" author="Kleppmann, Wiggins, van Hardenberg, McGranaghan" kind="paper" minutes={45} />
+<Reading url="https://www.youtube.com/watch?v=x7drE24geUw" title="CRDTs: The Hard Parts" author="Martin Kleppmann" kind="video" minutes={45} />
+
+**Remember this:** CRDTs are not magic. They're a data-structure-level answer to "how do replicas converge without a central coordinator." Everything else in this module is the consequence of that choice.

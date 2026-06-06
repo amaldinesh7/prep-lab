@@ -1,0 +1,134 @@
+---
+title: Yjs internals
+---
+
+<SectionHeader kind="concept" number={4} title="Yjs internals" />
+
+Yjs is the CRDT library most production teams ship with. Tiptap, BlockNote, Liveblocks, Hocuspocus, the editor in your favorite local-first app — all Yjs underneath. It's a small library (Kevin Jahns has maintained it solo for years), but the design decisions inside it are why CRDTs went from "neat paper" to "shipping software."
+
+This section is enough internals to debug Yjs when it misbehaves. Not enough to write your own — that's a multi-year project.
+
+## YATA: the algorithm
+
+Yjs is built on YATA — Yet Another Transformation Approach — an algorithm Kevin Jahns and Petho published in 2016. YATA is a list CRDT: a way to model an ordered sequence (text, an array, the order of paragraphs) such that concurrent inserts always converge.
+
+YATA is in the same family as Logoot, RGA, and Treedoc. What makes it Yjs-specific:
+
+1. **Stable IDs, not timestamps.** Each item gets a `(clientId, clock)` identifier. The clock is a per-client monotonic counter, not a wall clock. This sidesteps every clock-skew problem timestamps cause.
+2. **Origin pointers, not positions.** When you insert a character, the item records its _left and right neighbors at insert time_. Position is derived from the linked-list structure, not stored.
+3. **Deterministic tie-breaking.** When two clients insert at the same spot concurrently, YATA orders them by `clientId`. The choice is arbitrary but consistent — every replica reaches the same answer.
+
+That's the whole core. The block model below is the data structure that makes this efficient.
+
+## The block model
+
+Yjs stores everything as a doubly-linked list of `Item` blocks. An `Item` represents a contiguous run of inserted content — say, a string of characters all typed by the same client in sequence. Splitting and merging blocks happens automatically as edits land.
+
+<Code lang="ts" file="item.ts">{`// Simplified — the real Item has more fields for parent/sub-types and origin caching.
+class Item {
+  // Stable identifier. clientId is a per-session random number;
+  // clock counts ops produced by that client.
+  id: { clientId: number; clock: number };
+
+  // The item to my LEFT at the time I was inserted.
+  // null = I was inserted at the head.
+  origin: { clientId: number; clock: number } | null;
+
+  // The item to my RIGHT at the time I was inserted.
+  // null = I was inserted at the tail.
+  rightOrigin: { clientId: number; clock: number } | null;
+
+  // Live pointers (after current state of merges). These change as
+  // the document evolves; \`origin\` does not.
+  left: Item | null;
+  right: Item | null;
+
+  // What this block actually holds — characters, an embedded object,
+  // a reference to a sub-doc, etc.
+  content: Content;
+
+  // Tombstoned? See the next section for why deletion can't free memory.
+  deleted: boolean;
+
+  // Which Y.Doc field this belongs to (parent type).
+  parent: AbstractType;
+}
+`}</Code>
+
+A few things to internalize.
+
+**`origin` is immutable.** Once an item is created, its `origin` and `rightOrigin` never change. They record the state of the document at insert time. This is what makes YATA's integration deterministic — a remote item arriving at any replica integrates the same way, because it carries its own context.
+
+**`left` and `right` are live.** As other items get inserted around this one, the linked-list pointers update. The current document is read by walking `head → right → right → …` and concatenating content.
+
+**`deleted` is a flag, not a removal.** Deleted items stay in the list, just marked. The next section is about how Yjs eventually collapses them.
+
+## Conflict resolution: stable IDs, not timestamps
+
+Here's the canonical scenario. Two clients open an empty document. They both type "A" at position 0 simultaneously.
+
+Client 1 creates: `Item { id: (1, 0), origin: null, rightOrigin: null, content: "A" }`
+Client 2 creates: `Item { id: (2, 0), origin: null, rightOrigin: null, content: "A" }`
+
+When each client receives the other's item, both new items have the same `origin` (null — head of document) and the same `rightOrigin` (null — tail). They want to live in the same slot.
+
+YATA's tie-breaker: when two items would go in the same slot, the one with the _smaller clientId_ comes first. Both replicas independently apply that rule, both end up with `"AA"` in the same order, both replicas converge with no coordination.
+
+Why this is better than timestamps:
+- **No clock sync needed.** ClientId is assigned once at session start; clock is local-monotonic. Neither depends on machines agreeing about time.
+- **Survives offline merges.** A replica that's been offline for an hour and one that's been online both have valid clocks; integration still works.
+- **Tie-breaking is total.** Two timestamps can collide. Two `(clientId, clock)` pairs can't, because clientId is unique.
+
+If you've seen "last-write-wins" CRDTs, they use timestamps with a clientId fallback for ties — but they're a different kind of CRDT (LWW registers), used for things like a user's display name, not document content.
+
+## Binary update format
+
+Yjs encodes updates as binary blobs, not JSON. This matters more than it sounds.
+
+A typical Yjs update looks something like:
+- Varint-encoded count of client-IDs in this update
+- Per client: varint client-ID, varint starting clock, list of structs
+- Per struct: varint length, content (varint-encoded for known types), origin/rightOrigin references (compressed when adjacent)
+
+The result is roughly **10× smaller than the equivalent JSON** for editor-shaped workloads. A 10-character typo edit might be 30 bytes on the wire. A document state snapshot might be 1% of the size of its JSON serialization.
+
+You get the encoded form via:
+
+<Code lang="ts" file="encoding.ts">{`import * as Y from "yjs";
+
+const doc = new Y.Doc();
+const text = doc.getText("body");
+text.insert(0, "Hello");
+
+// Full state as a binary update — useful for snapshots and first-sync.
+const fullState: Uint8Array = Y.encodeStateAsUpdate(doc);
+
+// Just the diff since a peer's last-known state vector.
+const peerVector: Uint8Array = await peer.getStateVector();
+const diff: Uint8Array = Y.encodeStateAsUpdate(doc, peerVector);
+
+// On the receiving side
+Y.applyUpdate(doc, diff);
+`}</Code>
+
+The wire format is stable across Yjs versions (within a major), which means you can persist updates as opaque bytes in a database and replay them years later. Production teams use this for audit logs and time-travel features.
+
+## How a single keystroke flows through the system
+
+To make this concrete, here's what happens when a user types "x" in a Yjs-backed editor:
+
+1. **Editor binding fires.** y-prosemirror (or y-codemirror, or y-tiptap) intercepts the keystroke before it hits the editor's own state.
+2. **Local `Y.Text.insert(pos, "x")` runs.** Yjs creates a new `Item` with `id: (myClient, nextClock)`, `origin: <item to the left>`, `rightOrigin: <item to the right>`, integrates it into the linked list, marks the doc dirty.
+3. **Editor re-renders.** The binding observes the Yjs change and re-applies the diff to the editor's view layer.
+4. **Update is broadcast.** The Y.Doc emits an `update` event with the binary diff. Your provider (`y-websocket`, `y-webrtc`, `y-indexeddb`) hears it and ships the bytes.
+5. **Remote peer receives.** `Y.applyUpdate(remoteDoc, bytes)` runs. It integrates the new `Item` using the `origin`/`rightOrigin` pointers from the bytes — _the receiver doesn't need its own clock or any context to do this correctly_.
+6. **Remote editor updates.** Same binding mechanism in reverse.
+
+The whole round trip is typically sub-100ms LAN, sub-300ms across continents. The binary encoding plus the local-first apply (step 2 doesn't wait for the network) is what makes it feel real-time.
+
+<Reading url="https://blog.kevinjahns.de/are-crdts-suitable-for-shared-editing/" title="Are CRDTs suitable for shared editing?" author="Kevin Jahns" kind="blog" minutes={12} />
+<Reading url="https://www.researchgate.net/publication/310212186_Near_Real-Time_Peer-to-Peer_Shared_Editing_on_Extensible_Data_Types" title="YATA — Near Real-Time Peer-to-Peer Shared Editing on Extensible Data Types" author="Jahns, Petho (2016)" kind="paper" minutes={40} />
+<Reading url="https://docs.yjs.dev/api/internals" title="Yjs — Internals docs" kind="docs" minutes={10} />
+<Reading url="https://github.com/yjs/yjs/blob/main/INTERNALS.md" title="Yjs INTERNALS.md (the canonical source)" kind="docs" minutes={15} />
+
+**Remember this:** Yjs is a doubly-linked list of `Item` blocks. Conflicts are resolved by stable IDs (never timestamps). Updates are binary, ~10× smaller than JSON. Origin pointers, not positions, make integration deterministic.

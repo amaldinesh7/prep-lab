@@ -1,0 +1,95 @@
+---
+title: State-based vs op-based
+---
+
+<SectionHeader kind="concept" number={3} title="State-based vs op-based" />
+
+Both flavors of CRDT deliver the same end guarantee — strong eventual consistency. The difference is what travels on the wire. The choice shows up in your bandwidth bill, your reconnect logic, and how forgiving your transport has to be.
+
+## State-based (CvRDT)
+
+A state-based CRDT — sometimes written CvRDT, "convergent" — gossips its entire state. Each replica periodically (or on change) sends its full state to peers. The receiver merges the incoming state into its own via a _lattice join_: a function that takes two states and returns their least upper bound.
+
+The mental model is: every replica's state is a point in a partially ordered space. The join always moves you "upward" — toward more information, never less. Two replicas that have joined each other's states are guaranteed to be at the same point.
+
+<Code lang="ts" file="state-based.ts">{`// A state-based grow-only set (G-Set)
+type GSet<T> = Set<T>;
+
+const join = <T>(a: GSet<T>, b: GSet<T>): GSet<T> => new Set([...a, ...b]);
+
+// Broadcast loop (pseudo)
+async function gossip(local: GSet<string>, peer: Peer) {
+  setInterval(async () => {
+    const remote = await peer.fetchState();   // peer sends ENTIRE state
+    const merged = join(local, remote);       // lattice join
+    if (merged.size !== local.size) {
+      // we learned something; tell others on next tick
+      local = merged;
+    }
+  }, 5_000);
+}
+`}</Code>
+
+What's nice about state-based:
+- **No ordering requirement.** Messages can arrive in any order, get duplicated, get dropped — the next gossip will catch up the receiver.
+- **Reconnect is trivial.** A peer that's been offline for a week just sends its current state. The join handles everything.
+- **Math is clean.** The lattice structure is easy to reason about and easy to prove correct.
+
+What's expensive:
+- **Bandwidth scales with state size, not change size.** Edit one character in a 50KB document, send 50KB. Every gossip round.
+- **Merge cost scales with state.** Joining two 1MB G-Sets is O(n) every round.
+
+Production state-based CRDTs use _delta-state_ optimizations — only send the part of the state that changed since the peer's last seen version — to dodge the bandwidth issue. That's how AntidoteDB and similar systems work. It's a real engineering effort to do well.
+
+## Op-based (CmRDT)
+
+An op-based CRDT — CmRDT, "commutative" — broadcasts individual operations instead of full state. Each replica applies operations to its local copy. Convergence requires two things:
+
+1. The ops are pairwise commutative when applied to any reachable state.
+2. The transport guarantees _causal delivery_: if op B was created on a replica that had already seen op A, every other replica must see A before B.
+
+<Code lang="ts" file="op-based.ts">{`// An op-based grow-only set
+type Op = { type: "add"; value: string; from: ClientId };
+
+const apply = (set: Set<string>, op: Op) => set.add(op.value);
+
+// Broadcast on every local mutation
+function localAdd(set: Set<string>, value: string, broadcast: (op: Op) => void) {
+  const op: Op = { type: "add", value, from: myClientId };
+  apply(set, op);
+  broadcast(op); // network must deliver in causal order
+}
+`}</Code>
+
+What's nice about op-based:
+- **Bandwidth scales with change size.** Type one character, send one op. Editor-shaped workloads love this.
+- **Updates are cheap to log, persist, and replay.** Each op is small and self-contained.
+
+What's expensive:
+- **Causal delivery is a real constraint.** You need vector clocks or a topology that enforces ordering. UDP-style "fire and forget" doesn't cut it.
+- **Reconnect logic is trickier.** A replica that missed ops 5–17 needs to ask for them specifically. The transport has to track per-peer high-water marks.
+- **Duplicate suppression matters.** Op-based assumes exactly-once-or-better delivery; receivers usually dedupe by op ID.
+
+## When each flavor wins
+
+**Pick state-based when:** the dataset is small (tens of KB), updates are infrequent, and the network is hostile (mobile, satellite, BLE). Distributed-systems infrastructure work — service discovery, configuration propagation, shopping carts on Dynamo-style stores — is classic state-based territory.
+
+**Pick op-based when:** the dataset is large (documents, drawings) and updates are frequent and small. Every shipping collaborative editor — Yjs, Automerge, Figma, Linear's mutation log — is op-based or hybrid-leaning-op.
+
+## The hybrid that production CRDTs actually use
+
+In real life, Yjs and Automerge are hybrids. They look op-based on the wire — each edit sends a small binary update — but the data structure is designed so that any subset of updates can be merged in any order, like a state-based join. They don't strictly require causal delivery for correctness, because the merge is order-independent at the data-structure level.
+
+The way this plays out:
+
+- **Steady-state traffic:** small per-op binary updates. Op-based behavior.
+- **Reconnect after offline window:** the replica sends `Y.encodeStateAsUpdate(doc)` — the entire document's CRDT state, in binary. The receiver merges it. State-based behavior.
+- **Sync between cold peers:** both sides exchange a _state vector_ (`Y.encodeStateVector`), then each computes a diff (`Y.encodeStateAsUpdate(doc, peerStateVector)`) and sends only what the other is missing. Delta-state behavior.
+
+This is the right design for a real product. Op-based for bandwidth efficiency in the hot path, state-based fallback for joining new peers, delta-state for catching up cheap reconnects. The next section dives into how Yjs implements all of this.
+
+<Reading url="https://hal.inria.fr/inria-00555588/document" title="Conflict-free Replicated Data Types (Shapiro, Preguiça, Baquero, Zawirski)" author="Inria, 2011" kind="paper" minutes={40} />
+<Reading url="https://docs.yjs.dev/api/document-updates" title="Yjs — Document Updates" kind="docs" minutes={6} />
+<Reading url="https://www.bartoszsypytkowski.com/the-state-of-a-state-based-crdts/" title="The state of a state-based CRDTs" author="Bartosz Sypytkowski" kind="blog" minutes={15} />
+
+**Remember this:** State-based gossips full state and joins lattices. Op-based broadcasts ops and requires causal delivery. Production CRDTs are hybrids that do both, depending on the situation.

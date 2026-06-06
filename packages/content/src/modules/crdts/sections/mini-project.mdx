@@ -1,0 +1,189 @@
+---
+title: Two-tab collaborative editor
+---
+
+<SectionHeader kind="mini_project" number={8} title="Two-tab collaborative editor" />
+
+Three hours that take you from "I read about CRDTs" to "I have wired a Y.Doc to a CodeMirror editor, watched two browser tabs converge, inspected the binary update format, and forced a network partition." Once you've done this, the rest of the Yjs ecosystem is a small step.
+
+<ProjectCard hours="3" starter="./yjs-editor-starter">
+
+## Goal
+
+A minimal editor that:
+- Renders CodeMirror 6 bound to a Y.Text
+- Syncs across two browser tabs over WebSocket
+- Survives a deliberate offline period on one tab and converges on reconnect
+
+## Steps
+
+### 1. Scaffold
+
+```bash
+bun create vite yjs-editor --template vanilla-ts
+cd yjs-editor
+bun add yjs y-websocket y-codemirror.next
+bun add codemirror @codemirror/state @codemirror/view @codemirror/lang-markdown
+```
+
+We're using vanilla TypeScript to keep React out of the picture for this run — you'll see the Yjs primitives unobscured. (You can swap to React after; the bindings stay identical.)
+
+### 2. Start a local y-websocket server
+
+In a separate terminal:
+
+```bash
+PORT=1234 bunx y-websocket-server
+```
+
+That's it. `y-websocket-server` is a reference relay — it doesn't persist; it just broadcasts updates between connected clients in the same "room." Perfect for local dev.
+
+### 3. Wire CodeMirror to a Y.Doc
+
+Replace `src/main.ts` with:
+
+<Code lang="ts" file="src/main.ts">{`import * as Y from "yjs";
+import { WebsocketProvider } from "y-websocket";
+import { yCollab } from "y-codemirror.next";
+import { EditorState } from "@codemirror/state";
+import { EditorView, basicSetup } from "codemirror";
+import { markdown } from "@codemirror/lang-markdown";
+
+// 1. The shared document
+const doc = new Y.Doc();
+const ytext = doc.getText("body");
+
+// 2. Transport — connect to the local relay, room "demo"
+const provider = new WebsocketProvider("ws://localhost:1234", "demo", doc);
+
+// 3. Optional: presence (cursor color, name)
+provider.awareness.setLocalStateField("user", {
+  name: \`tab-\${Math.floor(Math.random() * 1000)}\`,
+  color: \`hsl(\${Math.floor(Math.random() * 360)} 70% 50%)\`,
+});
+
+// 4. Bind the editor
+const state = EditorState.create({
+  doc: ytext.toString(),
+  extensions: [
+    basicSetup,
+    markdown(),
+    yCollab(ytext, provider.awareness),
+  ],
+});
+
+const editor = new EditorView({
+  state,
+  parent: document.getElementById("editor")!,
+});
+
+// 5. Expose for poking from devtools
+Object.assign(window, { doc, ytext, provider, editor, Y });
+
+// 6. Status badge
+const status = document.getElementById("status")!;
+provider.on("status", ({ status: s }: { status: string }) => {
+  status.textContent = s;
+  status.style.color = s === "connected" ? "#10b981" : "#ef4444";
+});
+`}</Code>
+
+Update `index.html`:
+
+<Code lang="html" file="index.html">{`<!doctype html>
+<html>
+  <head><meta charset="utf-8" /><title>Yjs demo</title></head>
+  <body style="font-family: system-ui; max-width: 640px; margin: 40px auto;">
+    <h1>Yjs + CodeMirror</h1>
+    <p>Status: <span id="status">connecting…</span></p>
+    <div id="editor" style="border: 1px solid #ccc; min-height: 280px;"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>`}</Code>
+
+Run `bun run dev` and open the URL.
+
+### 4. Confirm convergence
+
+Open the same URL in a second tab. Type in one. Watch the other update in real-time. You should also see the remote tab's cursor render in a different color (that's the awareness layer).
+
+Now actually convince yourself the merge is structural, not "the server replays for you":
+
+1. Open DevTools in both tabs.
+2. In tab A, run `ytext.insert(0, "AAA")`.
+3. In tab B, run `ytext.insert(0, "BBB")`.
+4. Both should converge. Which string wins the front? Run `ytext.toString()` in both tabs and confirm they match. The order is deterministic — pinned by client IDs.
+
+### 5. Inspect the binary format
+
+Still in DevTools:
+
+```js
+// Full doc state as a binary update
+const u = Y.encodeStateAsUpdate(doc);
+console.log(u.byteLength, "bytes");
+console.log(u);  // Uint8Array
+
+// State vector (compact summary of what we've seen)
+const v = Y.encodeStateVector(doc);
+console.log(v.byteLength, "bytes");
+
+// Decode the update structurally
+const decoded = Y.decodeUpdate(u);
+console.log(decoded);  // { structs: [...], ds: ... }
+```
+
+For a doc with "hello world", the state update is maybe 30-50 bytes. JSON serialization of the same doc state would be 200+ bytes. The 5-10× ratio holds for editor-sized content.
+
+### 6. Force a network split, watch reconnect
+
+This is the headline experiment. With both tabs open:
+
+1. In tab A, open DevTools → Network → set throttling to "Offline."
+2. Type in tab A. Notice the status badge flips to disconnected. Edits still apply locally — the editor is responsive. The provider buffers the updates.
+3. Type _different_ content in tab B (still online). Tab A doesn't see B's edits; B doesn't see A's.
+4. Set tab A back to "Online."
+5. Watch both tabs converge — A's offline edits get sent, B's accumulated edits arrive at A.
+
+That's CRDT semantics on a live system. No conflict resolution UI fired. No "your edit failed." The merge is correct because the data structure makes it impossible to be wrong.
+
+### 7. Look at on-the-wire updates
+
+In tab A's DevTools → Network → WS, click the y-websocket connection, then "Messages." You'll see binary frames. Each user keystroke produces a tiny binary message — usually under 50 bytes — that gets relayed to tab B. Compare that to what a JSON-based "ops" channel would cost.
+
+## Stretch goals
+
+- **IndexedDB persistence.** Add `y-indexeddb`:
+  ```bash
+  bun add y-indexeddb
+  ```
+  ```ts
+  import { IndexeddbPersistence } from "y-indexeddb";
+  new IndexeddbPersistence("demo", doc);
+  ```
+  Close all tabs. Reopen. The doc reloads from IndexedDB before (or in parallel with) reconnecting to the server. Now your editor works offline-first.
+
+- **Toggle GC and observe.** Construct the doc as `new Y.Doc({ gc: false })`. Type a lot, delete a lot. Check `Y.encodeStateAsUpdate(doc).byteLength` over time vs the `gc: true` case. The growth difference is the tombstone cost.
+
+- **Replace CodeMirror with Tiptap.** Swap `y-codemirror.next` for `y-prosemirror` + Tiptap. Same Y.Doc, richer text model. This is the path to a real rich-text editor.
+
+- **Add a "save snapshot" button.** Capture `Y.encodeStateAsUpdate(doc)`, POST it to a tiny server, then a "load snapshot" button that `Y.applyUpdate(doc, snapshot)`s it back. You've just built the persistence pattern from the gotchas section.
+
+## What to internalize
+
+By the time you close the lid, you should be able to answer:
+
+- Why doesn't your editor's text get clobbered when two tabs type at the same instant?
+- What does `Y.encodeStateVector` give you that `Y.encodeStateAsUpdate` doesn't?
+- Where does the awareness state (cursor positions) live? Why isn't it inside the Y.Doc?
+- If the y-websocket server crashed mid-session, what would the clients lose? (Hint: with IndexedDB persistence, nothing.)
+- How small is a single-character edit on the wire? How does that compare to JSON?
+
+If these answers feel earned, not memorized, the project landed.
+
+</ProjectCard>
+
+<Reading url="https://docs.yjs.dev/getting-started/a-collaborative-editor" title="Yjs — A Collaborative Editor (tutorial)" kind="docs" minutes={15} />
+<Reading url="https://github.com/yjs/y-codemirror.next" title="y-codemirror.next (CodeMirror 6 binding)" kind="docs" minutes={5} />
+<Reading url="https://github.com/yjs/y-websocket" title="y-websocket (reference transport + server)" kind="docs" minutes={5} />
+<Reading url="https://github.com/yjs/y-indexeddb" title="y-indexeddb (offline-first persistence)" kind="docs" minutes={4} />

@@ -1,0 +1,113 @@
+---
+title: Tombstones and GC
+---
+
+<SectionHeader kind="pattern" number={5} title="Tombstones and garbage collection" />
+
+The single sharpest edge of CRDT design is that you cannot truly delete data. Once you understand why, you understand the memory profile of every CRDT library, and you can budget for it.
+
+## Why deletion has to be a flag
+
+Consider this sequence on two replicas:
+
+- Replica A inserts character "X" at position 5. (Item with id `(A, 0)`.)
+- Replica A deletes it.
+- Replica A goes offline.
+- Meanwhile, Replica B (which already saw the insert) inserts "Y" _immediately to the right of X_. Its new item's `origin` is `(A, 0)` — the X item.
+- A and B sync.
+
+If A had truly removed item `(A, 0)`, B's insert of Y would arrive carrying an `origin` pointer to nothing. The integration algorithm needs that pointer to position Y correctly. Throw it away and Y has no anchor — the document corrupts.
+
+The fix: deletion leaves the item in the structure but flips a `deleted: true` flag. The item is a _tombstone_. The text it used to hold is no longer shown to users, but the block still exists, still has its ID, still anchors other items' origin pointers.
+
+This is non-negotiable. Every list-CRDT — YATA, RGA, Logoot, Treedoc — has tombstones. There is no clever trick that avoids them.
+
+## The memory bill
+
+Tombstones cost memory. Over the lifetime of a document, every deleted character has a residual `Item` block (~50–100 bytes in Yjs) sitting in memory. A doc that has seen 1M edits but currently shows 10K characters still carries roughly the cost of those 1M items.
+
+For an interactive editor session (minutes to days), this is fine. For a doc that's been live-edited for years with millions of insertions and deletions, it's a problem. You need garbage collection.
+
+## How Yjs GC works
+
+The insight: a tombstone is only structurally necessary while there exist replicas that haven't seen the deletion yet. Once every replica has observed both the insert and the delete, you can collapse the tombstone — replace its content with a small "this item ID range was deleted" marker, drop the per-character bookkeeping, free the memory.
+
+Yjs implements this with a flag on the Y.Doc:
+
+<Code lang="ts" file="gc.ts">{`import * as Y from "yjs";
+
+// Default: gc is ON. Yjs will collapse tombstones aggressively.
+const doc = new Y.Doc();
+
+// Explicit, equivalent to the default:
+const doc2 = new Y.Doc({ gc: true });
+
+// Disabled — every item ever inserted stays as a full struct forever.
+// Use this when you need full edit history (Y.UndoManager across very long windows,
+// or audit logs that replay arbitrary historical states).
+const doc3 = new Y.Doc({ gc: false });
+`}</Code>
+
+When `gc: true`, Yjs runs a background pass during applyUpdate that finds runs of consecutive deleted items and merges them into a single placeholder. The reads still work because the placeholder preserves the ID range — anything pointing into it can still resolve the origin question correctly.
+
+## When `gc: true` is safe — and when it isn't
+
+The simple rule: GC is safe when every replica has observed the deletion. In practice, _every_ means "before any peer might come back online and try to integrate an op that references the deleted item."
+
+Safe cases:
+- **Short-window collaborative editing.** Two users in the same Liveblocks/y-websocket session. Reconnects happen within minutes. GC is fine — by the time someone reconnects, the server has already broadcast every delete.
+- **Server-relay topology.** A central server holds the authoritative Y.Doc. New clients fetch the current state. Old clients are out of luck for stale ops anyway. GC is fine on the server doc.
+
+Risky cases:
+- **Long offline windows.** A field tech edits a doc on Monday morning, doesn't reconnect until Friday. If the server has GC'd the items his offline ops reference, integrating his updates can break — depends on the exact ops, but the safe assumption is "don't."
+- **History features.** If you want `Y.UndoManager` to roll back arbitrarily far, or you want to display "what did this doc look like a month ago," you need the full struct history. GC kills both.
+- **Reproducible audit trails.** Compliance-sensitive products (legal, healthcare, finance) often want to replay every edit ever made. GC discards that detail.
+
+## The production pattern
+
+For most teams, the right pattern is a layered persistence model:
+
+<Code lang="ts" file="persistence.ts">{`import * as Y from "yjs";
+
+// In-memory doc: gc on. Cheap to operate, small footprint.
+const liveDoc = new Y.Doc({ gc: true });
+
+// Persistent log: every update gets appended to durable storage.
+// This is the audit trail and the source of truth.
+liveDoc.on("update", async (update: Uint8Array, origin: unknown) => {
+  if (origin === "remote") return; // don't echo
+  await db.appendUpdate(docId, update);
+});
+
+// Snapshot doc (cold storage): gc off. Used for history and rebuild.
+// Built periodically from the update log.
+async function buildSnapshot(docId: string): Promise<Y.Doc> {
+  const snap = new Y.Doc({ gc: false });
+  for (const update of await db.allUpdates(docId)) {
+    Y.applyUpdate(snap, update);
+  }
+  return snap;
+}
+`}</Code>
+
+The live doc uses GC for memory; the durable log preserves every update; you can rebuild the no-GC snapshot anytime by replaying the log. This separates "what the user is editing right now" (must be fast and small) from "the full history of the document" (must be complete).
+
+## Tombstones in non-Yjs CRDTs
+
+The same problem and roughly the same solution exist everywhere:
+
+- **Automerge** uses a similar approach: deleted items stay in the structure with a tombstone marker, and a "history compaction" pass merges them into compressed runs. Automerge has historically been less aggressive about GC, which is part of why its memory profile has been heavier.
+- **OR-Sets and PN-Counters** (set and counter CRDTs) carry per-element tombstones for the "remove" side. These typically GC by causally tracking which observers have seen the remove — same idea, smaller data.
+- **Riak's distributed data types** (when it shipped them) used a "vector-clock GC" approach: tombstones whose causal context is dominated by every replica's vector clock can be discarded.
+
+The pattern repeats. Tombstone, observe, collapse. Memorize it once.
+
+<Callout kind="pattern">
+  Default to `new Y.Doc({ gc: true })`. Turn it off only when (a) you need full history for undo/audit, or (b) your sync windows are longer than a couple hours. Pair the live doc with a durable update log so you can rebuild a no-GC snapshot on demand.
+</Callout>
+
+<Reading url="https://docs.yjs.dev/api/y.doc#advanced-creating-a-y.doc" title="Yjs — Y.Doc options (gc flag)" kind="docs" minutes={5} />
+<Reading url="https://josephg.com/blog/crdts-are-the-future/" title="CRDTs are the future" author="Joseph Gentle" kind="blog" minutes={15} />
+<Reading url="https://www.youtube.com/watch?v=B5NULPSiOGw" title="CRDTs Go Brrr (PWLConf talk on tombstones)" author="Joseph Gentle" kind="video" minutes={35} />
+
+**Remember this:** You can't truly delete from a CRDT — concurrent ops may point at deleted items. Tombstones mark the deletion, GC collapses them once every replica has observed it. `gc: true` is the default for good reason; turn it off only with intent.

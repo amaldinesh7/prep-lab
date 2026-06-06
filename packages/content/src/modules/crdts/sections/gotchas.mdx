@@ -1,0 +1,148 @@
+---
+title: Production gotchas
+---
+
+<SectionHeader kind="gotcha" number={7} title="Production gotchas" />
+
+Every team shipping CRDTs in production trips over these. None of them are bugs — they're properties of how the system works. Catching them in your second week is cheaper than catching them on a Friday at 5pm.
+
+## 1. Memory growth without GC, or with the wrong GC strategy
+
+The single most-reported "Yjs is broken" issue is memory creeping up on a long-lived server doc. The shape:
+
+- A Y.Doc is held in memory by your sync server (Hocuspocus, custom y-websocket server, Liveblocks-equivalent).
+- The doc is shared by users for weeks. Edits flow constantly.
+- Server memory rises steadily. Sometimes you OOM.
+
+Three causes, in order of likelihood:
+
+1. **You disabled `gc`.** Look at the Y.Doc construction. `new Y.Doc({ gc: false })` is the killer. If you turned it off for undo history, you're paying for every keystroke ever made.
+2. **You're holding stale snapshots.** Code that does `const snapshot = Y.encodeStateAsUpdate(doc)` and never lets the snapshot get GC'd by V8 is a slow leak. Snapshots are full state — they're big.
+3. **Sub-documents accumulating.** If your product creates new Y.Docs per session/conversation/page, are you also disposing of them? `doc.destroy()` is not automatic. Long-running servers keeping doc refs in maps forever leak the entire doc.
+
+The diagnostic: take a heap snapshot in Node DevTools while the issue is reproducing. Look for `Item` instances and `Y.Doc` instances. If `Item` count is huge → GC issue. If `Y.Doc` count is climbing → disposal issue.
+
+## 2. Update size grows on huge docs (encode/decode cost)
+
+Here's the surprise: even with binary encoding, a 5MB Y.Doc encoded as a full state update is 5MB of bytes that the client has to decode on initial sync. Decoding millions of items takes seconds — sometimes tens of seconds — on a low-end phone.
+
+You'll notice this when your editor takes 8 seconds to become interactive on first load for power-user docs. The fix is a multi-tiered sync strategy:
+
+<Code lang="ts" file="lazy-sync.ts">{`// On first load: send only the most recently used part of the doc,
+// then stream the rest in the background.
+async function lazyLoad(docId: string, clientStateVector: Uint8Array) {
+  const recent = await loadRecentSlice(docId);   // small, fast
+  await sendToClient(recent);
+
+  // Stream rest in chunks (each chunk = a delta from a checkpoint)
+  for await (const chunk of streamHistoricalChunks(docId, clientStateVector)) {
+    await sendToClient(chunk);
+  }
+}
+`}</Code>
+
+For most products, the lazy answer is good enough: paginate by sub-documents. Use one Y.Doc per "page" or "row" or "block" of your app, mount only the visible ones, lazy-load the rest. Yjs has first-class subdocument support (`Y.Doc#getSubdocs`).
+
+## 3. Persistence: snapshot + incremental, not full state every time
+
+The amateur persistence pattern: on every change, write `Y.encodeStateAsUpdate(doc)` to disk. This works until your doc is 1MB and your user types fast — now you're writing 1MB per keystroke. The disk dies, or the request queue saturates, or both.
+
+The right pattern is incremental:
+
+<Code lang="ts" file="persist.ts">{`import * as Y from "yjs";
+import * as db from "./db";
+
+doc.on("update", async (update: Uint8Array, origin: unknown) => {
+  // origin === "remote-sync" means it came from a peer — already persisted
+  if (origin === "remote-sync") return;
+  await db.appendUpdate(docId, update); // tiny — just the diff
+});
+
+// Periodically compact: load all updates, fold into a single state,
+// snapshot that, then delete the per-update log up to a checkpoint.
+async function compact(docId: string) {
+  const updates = await db.allUpdatesSince(docId, lastCheckpoint);
+  const doc = new Y.Doc();
+  for (const u of updates) Y.applyUpdate(doc, u);
+  const snapshot = Y.encodeStateAsUpdate(doc);
+  await db.writeSnapshot(docId, snapshot);
+  await db.deleteUpdatesBefore(docId, /* checkpoint = */ Date.now());
+}
+`}</Code>
+
+The pattern in plain English: append every incoming update as a row in a `doc_updates` table. Periodically (every hour, every 1000 updates, whatever fits) build a snapshot, write it to a `doc_snapshots` table, and prune the update log up to that point. On reload, restore the latest snapshot, then apply remaining updates.
+
+This is what every shipping Yjs server (`y-leveldb`, Hocuspocus's extensions, Liveblocks' backend) does internally. Don't reinvent it; if you're rolling your own server, copy this shape.
+
+## 4. Schema migration: how to add a field to existing docs
+
+You shipped v1 with `Y.Doc` containing a `title` (Y.Text) and `body` (Y.Text). Three months later you want to add `tags` (Y.Array). How?
+
+**The good news:** Y.Docs are open structures. `doc.getArray("tags")` on a v1 doc returns an empty Y.Array. You can read and write to it. Old docs auto-upgrade.
+
+**The bad news:** if you rename or restructure existing fields, you have a problem. v1 client writes to `body`, v2 client writes to `content`, they merge — both fields end up in the doc, neither client sees the other's edits.
+
+Survival rules:
+- **Never rename a field.** If you need to migrate, add a new field, dual-write for a transition period, eventually stop writing the old one.
+- **Never change a field's type.** A `Y.Text` cannot become a `Y.Array`. Add a new field of the new type.
+- **Version-gate at the client.** Detect schema version on read and adapt. Don't expect Y.Doc to migrate itself.
+- **For truly breaking changes**, write a one-time migration that creates a new Y.Doc with the desired shape, copies data over via the binding layer, and replaces the doc reference. Costly but unavoidable.
+
+This is one of the reasons local-first apps tend to evolve schemas more slowly than server-first apps. Plan your initial schema with more care.
+
+## 5. Network: don't ship full state every time
+
+Here's the bug: client reconnects, server doesn't know what the client has, so server sends `Y.encodeStateAsUpdate(doc)` — full state, every reconnect, on every flaky connection.
+
+The right move is state vectors. A state vector is a compact summary (per-clientId, the last clock the doc has seen) — 20-200 bytes regardless of doc size. The reconnect dance:
+
+<Code lang="ts" file="sync-protocol.ts">{`// Client side
+const myVector = Y.encodeStateVector(localDoc);
+ws.send({ type: "sync-step-1", vector: myVector });
+
+// Server receives sync-step-1
+const diffFromMyPerspective = Y.encodeStateAsUpdate(serverDoc, clientVector);
+const myVector = Y.encodeStateVector(serverDoc);
+ws.send({ type: "sync-step-2", update: diffFromMyPerspective, vector: myVector });
+
+// Client receives sync-step-2
+Y.applyUpdate(localDoc, update);
+const diffServerNeeds = Y.encodeStateAsUpdate(localDoc, serverVector);
+ws.send({ type: "sync-step-3", update: diffServerNeeds });
+`}</Code>
+
+Three round trips, but each carries only the bytes the other side is missing. The y-websocket library implements this protocol for you — if you're rolling your own provider, copy it.
+
+The anti-pattern to watch for: a custom WebSocket handler that, on `connect`, sends `Y.encodeStateAsUpdate(doc)` unconditionally. It works in dev (small doc, fast network) and explodes in prod (big doc, mobile network).
+
+## 6. Awareness state is not in the document — and shouldn't be
+
+Cursor positions, user presence ("Alice is typing"), selection highlights — these aren't document content. They're ephemeral. Putting them in the Y.Doc means every cursor move becomes a permanent change in the doc history. Memory, storage, network — all worse.
+
+Use `y-awareness` (a separate, ephemeral state channel that Yjs ships) for anything that disappears when the user disconnects. The doc is for persistent content. Awareness is for "who's here right now."
+
+<Code lang="ts" file="awareness.ts">{`import * as Y from "yjs";
+import { WebsocketProvider } from "y-websocket";
+
+const doc = new Y.Doc();
+const provider = new WebsocketProvider("ws://localhost:1234", "room-1", doc);
+
+// Awareness: ephemeral, not persisted in the doc
+provider.awareness.setLocalStateField("user", { name: "Alice", color: "#f59e0b" });
+provider.awareness.setLocalStateField("cursor", { anchor: 42, head: 42 });
+
+provider.awareness.on("change", () => {
+  const states = provider.awareness.getStates(); // Map<clientId, state>
+  // render cursors / presence list
+});
+`}</Code>
+
+<Callout kind="gotcha">
+  The classic Yjs production failures, in priority order: (1) memory growth because GC is off or sub-docs aren't disposed; (2) reconnect storms because you're sending full state instead of state-vector deltas; (3) schema drift because someone renamed a Y.Text field; (4) initial-load latency because the doc is 5MB and you're decoding it on a phone; (5) awareness state ending up in the doc. Audit for these on every code review of CRDT-touching code.
+</Callout>
+
+<Reading url="https://docs.yjs.dev/getting-started/working-with-shared-types" title="Yjs — Working with shared types" kind="docs" minutes={10} />
+<Reading url="https://github.com/yjs/y-protocols/blob/master/PROTOCOL.md" title="y-protocols PROTOCOL.md (sync protocol)" kind="docs" minutes={8} />
+<Reading url="https://tiptap.dev/docs/hocuspocus/getting-started/introduction" title="Hocuspocus — production Yjs server" kind="docs" minutes={6} />
+
+**Remember this:** the failures are all variations on "didn't budget for the data structure's actual size, on disk or on wire." Snapshot + incremental persistence. State-vector-based reconnect. Subdocs for large documents. Awareness for ephemera. Get these right early; retrofitting them is painful.

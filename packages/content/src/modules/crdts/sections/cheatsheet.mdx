@@ -1,0 +1,35 @@
+---
+title: Cheatsheet
+---
+
+<SectionHeader kind="cheatsheet" number={10} title="Cheatsheet" />
+
+Keep this open while you write Yjs code for the first month, and while you're reasoning about whether a CRDT is the right tool at all.
+
+<Cheatsheet rows={[
+  { k: "Algorithm Yjs uses", v: "YATA — a list CRDT in the Logoot/RGA family, by Jahns and Petho (2016)" },
+  { k: "Conflict resolution", v: "Stable (clientId, clock) IDs — never wall-clock timestamps" },
+  { k: "Storage shape", v: "Doubly-linked list of Item blocks; each Item has origin/rightOrigin pointers fixed at insert time" },
+  { k: "Update format", v: "Binary, ~10× smaller than equivalent JSON; stable across Yjs minor versions" },
+  { k: "Memory cost", v: "~3× plain-string cost for Y.Text at editor scale; higher with no GC or heavy edit history" },
+  { k: "GC enable", v: "new Y.Doc({ gc: true }) — the default; turn off only for full-history or long offline windows" },
+  { k: "State CRDT (CvRDT)", v: "Gossip full state + commutative/associative/idempotent lattice join" },
+  { k: "Op CRDT (CmRDT)", v: "Broadcast individual ops + require causal delivery from the transport" },
+  { k: "Strong eventual consistency", v: "Same op set, any order → same state. The three algebraic properties get you there." },
+  { k: "Persistence pattern", v: "Append every update to a log; periodic snapshot + prune; rebuild on demand from log" },
+  { k: "Reconnect protocol", v: "Exchange state vectors first, then send only diffs (Y.encodeStateAsUpdate(doc, peerVector))" },
+  { k: "Transport options", v: "y-websocket (relay), y-webrtc (P2P), y-indexeddb (local), Hocuspocus (full-featured server)" },
+  { k: "Editor bindings", v: "y-codemirror.next, y-prosemirror (Tiptap, BlockNote), y-monaco" },
+  { k: "Ephemeral state", v: "Use provider.awareness for cursors and presence — NOT the Y.Doc (which is persistent)" },
+  { k: "Sub-documents", v: "doc.getMap('pages').set(id, new Y.Doc()); load only the visible ones" },
+  { k: "Schema evolution", v: "Additive only. Never rename or retype fields on existing docs; dual-write during migrations" },
+  { k: "When CRDTs are wrong", v: "Last-write-wins is fine; you need invariants/transactions; central server already exists for OT; banking" },
+  { k: "When CRDTs win", v: "Collaborative + offline-capable + no single coordinator + structural merge correctness needed" },
+  { k: "Tombstones", v: "Deletion is a flag, not a removal — concurrent ops may still reference the deleted item's ID" },
+  { k: "Alternatives", v: "Automerge (cleaner API, heavier memory); OT (smaller doc, needs central server + huge effort); LWW for single fields" },
+  { k: "Hot read", v: "Kevin Jahns, \"Are CRDTs suitable for shared editing?\" — the canonical defense" },
+  { k: "Production server", v: "Hocuspocus (Tiptap team) — implements snapshot + log + presence + auth + extensions" },
+  { k: "Common production bug", v: "Sending Y.encodeStateAsUpdate(doc) on every reconnect instead of diffing against the client's state vector" }
+]} />
+
+**Remember this:** CRDTs are a structural answer to "converge without a coordinator." Yjs is what most teams ship. Yjs gives you that for free in return for ~3× memory, an immutable block model, and the discipline to handle GC, persistence, and schema evolution thoughtfully. When all of that matches your product, it's the right call. When it doesn't, last-write-wins on Postgres is still a great tool.

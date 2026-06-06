@@ -1,0 +1,85 @@
+---
+title: When NOT to use CRDTs
+---
+
+<SectionHeader kind="tradeoff" number={6} title="When NOT to use CRDTs" />
+
+CRDTs are the right answer to a small, specific question: "how do I get convergence without a coordinator." When that's your question, they're brilliant. When it isn't, they're an expensive way to write a feature you didn't need. Here are the cases where I'd push back on a teammate reaching for Yjs.
+
+## You only need last-write-wins, and your users agree
+
+For a startling number of fields in a startling number of products, "the most recent edit wins, end of story" is the correct semantics. User profile name. Workspace background color. The toggle state of a setting. The current title of a doc.
+
+If two users edit the workspace name to different values at the same instant, you don't need a merged "Acmecorp Project Phoenix" string — you need to pick one and move on. A timestamp-tagged LWW register, served from your normal database, is the right primitive. It's cheaper than a CRDT, easier to query, easier to debug, and your team already knows how to use it.
+
+Spending a Y.Doc on a single string field is roughly the same instinct as reaching for Redux to manage a checkbox.
+
+## Convergence ≠ "the merge the user wanted"
+
+This one is subtle and important. A CRDT guarantees that all replicas reach _a_ state, not _the_ state any user expected.
+
+The canonical failure mode: two users editing the same paragraph. User A rewrites sentence 1; User B rewrites sentence 2. The CRDT merges character-by-character. The result is technically convergent and likely useful. Now imagine instead that User A deletes the paragraph entirely and User B fixes a typo in the same paragraph. The CRDT merge gives you... the typo fix surviving on a half-deleted paragraph. Convergent. Garbage.
+
+CRDTs hand you a deterministic merge. They do not have opinions about whether that merge is the right semantics for your users. _Semantic conflicts still need product design._ Figma shows you both versions of the layer. Linear quietly resolves edit conflicts but pops a banner. Notion has invisible last-write-wins for some properties, character-merging for others.
+
+The lesson: even with a CRDT, you'll need a conflict UI strategy for the cases where the auto-merge is technically right but practically wrong. Don't pretend that "CRDTs handle conflicts" means "you don't have to think about conflicts."
+
+## You need transactional consistency
+
+Banking. Inventory. Anything where "user A spent $50 and user B spent $50 from the same account that had $80" needs to be detected and one of them has to fail.
+
+This is the cap-theorem moment. CRDTs sit on the AP side — Available + Partition-tolerant, sacrificing strict consistency. You cannot build a bank account ledger on a CRDT and refuse overdrafts. The structure literally doesn't let you say "no, I won't accept this op because the global state would be invalid" — every op has to merge, by definition.
+
+If your data needs preconditions checked against a global state, you need a coordinator. Postgres transactions. A central server. Strong consistency. CRDTs are the wrong tool, and trying to bolt invariants onto them by checking-after-the-fact ("if the balance went negative, undo") is a recipe for the kind of bugs that end up in front of regulators.
+
+## Operational transform beats CRDTs when you already have a central server
+
+If you have a server that every edit goes through anyway — Google Docs is the canonical example — operational transform (OT) has real advantages over CRDTs:
+
+- **Smaller memory.** No tombstones. The document is just the document.
+- **Smaller updates.** No origin pointers — positions are recomputed by the central server.
+- **History is just a list of ops.** Trivial to time-travel, audit, replay.
+
+The reason most new products don't pick OT is that OT requires a central server and a heroic implementation effort. If you've already built that infrastructure (Google has), OT wins. If you haven't, CRDTs let you avoid building it.
+
+This is the actual axis: OT trades engineering effort and topology rigidity for smaller, faster runtime; CRDTs trade memory and structural verbosity for the freedom to never need a coordinator. Pick by deployment shape, not by reading a paper.
+
+## Schema evolution is harder than it looks
+
+Adding a field to a Postgres table is a migration. Adding a field to a Y.Doc — across thousands of existing docs that clients might still be editing offline — is a research problem.
+
+The naive approach: bump a version field, read both old and new shapes in your binding code, write only the new shape. This works _if_ all your clients update simultaneously. If a v1 client is editing a doc that a v2 client has already migrated, the v1 client's writes to the old field structure can resurrect deleted state or shadow the new field entirely.
+
+Production teams handle this with:
+- **Additive-only schema changes.** Never rename, never delete fields; always add new ones. The old code path keeps working.
+- **Version-gated read paths.** Detect the schema version on read and adapt the binding. Don't try to migrate the doc itself.
+- **Forced client upgrade windows.** For breaking changes, refuse to load old clients and let users update.
+
+This is more painful than relational migrations, and it's a real ongoing cost. Budget for it.
+
+## Your data doesn't actually have concurrent edits
+
+Look at the actual product. If 95% of your "documents" are edited by one user at a time, with multi-user activity being rare and tolerable as last-write-wins, you don't need a CRDT — you need a database with optimistic locking and a "someone else is editing this" indicator. Cheaper to build, easier to maintain, fits in your existing stack.
+
+The default I'd push: ship the LWW version first. If users start complaining about concurrent-edit data loss, _then_ reach for a CRDT. Don't pay the cost up front for a problem you might not have.
+
+## Memory and storage costs at editor scale
+
+To put numbers on it:
+
+- **Y.Text vs plain string:** ~3× the memory at editor scale (10K–100K characters). Acceptable.
+- **Y.Text in a heavily-edited doc (millions of historical ops, GC on):** ~5–10× depending on edit pattern. Manage with periodic snapshots.
+- **Update log on the server, no compaction:** grows linearly with edit count. A doc with 1M edits and updates averaging 40 bytes = 40MB on the server. Per doc. Multiply by docs in your product.
+- **Initial sync payload for a fresh client:** the full `Y.encodeStateAsUpdate(doc)`. For an active doc, this can be hundreds of KB to a few MB. Plan for it on slow connections.
+
+None of these are deal-breakers, but they're real numbers. If you're shipping to a phone with a slow connection and a tight memory budget, do back-of-envelope math before committing.
+
+<Callout kind="tradeoff">
+  CRDTs are the right tool for collaborative + offline-capable products where the merge being deterministic is structurally important. They are the wrong tool for fields that should be last-write-wins, for invariants that need a coordinator, for products where concurrent editing is rare, and for systems where you already have a central server and the engineering depth for OT. Pick by your deployment topology and conflict semantics, not by the paper count.
+</Callout>
+
+<Reading url="https://www.inkandswitch.com/local-first/" title="Local-first software (Ink & Switch)" author="Kleppmann et al." kind="paper" minutes={45} />
+<Reading url="https://martin.kleppmann.com/2022/10/12/crdt-myths.html" title="Five Common Misconceptions About CRDTs" author="Martin Kleppmann" kind="blog" minutes={12} />
+<Reading url="https://www.figma.com/blog/how-figmas-multiplayer-technology-works/" title="How Figma's multiplayer technology works" author="Evan Wallace" kind="blog" minutes={15} />
+
+**Remember this:** CRDTs are an answer to convergence-without-coordination. If you don't need that — because LWW is fine, because you need invariants, because you already have a server — they're an expensive way to write the wrong solution. Pick by the shape of the problem, not by the elegance of the algorithm.

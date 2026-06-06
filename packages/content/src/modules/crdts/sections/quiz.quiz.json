@@ -1,0 +1,64 @@
+{
+  "questions": [
+    {
+      "id": "q1",
+      "prompt": "Why does Yjs use stable IDs `(clientId, clock)` instead of timestamps to resolve concurrent inserts?",
+      "options": [
+        { "id": "a", "label": "Timestamps need wall-clock synchronization across machines, which is unreliable; stable IDs are local-monotonic and total-ordered without coordination" },
+        { "id": "b", "label": "Stable IDs are smaller than 64-bit timestamps in memory" },
+        { "id": "c", "label": "Timestamps can't represent insertions that happen in the same millisecond" },
+        { "id": "d", "label": "Yjs predates the JavaScript Date API supporting nanoseconds" }
+      ],
+      "correct": "a",
+      "explanation": "Clock skew between clients makes timestamp ordering unreliable, and timestamp ties still need a tiebreaker. `(clientId, clock)` pairs are unique by construction (no two clients share a clientId), local-monotonic (clock only goes up), and impose a total order that every replica agrees on without coordination. The other options describe real but secondary benefits."
+    },
+    {
+      "id": "q2",
+      "prompt": "What's the primary difference between state-based (CvRDT) and op-based (CmRDT) CRDTs?",
+      "options": [
+        { "id": "a", "label": "State-based supports offline edits; op-based does not" },
+        { "id": "b", "label": "State-based gossips the entire replica state and merges via lattice join; op-based broadcasts individual operations and requires causal delivery" },
+        { "id": "c", "label": "State-based is for text; op-based is for counters" },
+        { "id": "d", "label": "State-based runs on a single machine; op-based requires multiple machines" }
+      ],
+      "correct": "b",
+      "explanation": "The wire shape and ordering requirements are the split. State-based sends full state, joins are commutative/associative/idempotent by lattice structure, and order doesn't matter. Op-based sends individual ops and needs the transport to deliver them in causal order. Both deliver strong eventual consistency; they just trade bandwidth against ordering."
+    },
+    {
+      "id": "q3",
+      "prompt": "When is it safe to construct a Y.Doc with `gc: true`?",
+      "options": [
+        { "id": "a", "label": "Always — the GC is fully transparent and never has correctness implications" },
+        { "id": "b", "label": "Only when there's only one peer (no real collaboration), so deletes never race with concurrent ops" },
+        { "id": "c", "label": "When every peer has observed the deletions before any might come back online with stale ops — typically when sync windows are short (minutes to a few hours)" },
+        { "id": "d", "label": "Only on the server, never on clients" }
+      ],
+      "correct": "c",
+      "explanation": "GC collapses tombstones once they're causally observed by all live replicas. If a long-offline peer reconnects later with ops that reference items the server has already GC'd, integration can fail. Short sync windows make this safe; long offline windows or full-history features (undo across days, audit replay) need `gc: false`."
+    },
+    {
+      "id": "q4",
+      "prompt": "Roughly how does the memory cost of `Y.Text` with 100K characters compare to the same string as a plain JavaScript string?",
+      "options": [
+        { "id": "a", "label": "Approximately the same" },
+        { "id": "b", "label": "~3× the plain-string cost — each character lives in an Item block with origin pointers and metadata" },
+        { "id": "c", "label": "~100× the plain-string cost — Yjs is fundamentally inefficient for text" },
+        { "id": "d", "label": "Half the cost — Yjs uses binary encoding that beats UTF-16 strings" }
+      ],
+      "correct": "b",
+      "explanation": "The ~3× figure is the canonical number for editor-scale text. Items carry IDs, origin/rightOrigin pointers, content, and flags; the overhead per character is real but bounded. Heavily edited docs (tombstones + GC patterns) can go higher. Plain strings are cheaper, but they don't merge — that's the trade."
+    },
+    {
+      "id": "q5",
+      "prompt": "What does 'strong eventual consistency' guarantee about CRDT replicas?",
+      "options": [
+        { "id": "a", "label": "All replicas always have identical state at every instant" },
+        { "id": "b", "label": "Replicas converge to the latest update, where 'latest' is determined by wall-clock timestamps" },
+        { "id": "c", "label": "Any two replicas that have received the same set of updates are in the same state — independent of the order they arrived, because the merge function is commutative, associative, and idempotent" },
+        { "id": "d", "label": "A central coordinator broadcasts a canonical order; replicas catch up to that order eventually" }
+      ],
+      "correct": "c",
+      "explanation": "SEC is order-independent convergence given the same op set. The three algebraic properties — commutative, associative, idempotent — are what let any application order, including duplicates, reach the same final state. Option (a) is too strong (instantaneous consistency); (b) and (d) describe last-write-wins and coordinated systems respectively, not CRDTs."
+    }
+  ]
+}
