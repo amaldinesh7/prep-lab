@@ -1,0 +1,123 @@
+---
+title: Tradeoffs
+---
+
+<SectionHeader kind="tradeoff" number={6} title="Tradeoffs" />
+
+The SW pitch sounds unambiguous: offline, push, install — all wins. The reality is messier. Service workers add a real ops complexity tax, mask bugs in distinctive ways, and aren't the right answer for every app. Senior engineering work is knowing when to skip them entirely.
+
+## The ops complexity is real
+
+A SW is a second runtime. It has its own:
+
+- Lifecycle (install, waiting, activate)
+- Versioning story (cache namespaces, manifest hashes)
+- Update flow (which version is live? which cache is the user reading?)
+- Debugging surface (Chrome DevTools → Application → Service Workers; separate console; "Update on reload" toggle)
+- Failure modes (failed install, stuck in waiting, "ghost SW" serving stale code)
+- Mental model for the rest of the team
+
+Every junior engineer who joins your team will need to learn this. Every bug that traces back to "the SW served the wrong thing" will take them twice as long to diagnose the first time. Every deploy that goes weird will have someone asking "is it the SW?"
+
+That cost is paid forever. A team that ships a SW commits to maintaining it.
+
+## Not every app needs offline
+
+A short, honest list of apps that probably don't need a SW:
+
+- **An internal admin dashboard for a 50-person company.** They use it at desks on Wi-Fi. Caching's job is done by HTTP and a CDN.
+- **A B2B SaaS app whose users are on hardwired desktops.** Same story; the offline edge case is "Comcast outage" and the fix is "wait."
+- **A dev-tool app whose users are always near a terminal.** They're not opening it on the subway.
+- **A read-only marketing site.** A static CDN with sane cache headers gives you instant repeat visits without any SW code.
+
+And the apps that genuinely do need one:
+
+- **Anything used heavily on mobile in transit.** Note-taking, messaging, reading, todo, navigation.
+- **Anything with real collaboration semantics.** Offline edits + conflict resolution + sync = a foundation worth building on.
+- **Anything that wants push notifications.** SW is the only way.
+- **Anything you want users to "install"** as a PWA. The browser won't show the install prompt without a registered SW.
+
+If your app's offline story is "you can't" and that's a fine answer for your users, don't add a SW. The complexity won't pay back.
+
+## SW caches can mask bugs
+
+This is the failure mode that bites the most teams. A SW sits between your page and the network. Your page sees responses the SW chose to give it. If the SW is serving last week's bundle, your bug report says "user sees old code" — but the deploy looks fine, the CDN looks fine, the build artifact is correct.
+
+The flow:
+
+1. You ship a deploy that fixes a bug.
+2. Users still see the bug.
+3. You verify the deploy. CDN is clean. Build is clean.
+4. You finally check the SW. It's serving the old bundle from cache.
+5. The old bundle hits an old endpoint that returns a different shape than the new one.
+6. The page renders the wrong thing.
+
+The user's experience: "this app is broken." Your experience: an hour of confusion before "is it the SW?" enters your head. Then a half-day of writing tooling so it doesn't happen again.
+
+The mitigations exist (versioned caches, prompt-to-update, navigation network-first), but you have to install them on purpose. The default of "register a SW and start caching everything" is the path to this bug.
+
+## When a CDN + HTTP caching is enough
+
+Before reaching for a SW, ask whether HTTP-layer caching does the job.
+
+- Static assets with content hashes (`main.a1b2.js`) → `Cache-Control: public, max-age=31536000, immutable`. Browser handles it perfectly. No SW required.
+- HTML that's mostly the same across visits → `Cache-Control: public, max-age=0, must-revalidate` + a strong ETag. Fast 304s on repeat visits.
+- API responses your CDN can fan out → `Cache-Control: s-maxage=60, stale-while-revalidate=86400` at the CDN, no SW needed.
+
+If all your offline use cases are "make repeat visits faster," HTTP caching is enough. SW earns its keep when you need behavior the network layer can't give you: cache-then-revalidate on the client, offline reads when the network is unreachable, write queues, push.
+
+The "SW = always faster" intuition is wrong. A well-tuned CDN + HTTP cache is competitive with a SW for warm-cache loads and dramatically simpler.
+
+## The skipWaiting tradeoff
+
+Module 2 introduced `skipWaiting` + `clients.claim` as the easy path. The catch:
+
+If your app has long-running stateful connections — a `MessageChannel` to the SW, a `BroadcastChannel`, an in-flight `fetch` that the SW is mid-handling — and you swap the SW underneath them, those connections see incoherent state. The old page expects the old SW's protocol; suddenly the new SW is on the other end.
+
+For most apps this is fine. For apps with a heavy SW protocol (sync engines, collaborative documents, anything where SW is a stateful coordinator), it isn't. The prompt-to-reload pattern is the disciplined answer:
+
+- New SW installs and waits
+- App detects the waiting SW
+- App shows "Reload to update"
+- User clicks reload → app explicitly calls `skipWaiting()` and reloads
+- The old SW and old page die together; the new SW comes up clean
+
+You give up "instant updates for everyone" and gain "no incoherent state across versions." For collab apps, the tradeoff is obvious.
+
+## Quota and eviction
+
+Browsers don't promise to keep your cache. They promise to keep it if there's room. Eviction policies vary:
+
+- **Chromium**: large, soft quota (~60% of disk per origin). Eviction on global storage pressure.
+- **Safari**: 7-day eviction if the user hasn't visited the site, since iOS 13.4. Aggressive.
+- **Firefox**: similar to Chromium, slightly tighter.
+
+The implication: your offline reader can lose its archive if the user doesn't visit for a week on iOS. Plan for it. Treat the cache as a hint, not a guarantee, for anything user-data-shaped. Critical user data goes in IndexedDB with explicit `navigator.storage.persist()` (which prompts the user on some browsers, silently grants on others, and is the only way to ask the browser "don't evict me").
+
+This isn't a reason to avoid SWs; it's a reason to design with eviction in mind.
+
+<Callout kind="tradeoff">
+  The SW tax is paid every day forever — debugging, versioning, mental model, the ghost-SW problem. The wins are real and worth it _for the right apps_: anything mobile, anything collab, anything that needs push. For an internal dashboard or a B2B SaaS app where users are on Wi-Fi at desks, a CDN with sane HTTP caching gives you 90% of the speed without the complexity. Don't ship a SW because PWAs are cool. Ship one because the user's experience requires it.
+</Callout>
+
+## Senior take
+
+The decision matrix:
+
+| Question | Yes → SW | No → skip |
+| --- | --- | --- |
+| Mobile users in transit? | ✓ | |
+| Offline reads required? | ✓ | |
+| Offline writes / sync? | ✓ | |
+| Push notifications? | ✓ | |
+| Installable PWA? | ✓ | |
+| Just want repeat visits faster? | | Use HTTP caching |
+| Just want CDN-edge caching? | | Use a CDN |
+
+If you have zero checks in the "Yes → SW" column, the SW will cost you more than it gives. If you have one, it's a serious option. Two or more, it's the foundation you should plan for from the first commit.
+
+<Reading url="https://web.dev/articles/storage-for-the-web" title="Storage for the Web" author="Pete LePage, Thomas Steiner" kind="docs" minutes={12} />
+<Reading url="https://webkit.org/blog/10218/full-third-party-cookie-blocking-and-more/" title="Full Third-Party Cookie Blocking and More (Safari 7-day eviction)" author="John Wilander" kind="blog" minutes={6} />
+<Reading url="https://jakearchibald.com/2015/thats-so-fetch/" title="That's so fetch! — Fetch as the foundation for SW" author="Jake Archibald" kind="blog" minutes={8} />
+
+**Remember this:** A SW is the right tool for mobile-first, collab, push, or installable PWAs. It's the wrong tool for an internal dashboard. The complexity tax is paid forever; charge it only when the wins justify it.

@@ -1,0 +1,166 @@
+---
+title: Lifecycle
+---
+
+<SectionHeader kind="concept" number={2} title="Lifecycle: install, activate, fetch" />
+
+The SW lifecycle is the single most-misunderstood thing about service workers. Most bugs labeled "the SW isn't working" are actually "the SW is working exactly as designed, and the design surprised me." Get the lifecycle right and the rest of the module clicks.
+
+## The five states
+
+A SW moves through five states. You'll touch each one in code or in DevTools.
+
+1. **Parsed.** The browser downloaded the script, parsed it, set up the registration.
+2. **Installing.** The `install` event is firing. This is your one chance to pre-cache things before the SW becomes responsible for requests.
+3. **Installed (waiting).** Install succeeded. The SW sits idle until every page controlled by the _previous_ SW closes. This is the part that surprises people.
+4. **Activating.** The previous SW's clients are gone (or you forced the issue). The `activate` event fires — your chance to clean up old caches.
+5. **Activated.** The SW is now controlling pages and seeing `fetch` events.
+
+A failed install or activate handler moves the SW to "redundant" — dead, garbage-collected. Throwing in `install` is a real way to kill a deploy.
+
+## Registration
+
+Registration is what you do from the page. It's the bridge between "I have a SW file" and "the browser knows about it."
+
+<Code lang="ts" file="src/main.ts">{`if ("serviceWorker" in navigator) {
+  window.addEventListener("load", async () => {
+    try {
+      const reg = await navigator.serviceWorker.register("/sw.js", {
+        scope: "/", // default; controls which URLs this SW intercepts
+        type: "module", // if your sw.js uses import statements
+      });
+      console.log("SW registered with scope:", reg.scope);
+    } catch (err) {
+      console.error("SW registration failed:", err);
+    }
+  });
+}`}</Code>
+
+Two rules about registration that you must internalize:
+
+**Scope is bounded by file location.** A SW at `/sw.js` can have scope `/`. A SW at `/app/sw.js` can _only_ have scope `/app/` or narrower. You cannot put the SW deep in your bundle output and have it control the whole origin. This is why bundler-served SWs go through a plugin (Workbox, vite-plugin-pwa) — the plugin emits the SW at the root and rewrites paths.
+
+**Scope is set at register time, not in the SW.** You can register the same `sw.js` at different scopes from different pages. The scope you pass in `register()` is the one that sticks.
+
+## The install event
+
+`install` fires once per SW version. It's your one shot to pre-fetch resources you want available offline before this SW takes over.
+
+<Code lang="ts" file="src/sw.ts">{`// In the SW global scope, "self" is the ServiceWorkerGlobalScope.
+declare const self: ServiceWorkerGlobalScope;
+
+const CACHE_VERSION = "app-shell-v3";
+const SHELL = ["/", "/index.html", "/main.js", "/main.css", "/icon.svg"];
+
+self.addEventListener("install", (event) => {
+  event.waitUntil(
+    (async () => {
+      const cache = await caches.open(CACHE_VERSION);
+      await cache.addAll(SHELL);
+    })(),
+  );
+});`}</Code>
+
+`event.waitUntil(promise)` is the lifecycle escape hatch. It tells the browser "don't move me to 'installed' until this promise resolves." Without it, the SW would install while the pre-cache is still in flight.
+
+`cache.addAll(urls)` is atomic — if _any_ URL fails to fetch (404, network error), the whole `addAll` rejects, `waitUntil` rejects, install fails, the SW becomes redundant. That's a feature: a half-cached shell is worse than no cache at all. The implication is that you should keep the shell list small and reliable.
+
+## The waiting state — the part that bites
+
+Here's the surprise. After `install` succeeds, the SW does _not_ start handling fetches. It waits. The waiting SW only takes over when every page that was loaded under the old SW has closed. Refreshing the tab is not enough — the old SW stays alive across navigations within its scope.
+
+In practice this means: you deploy SW v2, your users keep seeing v1 until they close every tab of your site. For users who keep your dashboard open all day, "every tab" is "tomorrow morning, maybe."
+
+The waiting design is intentional — it prevents one tab from running v1 of your code while another tab runs v2, where they'd disagree about cache shapes, message protocols, and database schemas. The cost is update latency.
+
+## skipWaiting and clients.claim — the shortcuts
+
+Two APIs cut through the waiting design. Use them when you understand what they do.
+
+<Code lang="ts" file="src/sw.ts">{`self.addEventListener("install", (event) => {
+  // Move from "installed" to "activating" without waiting for old clients to close.
+  self.skipWaiting();
+  event.waitUntil(precacheShell());
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    (async () => {
+      await cleanupOldCaches();
+      // Take control of any already-open pages immediately, without a reload.
+      await self.clients.claim();
+    })(),
+  );
+});`}</Code>
+
+`skipWaiting()` tells the SW: "the moment install finishes, become the active SW even if old clients are around." `clients.claim()` then takes control of those existing pages, so they start receiving fetches from the new SW without a reload.
+
+The pair is the right default for content sites and read-heavy apps. **It is the wrong default for apps where cache shapes or message protocols change between versions.** If v1 of your page is holding a long-running `postMessage` connection to v1 of the SW, and you swap to v2 mid-flight, the protocol mismatch will manifest as silently-dropped messages or runtime crashes. The Gotchas section has a longer note on this.
+
+A safer pattern for those apps: detect the new SW, prompt the user to refresh, and only `skipWaiting()` once they accept.
+
+## The activate event
+
+`activate` fires when the SW takes control. Two jobs live here.
+
+<Code lang="ts" file="src/sw.ts">{`const CACHE_VERSION = "app-shell-v3";
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    (async () => {
+      // 1. Delete caches owned by older SW versions.
+      const keys = await caches.keys();
+      await Promise.all(
+        keys.filter((k) => k !== CACHE_VERSION).map((k) => caches.delete(k)),
+      );
+
+      // 2. Optionally, take control of existing clients.
+      await self.clients.claim();
+    })(),
+  );
+});`}</Code>
+
+If you don't clean up old caches in `activate`, they accumulate. Browser quotas vary — Chrome is generous, Safari less so — and you'll eventually hit a `QuotaExceededError` on `cache.put`. The convention is to namespace caches by SW version and prune everything except the current one.
+
+## The fetch event
+
+This is where SWs earn their keep. Every request your page makes — fetch, XHR, navigation, image, font, script — goes through `fetch` if the request URL is within scope.
+
+<Code lang="ts" file="src/sw.ts">{`self.addEventListener("fetch", (event) => {
+  // You MUST call respondWith synchronously (or not at all).
+  // If you skip it, the browser does the default network fetch.
+  event.respondWith(
+    (async () => {
+      const cached = await caches.match(event.request);
+      if (cached) return cached;
+      return fetch(event.request);
+    })(),
+  );
+});`}</Code>
+
+Two rules about `fetch`:
+
+**Respond synchronously or pass.** `event.respondWith(promise)` must be called inside the event handler synchronously. You can pass it a promise (async work is fine), but the _decision_ to handle the request must be made before the handler returns. If you don't call `respondWith`, the browser falls through to default network handling — which is often what you want for requests you're not caching.
+
+**Filter what you intercept.** Don't pass every request through your cache logic. Cross-origin requests, POSTs, range requests, and analytics beacons have edge cases that your "cache-first" code will mishandle. Either narrow with `if (event.request.method !== "GET") return;` early, or use Workbox's route matching.
+
+## Update flow
+
+When you ship a new SW, the browser fetches the new `sw.js`, byte-compares it to the old one, and if they differ (even by a comment), starts the install → waiting → activate cycle. Browsers do this check on navigation by default, and at most every 24 hours for long-lived clients. Some HTTP cache headers on `sw.js` can interfere — the browser ignores them up to a 24h cap, but serving `sw.js` with `Cache-Control: max-age=0` is the safe default.
+
+The bytewise comparison means changing _any_ byte forces an update. Workbox-generated SWs embed a precache manifest with content hashes, so adding a new asset to the precache changes the manifest hash, which changes a byte in the SW, which triggers the update. That's the chain you depend on.
+
+## What to remember
+
+- Lifecycle is install → (wait) → activate → fetch.
+- `waitUntil` extends each event past its synchronous body.
+- `addAll` is atomic; pre-cache only essentials.
+- The new SW waits for old clients to close. `skipWaiting` + `clients.claim` skip it; understand the tradeoff.
+- Clean up old caches in `activate`. Version your caches.
+- `fetch` must call `respondWith` synchronously (with an async value).
+
+<Reading url="https://web.dev/articles/service-worker-lifecycle" title="The Service Worker Lifecycle" author="Jeff Posnick" kind="docs" minutes={15} />
+<Reading url="https://developer.mozilla.org/en-US/docs/Web/API/ServiceWorkerGlobalScope" title="ServiceWorkerGlobalScope — MDN" kind="docs" minutes={8} />
+<Reading url="https://web.dev/articles/service-worker-mindset" title="Getting your head around the service worker lifecycle" kind="blog" minutes={10} />
+
+**Remember this:** The SW you just deployed is not the SW your users are running. It will be — eventually, when their tab closes — unless you `skipWaiting`. Plan for that gap.

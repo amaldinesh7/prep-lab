@@ -1,0 +1,64 @@
+{
+  "questions": [
+    {
+      "id": "q1",
+      "prompt": "What is the correct order of service worker lifecycle events on a fresh registration?",
+      "options": [
+        { "id": "a", "label": "fetch → install → activate" },
+        { "id": "b", "label": "install → activate → fetch" },
+        { "id": "c", "label": "register → fetch → install → activate" },
+        { "id": "d", "label": "install → fetch → activate (fetch fires during install)" }
+      ],
+      "correct": "b",
+      "explanation": "After registration, the SW transitions: install → (possibly waiting) → activate → fetch. `fetch` events only fire on the active SW; you can't intercept requests during install. If a previous SW is controlling clients, the new one waits between install and activate unless `skipWaiting` + `clients.claim` are used."
+    },
+    {
+      "id": "q2",
+      "prompt": "How does stale-while-revalidate behave?",
+      "options": [
+        { "id": "a", "label": "Return cache; only fetch network if cache is missing" },
+        { "id": "b", "label": "Try network first; fall back to cache on failure" },
+        { "id": "c", "label": "Return cache immediately, fetch network in parallel, update cache for next time" },
+        { "id": "d", "label": "Wait for both network and cache, return whichever finishes first" }
+      ],
+      "correct": "c",
+      "explanation": "SWR is the workhorse strategy. Cache hits return instantly; the network request runs in parallel and updates the cache for the next visit. The user sees yesterday's data now, today's data on next reload. The price: a moment of UI inconsistency if the network response differs visibly from the cache."
+    },
+    {
+      "id": "q3",
+      "prompt": "Why call `self.clients.claim()` inside the activate event?",
+      "options": [
+        { "id": "a", "label": "It registers the SW with the browser's update tracker" },
+        { "id": "b", "label": "It allows the new SW to take control of pages that are already open, without waiting for navigation" },
+        { "id": "c", "label": "It claims the cache namespace so other SWs can't write to it" },
+        { "id": "d", "label": "It's required by the spec for a SW to start handling fetch events" }
+      ],
+      "correct": "b",
+      "explanation": "By default, even after a SW activates, pages that loaded under the previous SW stay attached to it until the user navigates. `clients.claim()` overrides that — the new SW takes over immediately. Combined with `skipWaiting()` in install, you get instant updates. Combined with nothing, you can sit waiting all day."
+    },
+    {
+      "id": "q4",
+      "prompt": "What's the production reality of the Background Sync API?",
+      "options": [
+        { "id": "a", "label": "Works everywhere; just register a sync tag" },
+        { "id": "b", "label": "Works in all major browsers except Safari on iOS" },
+        { "id": "c", "label": "Chromium-only — Safari and Firefox don't ship it, so you must build an app-level IndexedDB queue as the floor and use SW sync as an optimization" },
+        { "id": "d", "label": "Removed from the spec — use Periodic Sync instead" }
+      ],
+      "correct": "c",
+      "explanation": "Background Sync has been Chromium-only since 2016 and shows no sign of changing. The production pattern is an IndexedDB outbox that drains on the `online` event (works everywhere), with an optional `registration.sync.register()` layer for Chromium users that drains even when no tab is open."
+    },
+    {
+      "id": "q5",
+      "prompt": "Why does the browser require HTTPS for service worker registration?",
+      "options": [
+        { "id": "a", "label": "Performance — HTTPS connections are faster than HTTP, and SWs need fast startup" },
+        { "id": "b", "label": "Spec compatibility — old SW polyfills only worked on HTTPS" },
+        { "id": "c", "label": "Because a SW is a programmable proxy with persistent control over an origin's requests; HTTPS prevents a network attacker from injecting a malicious SW that owns your origin" },
+        { "id": "d", "label": "Cache size — HTTPS storage has a higher quota than HTTP" }
+      ],
+      "correct": "c",
+      "explanation": "A SW can intercept every request from your origin and persist past the tab closing. On plain HTTP, a MITM could inject JavaScript that registers a malicious SW that takes permanent control of your origin in the user's browser. HTTPS prevents the injection. `localhost` is the one exception because there's no meaningful MITM in the loopback case."
+    }
+  ]
+}

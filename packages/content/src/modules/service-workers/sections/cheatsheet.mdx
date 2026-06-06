@@ -1,0 +1,37 @@
+---
+title: Cheatsheet
+---
+
+<SectionHeader kind="cheatsheet" number={10} title="Cheatsheet" />
+
+Keep this open while you write your first production SW. Most of what bites you lives here.
+
+<Cheatsheet rows={[
+  { k: "Registration", v: "navigator.serviceWorker.register('/sw.js', { scope: '/', type: 'module' })" },
+  { k: "Lifecycle", v: "parsed → install → (waiting) → activate → fetch" },
+  { k: "Open a cache", v: "const cache = await caches.open('shell-v1')" },
+  { k: "Pre-cache (atomic)", v: "await cache.addAll(['/','/main.js','/main.css'])  // any 404 fails the whole install" },
+  { k: "Strategy: SWR", v: "Return cache immediately, fetch network in parallel, update cache" },
+  { k: "Strategy: cache-first", v: "Hashed assets, fonts, vendored images — never changes, cache wins" },
+  { k: "Strategy: network-first", v: "Freshness-critical reads — try network, fall back to cache, with a timeout" },
+  { k: "Strategy: network-only", v: "POST/PUT/DELETE, analytics — don't call respondWith, let the browser handle" },
+  { k: "Strategy: cache-only", v: "Offline navigation shell; explicit precache" },
+  { k: "Skip waiting", v: "self.skipWaiting()  // in install; instant takeover, foot-gun for stateful SWs" },
+  { k: "Claim clients", v: "await self.clients.claim()  // in activate; takes control of already-open pages" },
+  { k: "Clean old caches", v: "In activate: caches.keys().then(ks => ks.filter(k => k !== CURRENT).map(caches.delete))" },
+  { k: "Respond to fetch", v: "event.respondWith(promise)  // must be called synchronously inside the handler" },
+  { k: "Keep SW alive", v: "event.waitUntil(promise)  // works in install, activate, sync, message" },
+  { k: "Background sync register", v: "await registration.sync.register('outbox')  // Chromium only — build IDB outbox as floor" },
+  { k: "Background sync handler", v: "self.addEventListener('sync', (e) => { if (e.tag==='outbox') e.waitUntil(drain()) })" },
+  { k: "App-level online drain", v: "window.addEventListener('online', drainOutbox)  // works everywhere" },
+  { k: "Workbox plugin (Vite)", v: "vite-plugin-pwa, generateSW mode, registerType: 'prompt'" },
+  { k: "Update flow", v: "Detect waiting SW → prompt user → updateServiceWorker(true) → reload → new SW takes over" },
+  { k: "Devtools must-haves", v: "Application → Service Workers → 'Update on reload' + 'Bypass for network' + 'Offline'" },
+  { k: "HTTPS requirement", v: "SW only registers on HTTPS; sole exception is http://localhost (and 127.0.0.1)" },
+  { k: "Scope rule", v: "SW at /static/sw.js can only control /static/* unless served with Service-Worker-Allowed: /" },
+  { k: "Quota errors", v: "Wrap cache.put in try/catch; cap caches with ExpirationPlugin or hand-rolled timestamps" },
+  { k: "Opaque responses", v: "Cross-origin no-cors fetches — can cache but can't read; allocated MB-scale quota each" },
+  { k: "Safari reality", v: "No Background Sync, no Periodic Sync, push only for installed PWAs; 7-day inactivity eviction" }
+]} />
+
+**Remember this:** The shortest debugging path is DevTools → Application → Service Workers → check Update-on-reload, check Offline, click Unregister between iterations. Half of "SW is broken" turns out to be "SW is working perfectly and you forgot to turn on Update-on-reload."

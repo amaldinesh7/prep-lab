@@ -1,0 +1,200 @@
+---
+title: Background sync
+---
+
+<SectionHeader kind="concept" number={4} title="Background sync" />
+
+The hardest part of offline isn't reads — caching solves that. It's writes. When a user clicks "Send" while underground, your app has three bad choices: throw an error, swallow it silently, or pretend it worked and pray. Background sync is the API that gives you a fourth, honest answer: queue it locally, replay it when the network's back, tell the user when it's done.
+
+## The mental model
+
+Background sync inverts the usual control flow. Instead of "user clicks → fetch fires → backend responds," it's:
+
+1. User clicks while offline (or with a flaky connection).
+2. The page hands the mutation to the SW as a queued operation.
+3. The page returns to the user immediately ("Sent ✓ — will deliver when online").
+4. The browser wakes the SW when connectivity returns.
+5. The SW drains the queue, calling the real API.
+6. On success, the SW posts a message back to any open page; on failure, it retries with backoff.
+
+The SW doing the replay is the load-bearing detail. The page might be closed, the tab might be gone, the user might have moved on. The SW runs anyway, on the OS's schedule, when the browser sees the network come back.
+
+## The native API
+
+The Background Sync API itself is small. The page registers a sync tag; the SW listens for `sync` events with that tag.
+
+<Code lang="ts" file="src/app.ts">{`async function queueOutbound(payload: unknown) {
+  // 1. Persist the payload somewhere the SW can read it. IndexedDB is the standard.
+  await idb.add("outbound", { id: crypto.randomUUID(), payload, attempts: 0 });
+
+  // 2. Ask the browser to wake the SW when connectivity allows.
+  const reg = await navigator.serviceWorker.ready;
+  if ("sync" in reg) {
+    await (reg as ServiceWorkerRegistration & { sync: SyncManager }).sync.register(
+      "outbound-replay",
+    );
+  } else {
+    // Fallback path — see "no support" section below.
+    fallbackReplaySoon();
+  }
+}`}</Code>
+
+In the SW:
+
+<Code lang="ts" file="src/sw.ts">{`self.addEventListener("sync", (event) => {
+  if (event.tag === "outbound-replay") {
+    event.waitUntil(drainOutboundQueue());
+  }
+});
+
+async function drainOutboundQueue() {
+  const items = await idb.getAll("outbound");
+  for (const item of items) {
+    try {
+      const res = await fetch("/api/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(item.payload),
+      });
+      if (!res.ok) throw new Error(\`HTTP \${res.status}\`);
+      await idb.delete("outbound", item.id);
+      // Tell any open pages we synced this one.
+      const clients = await self.clients.matchAll();
+      clients.forEach((c) => c.postMessage({ type: "sync:done", id: item.id }));
+    } catch (err) {
+      await idb.update("outbound", item.id, (cur) => ({
+        ...cur,
+        attempts: cur.attempts + 1,
+        lastError: String(err),
+      }));
+      // Throwing from a sync handler tells the browser to retry later
+      // with exponential backoff. Don't throw if you've exceeded a max
+      // attempt count — that just burns the queue.
+      if (item.attempts < 5) throw err;
+    }
+  }
+}`}</Code>
+
+Two important behaviors of the `sync` event:
+
+- **The browser holds the SW alive while `waitUntil` is pending**, just like install/activate. The OS won't kill you mid-replay.
+- **Throwing from the handler triggers retry with backoff** — the browser will wake you again later. This is the right behavior on transient failure (5xx, timeout). It's the wrong behavior on permanent failure (400, auth invalid). Drop those from the queue explicitly, don't re-throw.
+
+## The browser support reality
+
+Here's the catch that shapes every production deployment: **Background Sync is Chromium-only.** Safari has never shipped it. Firefox shipped it as experimental once and removed it. As of 2026, the picture hasn't changed.
+
+For a startup shipping a collab/agentic app, this means: you cannot _rely_ on the Background Sync API. You can use it as an optimization on Chromium-based browsers (Chrome, Edge, most Android browsers) and you must build an app-level queue that works everywhere else.
+
+The pattern that works:
+
+<Code lang="ts" file="src/queue.ts">{`// App-level outbox in IndexedDB. The SW Background Sync API is the
+// optimization layer; this is the floor.
+
+interface OutboxItem {
+  id: string;
+  endpoint: string;
+  method: "POST" | "PUT" | "PATCH" | "DELETE";
+  body: unknown;
+  attempts: number;
+  enqueuedAt: number;
+}
+
+export async function enqueue(item: Omit<OutboxItem, "id" | "attempts" | "enqueuedAt">) {
+  const record: OutboxItem = {
+    ...item,
+    id: crypto.randomUUID(),
+    attempts: 0,
+    enqueuedAt: Date.now(),
+  };
+  await idb.add("outbox", record);
+
+  // Try right now — if we're online, this often succeeds immediately.
+  void drain();
+
+  // Ask the SW to handle it in the background if it can.
+  const reg = await navigator.serviceWorker.ready.catch(() => null);
+  if (reg && "sync" in reg) {
+    await (reg as any).sync.register("outbox").catch(() => {});
+  }
+}
+
+// Drain runs on three triggers: enqueue, 'online' event, and SW sync.
+export async function drain() {
+  if (!navigator.onLine) return;
+  const items = await idb.getAll("outbox");
+  for (const item of items) {
+    try {
+      const res = await fetch(item.endpoint, {
+        method: item.method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(item.body),
+      });
+      if (res.status >= 500) throw new Error("retryable");
+      if (!res.ok && res.status !== 409) {
+        // 4xx is permanent. Conflict (409) might want server-side merge.
+        await idb.delete("outbox", item.id);
+        continue;
+      }
+      await idb.delete("outbox", item.id);
+    } catch {
+      await idb.update("outbox", item.id, (cur) => ({
+        ...cur,
+        attempts: cur.attempts + 1,
+      }));
+      // Stop draining — we'll be re-triggered on next online event.
+      return;
+    }
+  }
+}
+
+window.addEventListener("online", drain);`}</Code>
+
+The hierarchy:
+1. **App-level outbox in IndexedDB** — works everywhere, survives reloads, drains on the `online` event.
+2. **Service worker `sync` event** — Chromium-only, lets the queue drain even when no tab is open.
+3. **Periodic sync** — Chromium-only, behind a permission, lets the queue drain on a schedule. Almost no app needs this; it's an extra layer for content-refresh use cases.
+
+Most collaboration apps stop at level 1 with a thin level 2 enhancement. That's enough.
+
+## Conflict resolution
+
+The replay model assumes operations are idempotent or commutative. They usually aren't. Two questions to answer before you ship a sync queue:
+
+**What if the server already has the operation?** A user enqueues "create note X" offline, then connects briefly, then disconnects. The first replay succeeds. The SW retries because it didn't get an ack. Now the server has two notes. Fix: assign a client-side `idempotencyKey` (a UUID) and have the server dedupe on it. This pattern is well-trodden — Stripe popularized it and basically every payments / mutation API supports it now.
+
+**What if the server's state changed since the user went offline?** Classic offline-edit-conflict. The user edited a doc that someone else also edited. Options range from "last write wins" (cheap, sometimes wrong) to a CRDT (correct, expensive, big design lift). For non-collab apps, last-write-wins with an `If-Match` ETag and a server-side 409 response works fine — the SW catches the 409, surfaces it to the page, the page asks the user.
+
+The Sync Engines module goes deeper on this. For this module, the message is: a working sync queue is necessary but not sufficient for offline collaboration. Plan the conflict story before you build the queue.
+
+## What the user sees
+
+Background sync is invisible by design. The user clicks, the UI shows success, the data eventually reaches the server. Three pieces of UI make this honest rather than mysterious:
+
+- **An "unsent" badge** somewhere ambient — a count of queued operations, surfaced quietly so a paranoid user can verify.
+- **A toast on successful replay** ("Your message sent") only when the user has been waiting visibly long; otherwise it's noise.
+- **An "I tried, it failed" path** — once retries are exhausted, surface the failure with a "Retry" or "Discard" choice. Silent permanent failure is the worst outcome of any sync queue.
+
+The SW's `postMessage` to open clients is how those UI signals flow. Listen in the page:
+
+<Code lang="ts" file="src/app.ts">{`navigator.serviceWorker.addEventListener("message", (event) => {
+  if (event.data?.type === "sync:done") {
+    toast(\`Synced \${event.data.id}\`);
+  } else if (event.data?.type === "sync:failed") {
+    surfaceFailure(event.data);
+  }
+});`}</Code>
+
+## What to remember
+
+- Background sync = SW-driven queue replay when network returns.
+- The native `sync` event is Chromium-only — build the app-level outbox first, layer `sync` on top.
+- Idempotency keys are non-negotiable; retries will double-fire eventually.
+- Decide your conflict story before you ship the queue.
+- Surface queue state to the user, surface permanent failures explicitly.
+
+<Reading url="https://developer.chrome.com/docs/capabilities/background-sync" title="Background Sync — Chrome Developers" kind="docs" minutes={10} />
+<Reading url="https://developer.mozilla.org/en-US/docs/Web/API/Background_Synchronization_API" title="Background Synchronization API — MDN" kind="docs" minutes={8} />
+<Reading url="https://docs.stripe.com/api/idempotent_requests" title="Idempotency keys — Stripe API" kind="docs" minutes={5} />
+
+**Remember this:** Background Sync is an optimization, not a foundation. The foundation is an IndexedDB outbox that drains on `online`. Add the SW `sync` handler for Chromium users; don't depend on it.

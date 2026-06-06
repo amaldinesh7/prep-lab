@@ -1,0 +1,425 @@
+---
+title: Offline-first reader
+---
+
+<SectionHeader kind="mini_project" number={8} title="Offline-first reader" />
+
+A 3-hour build that exercises every concept in this module: a Vite + React reader app that fetches articles, caches them, works offline, and queues a "star" action that replays on reconnect.
+
+The reference API is the Hacker News Algolia API — no auth, generous CORS, JSON. https://hn.algolia.com/api. You'll fetch the top story list, then fetch individual stories on demand.
+
+<ProjectCard hours="3" starter="./offline-reader-starter">
+
+## Goal
+
+Build an offline reader:
+- Fetches a list of top articles from HN
+- Caches the app shell + articles for offline reads
+- Shows an "I'm offline" banner when `navigator.onLine` flips
+- Lets the user star an article — even offline — and replays the star when the network returns
+- Stretch: push notification on successful sync
+
+By the end, you should be able to airplane-mode your laptop and still browse articles you've previously opened.
+
+## Steps
+
+### 1. Scaffold
+
+```bash
+bun create vite offline-reader --template react-ts
+cd offline-reader
+bun add idb-keyval
+bun add -D vite-plugin-pwa
+```
+
+`idb-keyval` is a thin IndexedDB wrapper. Hand-rolling IDB for a 3-hour project is masochism.
+
+### 2. Wire vite-plugin-pwa
+
+Edit `vite.config.ts`:
+
+```ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import { VitePWA } from "vite-plugin-pwa";
+
+export default defineConfig({
+  plugins: [
+    react(),
+    VitePWA({
+      strategies: "generateSW",
+      registerType: "prompt",
+      manifest: {
+        name: "Offline Reader",
+        short_name: "Reader",
+        theme_color: "#0a0a0a",
+        background_color: "#ffffff",
+        display: "standalone",
+        icons: [
+          { src: "/pwa-192.png", sizes: "192x192", type: "image/png" },
+          { src: "/pwa-512.png", sizes: "512x512", type: "image/png" },
+        ],
+      },
+      workbox: {
+        globPatterns: ["**/*.{js,css,html,svg,png,woff2}"],
+        navigateFallback: "/index.html",
+        runtimeCaching: [
+          {
+            // Article list — SWR so it's fast but eventually fresh.
+            urlPattern: ({ url }) =>
+              url.hostname === "hn.algolia.com" &&
+              url.pathname.includes("search"),
+            handler: "StaleWhileRevalidate",
+            options: {
+              cacheName: "hn-list",
+              expiration: { maxEntries: 20, maxAgeSeconds: 60 * 60 * 24 },
+              cacheableResponse: { statuses: [0, 200] },
+            },
+          },
+          {
+            // Individual article — CacheFirst so opened articles read offline.
+            urlPattern: ({ url }) =>
+              url.hostname === "hn.algolia.com" &&
+              /\\/items\\/\\d+/.test(url.pathname),
+            handler: "CacheFirst",
+            options: {
+              cacheName: "hn-items",
+              expiration: { maxEntries: 200, maxAgeSeconds: 60 * 60 * 24 * 30 },
+              cacheableResponse: { statuses: [0, 200] },
+            },
+          },
+        ],
+      },
+      devOptions: { enabled: true, type: "module" },
+    }),
+  ],
+});
+```
+
+Use SWR for the list (it changes often, freshness matters), CacheFirst for individual articles (they don't change, and offline access matters).
+
+### 3. The online/offline banner
+
+`src/components/OfflineBanner.tsx`:
+
+```tsx
+import { useEffect, useState } from "react";
+
+export function OfflineBanner() {
+  const [online, setOnline] = useState(navigator.onLine);
+
+  useEffect(() => {
+    const on = () => setOnline(true);
+    const off = () => setOnline(false);
+    window.addEventListener("online", on);
+    window.addEventListener("offline", off);
+    return () => {
+      window.removeEventListener("online", on);
+      window.removeEventListener("offline", off);
+    };
+  }, []);
+
+  if (online) return null;
+  return (
+    <div
+      role="status"
+      style={{
+        position: "sticky",
+        top: 0,
+        background: "#fef3c7",
+        padding: "8px 16px",
+        borderBottom: "1px solid #fde68a",
+        textAlign: "center",
+      }}
+    >
+      You are offline — showing cached articles. Changes will sync when you reconnect.
+    </div>
+  );
+}
+```
+
+`navigator.onLine` is honest about "the browser thinks there's no network" and a lie about "you have a real internet connection." A captive-portal Wi-Fi at a coffee shop returns `true` while every request times out. Treat the banner as a hint, not a guarantee.
+
+### 4. The article list
+
+`src/components/ArticleList.tsx`:
+
+```tsx
+import { useEffect, useState } from "react";
+
+interface Hit {
+  objectID: string;
+  title: string;
+  url?: string;
+  points: number;
+  author: string;
+}
+
+export function ArticleList({ onOpen }: { onOpen: (id: string) => void }) {
+  const [hits, setHits] = useState<Hit[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetch("https://hn.algolia.com/api/v1/search?tags=front_page")
+      .then((r) => r.json())
+      .then((j) => setHits(j.hits))
+      .catch(() => {
+        /* SW serves cached list if there is one */
+      })
+      .finally(() => setLoading(false));
+  }, []);
+
+  if (loading) return <p>Loading…</p>;
+  return (
+    <ul style={{ listStyle: "none", padding: 0 }}>
+      {hits.map((h) => (
+        <li key={h.objectID} style={{ padding: 12, borderBottom: "1px solid #eee" }}>
+          <button
+            onClick={() => onOpen(h.objectID)}
+            style={{ background: "none", border: "none", cursor: "pointer", textAlign: "left" }}
+          >
+            <strong>{h.title}</strong>
+            <div style={{ fontSize: 12, color: "#666" }}>
+              {h.points} pts by {h.author}
+            </div>
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+### 5. The article view + the outbox
+
+The star button is where offline writes earn their keep. Star while online → POST goes through. Star while offline → write to IndexedDB outbox, drain on reconnect.
+
+`src/lib/outbox.ts`:
+
+```ts
+import { get, set, del, keys } from "idb-keyval";
+
+export interface OutboxItem {
+  id: string;
+  articleId: string;
+  starredAt: number;
+  attempts: number;
+}
+
+export async function enqueueStar(articleId: string) {
+  const id = crypto.randomUUID();
+  const item: OutboxItem = {
+    id,
+    articleId,
+    starredAt: Date.now(),
+    attempts: 0,
+  };
+  await set(\`outbox:\${id}\`, item);
+  // Mark the article as starred in local state immediately (optimistic).
+  await set(\`star:\${articleId}\`, true);
+  // Try to drain right away in case we're actually online.
+  void drainOutbox();
+  // Register a background sync if supported.
+  const reg = await navigator.serviceWorker.ready.catch(() => null);
+  if (reg && "sync" in reg) {
+    await (reg as any).sync.register("drain-outbox").catch(() => {});
+  }
+}
+
+export async function drainOutbox() {
+  if (!navigator.onLine) return;
+  const allKeys = await keys();
+  const outboxKeys = (allKeys as string[]).filter((k) => k.startsWith("outbox:"));
+  for (const key of outboxKeys) {
+    const item = (await get(key)) as OutboxItem | undefined;
+    if (!item) continue;
+    try {
+      // Pretend POST endpoint — HN doesn't have a star API.
+      // In real life this is your backend.
+      const res = await fetch("https://httpbin.org/post", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          articleId: item.articleId,
+          starredAt: item.starredAt,
+          idempotencyKey: item.id, // dedupe on the server
+        }),
+      });
+      if (!res.ok) throw new Error(\`HTTP \${res.status}\`);
+      await del(key);
+    } catch {
+      await set(key, { ...item, attempts: item.attempts + 1 });
+      return; // stop draining; try again on next online event
+    }
+  }
+}
+
+window.addEventListener("online", drainOutbox);
+```
+
+`src/components/ArticleView.tsx`:
+
+```tsx
+import { useEffect, useState } from "react";
+import { get } from "idb-keyval";
+import { enqueueStar } from "../lib/outbox";
+
+interface Item {
+  id: number;
+  title: string;
+  text?: string;
+  url?: string;
+  author: string;
+}
+
+export function ArticleView({ id, onBack }: { id: string; onBack: () => void }) {
+  const [item, setItem] = useState<Item | null>(null);
+  const [starred, setStarred] = useState(false);
+
+  useEffect(() => {
+    fetch(\`https://hn.algolia.com/api/v1/items/\${id}\`)
+      .then((r) => r.json())
+      .then(setItem);
+    get(\`star:\${id}\`).then((v) => setStarred(Boolean(v)));
+  }, [id]);
+
+  if (!item) return <p>Loading…</p>;
+  return (
+    <article style={{ padding: 16 }}>
+      <button onClick={onBack}>← back</button>
+      <h1>{item.title}</h1>
+      <p style={{ color: "#666" }}>by {item.author}</p>
+      {item.url && (
+        <p>
+          <a href={item.url} target="_blank" rel="noreferrer">
+            Open original →
+          </a>
+        </p>
+      )}
+      {item.text && <div dangerouslySetInnerHTML={{ __html: item.text }} />}
+      <button
+        onClick={async () => {
+          setStarred(true);
+          await enqueueStar(String(item.id));
+        }}
+        disabled={starred}
+        style={{ marginTop: 16 }}
+      >
+        {starred ? "★ Starred" : "☆ Star"}
+      </button>
+    </article>
+  );
+}
+```
+
+### 6. The update prompt
+
+`src/components/UpdatePrompt.tsx`:
+
+```tsx
+import { useRegisterSW } from "virtual:pwa-register/react";
+
+export function UpdatePrompt() {
+  const {
+    needRefresh: [needRefresh, setNeedRefresh],
+    updateServiceWorker,
+  } = useRegisterSW({
+    onRegisteredSW(_url, reg) {
+      reg && setInterval(() => reg.update(), 60 * 60 * 1000);
+    },
+  });
+
+  if (!needRefresh) return null;
+  return (
+    <div
+      style={{
+        position: "fixed",
+        bottom: 16,
+        right: 16,
+        background: "#111",
+        color: "#fff",
+        padding: 12,
+        borderRadius: 8,
+        display: "flex",
+        gap: 8,
+      }}
+    >
+      <span>New version available.</span>
+      <button onClick={() => updateServiceWorker(true)}>Reload</button>
+      <button onClick={() => setNeedRefresh(false)}>Later</button>
+    </div>
+  );
+}
+```
+
+### 7. Wire it together
+
+`src/App.tsx`:
+
+```tsx
+import { useState } from "react";
+import { OfflineBanner } from "./components/OfflineBanner";
+import { ArticleList } from "./components/ArticleList";
+import { ArticleView } from "./components/ArticleView";
+import { UpdatePrompt } from "./components/UpdatePrompt";
+
+export function App() {
+  const [openId, setOpenId] = useState<string | null>(null);
+  return (
+    <>
+      <OfflineBanner />
+      <main style={{ maxWidth: 720, margin: "0 auto", padding: 16 }}>
+        <h1>Reader</h1>
+        {openId ? (
+          <ArticleView id={openId} onBack={() => setOpenId(null)} />
+        ) : (
+          <ArticleList onOpen={setOpenId} />
+        )}
+      </main>
+      <UpdatePrompt />
+    </>
+  );
+}
+```
+
+### 8. Run and test the offline path
+
+```bash
+bun run dev
+```
+
+Then:
+
+1. Open the app. Browse the list. Click into 2-3 articles.
+2. Open DevTools → Application → Service Workers. Confirm the SW is registered and activated.
+3. Open DevTools → Network → check the "Offline" box.
+4. Refresh the page. The shell loads. The article list (cached) appears. Click into an article you visited — it loads from cache.
+5. Star an article while offline. Watch the IndexedDB grow (DevTools → Application → IndexedDB).
+6. Uncheck "Offline". The `online` event fires, `drainOutbox()` runs, the IndexedDB entry disappears.
+
+If all six steps work, you've shipped offline-first.
+
+## Stretch goals
+
+- **Push notifications on successful sync.** Switch to `injectManifest` mode, write a custom SW, request notification permission, post a notification from `drainOutboxInSW()` when an item succeeds. https://web.dev/articles/push-notifications-overview is the entry point.
+- **Periodic background refresh.** Use the Periodic Sync API (Chromium only, behind permission) to refresh the article list every few hours.
+- **Conflict UI.** When the server responds 409 (someone else starred first, or the server has a different state), surface a "this changed elsewhere — refresh?" toast.
+- **Persistent storage.** Call `navigator.storage.persist()` and watch the user prompt. Add `navigator.storage.estimate()` reporting to your settings page.
+- **Workbox InjectManifest.** Migrate from `generateSW` to `injectManifest` and re-implement the runtimeCaching as explicit `registerRoute` calls. You'll appreciate the declarative version after.
+
+## What to internalize
+
+When you finish:
+
+- Why is the article list SWR but individual articles CacheFirst?
+- Why does the outbox call `drainOutbox()` both on enqueue _and_ on the `online` event _and_ register a SW sync?
+- What's the failure mode if you drop the `idempotencyKey` from the POST body?
+- What's the difference between hard-reload (Cmd+Shift+R) and DevTools → "Unregister"?
+
+If those answers feel obvious, the module landed.
+
+</ProjectCard>
+
+<Reading url="https://vite-pwa-org.netlify.app/guide/" title="vite-plugin-pwa quick start" kind="docs" minutes={10} />
+<Reading url="https://hn.algolia.com/api" title="HN Algolia API docs" kind="docs" minutes={3} />
+<Reading url="https://web.dev/articles/offline-cookbook" title="Web.dev: Offline Cookbook (updated)" kind="docs" minutes={12} />

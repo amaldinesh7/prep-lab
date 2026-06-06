@@ -1,0 +1,198 @@
+---
+title: Workbox: production tooling
+---
+
+<SectionHeader kind="pattern" number={5} title="Workbox: production tooling" />
+
+You can write every cache strategy, every lifecycle handler, every precache manifest by hand. People do. They also spend an afternoon a quarter debugging cache-eviction bugs, precache-version drift, and "the SW updated but the manifest didn't" issues that Workbox solved five years ago.
+
+Workbox is Google's SW library. It's the same code that powers Chrome team examples, the official PWA docs, and (in plugin form) Vite, Next.js, and most other build-tool PWA integrations. For anything past a small content site, it's the answer.
+
+## What Workbox actually is
+
+Workbox is three things in a trench coat.
+
+- **A runtime library** with implementations of the five cache strategies, an expiration plugin, a routing system, and a queue helper for background sync. Imported in your SW file.
+- **A build-time toolchain** that walks your build output, generates a precache manifest (URLs + content hashes), and injects it into your SW. This is the part that's painful to roll by hand.
+- **A set of integrations** for the major bundlers (`workbox-webpack-plugin`, `vite-plugin-pwa`, Next.js's `next-pwa`) so you don't touch the runtime or the toolchain directly — you configure a plugin and ship.
+
+For a Vite + React app, `vite-plugin-pwa` is the answer 95% of the time. It wraps Workbox, generates the SW, handles the manifest, and gives you a typed config.
+
+## When to use raw SW vs Workbox
+
+A useful rule of thumb:
+
+- **Small app, one or two cache rules, learning project** — raw SW. Writing it once is educational and forces you to internalize the lifecycle.
+- **Medium app, multiple resource classes, real users** — Workbox. The boilerplate it eliminates (precache versioning, expiration, route matching, retry queues) is non-trivial and easy to get wrong.
+- **Custom protocol, novel use case, weird sync needs** — raw SW with Workbox pulled in selectively. You can `import { CacheFirst } from "workbox-strategies"` and use it inside a hand-rolled handler.
+
+If you find yourself reaching for the second `caches.open` in your hand-rolled SW, you've crossed the line.
+
+## Vite + vite-plugin-pwa: the configuration
+
+This is the canonical setup for a startup Vite app that wants offline.
+
+<Code lang="ts" file="vite.config.ts">{`import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import { VitePWA } from "vite-plugin-pwa";
+
+export default defineConfig({
+  plugins: [
+    react(),
+    VitePWA({
+      // GenerateSW = let the plugin write the SW for you (most common).
+      // InjectManifest = you write the SW, plugin injects the precache list.
+      strategies: "generateSW",
+      registerType: "prompt", // "autoUpdate" is tempting; see notes below.
+
+      // What the browser sees as the installed app.
+      manifest: {
+        name: "Notes",
+        short_name: "Notes",
+        theme_color: "#111111",
+        background_color: "#ffffff",
+        display: "standalone",
+        icons: [
+          { src: "/icon-192.png", sizes: "192x192", type: "image/png" },
+          { src: "/icon-512.png", sizes: "512x512", type: "image/png" },
+        ],
+      },
+
+      // What to pre-cache (the app shell + hashed assets).
+      workbox: {
+        globPatterns: ["**/*.{js,css,html,svg,png,woff2}"],
+        // Don't precache huge files (the limit is per-file).
+        maximumFileSizeToCacheInBytes: 3 * 1024 * 1024,
+        // Navigation fallback: every nav goes to /index.html (SPA shell).
+        navigateFallback: "/index.html",
+        navigateFallbackDenylist: [/^\\/api\\//],
+
+        // Runtime caching = per-request-class strategies for things outside the build.
+        runtimeCaching: [
+          {
+            urlPattern: ({ url }) => url.pathname.startsWith("/api/articles"),
+            handler: "StaleWhileRevalidate",
+            options: {
+              cacheName: "api-articles",
+              expiration: { maxEntries: 100, maxAgeSeconds: 60 * 60 * 24 * 7 },
+              cacheableResponse: { statuses: [0, 200] },
+            },
+          },
+          {
+            urlPattern: /^https:\\/\\/fonts\\.gstatic\\.com\\//,
+            handler: "CacheFirst",
+            options: {
+              cacheName: "google-fonts",
+              expiration: { maxEntries: 30, maxAgeSeconds: 60 * 60 * 24 * 365 },
+            },
+          },
+          {
+            urlPattern: ({ request }) => request.destination === "image",
+            handler: "CacheFirst",
+            options: {
+              cacheName: "images",
+              expiration: { maxEntries: 100, maxAgeSeconds: 60 * 60 * 24 * 30 },
+            },
+          },
+        ],
+      },
+
+      devOptions: {
+        enabled: true, // SW runs in dev, useful for testing
+        type: "module",
+      },
+    }),
+  ],
+});`}</Code>
+
+A few things worth highlighting:
+
+- **`registerType: "prompt"` vs `"autoUpdate"`.** `autoUpdate` calls `skipWaiting` for you on every deploy — fastest, also riskiest (see Gotchas re: in-flight requests). `prompt` exposes hooks for you to ask the user "new version available, reload?" and only `skipWaiting` after they accept. For a startup with real users, `prompt` is safer.
+- **`navigateFallback` is the SPA shell trick.** Every URL the user types lands at `/index.html` (cached), the React router takes over from there. `navigateFallbackDenylist` excludes `/api/*` so you don't accidentally serve HTML for a JSON request.
+- **`runtimeCaching` is where strategy lives.** Each entry pairs a URL matcher with a Workbox strategy and options. The five strategies map to `"CacheFirst" | "NetworkFirst" | "StaleWhileRevalidate" | "NetworkOnly" | "CacheOnly"`.
+
+## The prompt-to-reload pattern
+
+If you went with `registerType: "prompt"`, you need a tiny piece of UI in the app:
+
+<Code lang="tsx" file="src/UpdatePrompt.tsx">{`import { useRegisterSW } from "virtual:pwa-register/react";
+
+export function UpdatePrompt() {
+  const {
+    needRefresh: [needRefresh, setNeedRefresh],
+    updateServiceWorker,
+  } = useRegisterSW({
+    onRegisteredSW(url, reg) {
+      // Optional: poll for updates every hour
+      reg && setInterval(() => reg.update(), 60 * 60 * 1000);
+    },
+  });
+
+  if (!needRefresh) return null;
+  return (
+    <div role="alert" className="update-toast">
+      <span>New version available.</span>
+      <button onClick={() => updateServiceWorker(true)}>Reload</button>
+      <button onClick={() => setNeedRefresh(false)}>Later</button>
+    </div>
+  );
+}`}</Code>
+
+`updateServiceWorker(true)` calls `skipWaiting` on the new SW, then reloads the page. The whole dance — detect waiting, prompt, swap, reload — is six lines of UI.
+
+## When to drop to InjectManifest mode
+
+`generateSW` is great until you need to do something Workbox's config doesn't expose. Common reasons to switch to `injectManifest`:
+
+- A custom `sync` handler for background sync (Workbox's `BackgroundSyncPlugin` covers most cases, but not all)
+- A custom `push` handler for push notifications
+- A custom `message` handler for app-driven cache invalidation
+- Cross-tab coordination via `BroadcastChannel`
+
+`injectManifest` mode means: you write `src/sw.ts`, the plugin writes the precache manifest into a placeholder you call (`precacheAndRoute(self.__WB_MANIFEST)`), and you wire up Workbox's strategy classes by hand.
+
+<Code lang="ts" file="src/sw.ts">{`import { precacheAndRoute } from "workbox-precaching";
+import { registerRoute } from "workbox-routing";
+import { StaleWhileRevalidate, CacheFirst } from "workbox-strategies";
+import { ExpirationPlugin } from "workbox-expiration";
+
+declare const self: ServiceWorkerGlobalScope;
+
+// Injected by vite-plugin-pwa at build time.
+precacheAndRoute(self.__WB_MANIFEST);
+
+registerRoute(
+  ({ url }) => url.pathname.startsWith("/api/articles"),
+  new StaleWhileRevalidate({
+    cacheName: "api-articles",
+    plugins: [new ExpirationPlugin({ maxEntries: 100, maxAgeSeconds: 604800 })],
+  }),
+);
+
+// … add custom handlers here
+
+self.addEventListener("message", (event) => {
+  if (event.data?.type === "SKIP_WAITING") self.skipWaiting();
+});`}</Code>
+
+The mental model: `generateSW` for declarative config, `injectManifest` when you need imperative code. Start with `generateSW`; switch when you outgrow it.
+
+<Callout kind="pattern">
+  For Vite + React apps, the production-default offline stack is: `vite-plugin-pwa` in `generateSW` mode, `registerType: "prompt"` with a small "Update available" toast, runtime caching rules covering API (SWR), images (cache-first), fonts (cache-first), and a navigation fallback to the SPA shell. This stack handles 90% of real apps without writing a line of raw SW code. Switch to `injectManifest` only when you need behavior the declarative config can't express.
+</Callout>
+
+## What you give up
+
+Workbox is opinionated. Three things to know:
+
+- **Bigger SW bundle.** Workbox-generated SWs are 30-50KB gzipped, vs a few KB for a hand-rolled one. Negligible for most apps, real if you're shipping to slow networks with tight budgets.
+- **Less visibility into the exact behavior.** Bugs that live inside Workbox's strategies require reading Workbox's source. The library is mature and well-tested, so this is rare — but when it bites, it bites hard.
+- **Coupling to Google's roadmap.** Workbox is still actively maintained, but Google has shut down high-profile projects before. The risk is low; not zero.
+
+For most teams, none of these are dealbreakers. If you're the team they would be a dealbreaker for, you already know.
+
+<Reading url="https://developer.chrome.com/docs/workbox" title="Workbox docs — Chrome Developers" kind="docs" minutes={15} />
+<Reading url="https://vite-pwa-org.netlify.app/" title="vite-plugin-pwa docs" kind="docs" minutes={12} />
+<Reading url="https://developer.chrome.com/docs/workbox/the-ways-of-workbox" title="The ways of Workbox" kind="docs" minutes={10} />
+
+**Remember this:** Write a raw SW once, ship Workbox after that. For Vite + React the default is `vite-plugin-pwa` in `generateSW` mode with `registerType: "prompt"`.

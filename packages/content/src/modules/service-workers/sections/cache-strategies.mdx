@@ -1,0 +1,208 @@
+---
+title: Cache strategies
+---
+
+<SectionHeader kind="pattern" number={3} title="Cache strategies" />
+
+There are five canonical SW cache strategies. They're not framework concepts; they're the small set of meaningful answers to the question "what do I do when a request comes in?" Workbox names them, raw SW code implements them. Senior eng work is picking the right one per request class without thinking about it.
+
+## The five strategies
+
+| Strategy | What it does | Use it for |
+| --- | --- | --- |
+| Cache-first | Return cache; fall back to network only on miss | Versioned static assets, fonts, vendored images |
+| Network-first | Try network; fall back to cache on failure | Freshness-critical reads (account data, dashboards) |
+| Stale-while-revalidate | Return cache immediately; fetch network in background; update cache | App content where "slightly stale is fine" |
+| Network-only | Always network; never cache | Mutations, analytics, anything sensitive |
+| Cache-only | Always cache; never network | Pre-cached app shell during offline navigation |
+
+Pick by request class, not per route. Static assets cache-first. APIs network-first or SWR. Mutations network-only. Once it's a habit you'll write the right strategy by reflex.
+
+## Cache-first: assets that don't change
+
+The asset hash in `main.a1b2c3d4.js` means: this exact bytes-for-bytes file will never change. There's no reason to ever go to network for it after the first fetch. Cache-first is the optimal strategy.
+
+<Code lang="ts" file="sw.ts">{`async function cacheFirst(request: Request, cacheName: string) {
+  const cache = await caches.open(cacheName);
+  const cached = await cache.match(request);
+  if (cached) return cached;
+  const response = await fetch(request);
+  // Only cache successful, basic responses (not opaque cross-origin).
+  if (response.ok && response.type === "basic") {
+    cache.put(request, response.clone()).catch(() => {});
+  }
+  return response;
+}
+
+self.addEventListener("fetch", (event) => {
+  const url = new URL(event.request.url);
+  if (event.request.method !== "GET") return;
+  if (url.pathname.startsWith("/assets/")) {
+    event.respondWith(cacheFirst(event.request, "assets-v1"));
+  }
+});`}</Code>
+
+Two things to notice:
+
+- `response.clone()` is mandatory before `cache.put`. A `Response` body is a single-use stream; once you give it to the cache you can't return it to the page.
+- We swallow the `cache.put` rejection. Quota errors shouldn't fail the user's request — we already have a good response in hand.
+
+## Network-first: fresh data with a safety net
+
+When freshness matters more than instant load but you still want offline to work, network-first is the answer. Most application APIs land here.
+
+<Code lang="ts" file="sw.ts">{`async function networkFirst(request: Request, cacheName: string, timeoutMs = 3000) {
+  const cache = await caches.open(cacheName);
+  try {
+    const response = await Promise.race([
+      fetch(request),
+      new Promise<Response>((_, reject) =>
+        setTimeout(() => reject(new Error("timeout")), timeoutMs),
+      ),
+    ]);
+    if (response.ok) cache.put(request, response.clone()).catch(() => {});
+    return response;
+  } catch {
+    const cached = await cache.match(request);
+    if (cached) return cached;
+    // Last-resort offline response.
+    return new Response(JSON.stringify({ error: "offline" }), {
+      status: 503,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+}`}</Code>
+
+The timeout matters. Without it, a hung-but-not-failed network keeps the user staring at a spinner forever even though there's a perfectly good cached copy two layers down. Three seconds is a reasonable starting point; tune to your p95 backend latency.
+
+## Stale-while-revalidate: the workhorse
+
+SWR (stale-while-revalidate) is the strategy you reach for when "slightly stale is fine, but eventually fresh is required." Articles, product listings, user profiles that refresh on app reload. SWR _starts_ the network request in parallel with the cache hit, returns the cache immediately, and the network response lands in the cache for next time.
+
+<Code lang="ts" file="sw.ts">{`async function staleWhileRevalidate(request: Request, cacheName: string) {
+  const cache = await caches.open(cacheName);
+  const cached = await cache.match(request);
+
+  // Fire the network in the background, regardless of cache hit.
+  const networkPromise = fetch(request)
+    .then((response) => {
+      if (response.ok) cache.put(request, response.clone()).catch(() => {});
+      return response;
+    })
+    .catch(() => null);
+
+  // Return cache immediately if we have it, else wait for the network.
+  return cached ?? (await networkPromise) ?? Response.error();
+}`}</Code>
+
+The trick is that the page sees the cached response in milliseconds, while the network keeps running. By the next visit, the cache holds yesterday's network result. Two-visit consistency, one-visit speed.
+
+<Callout kind="pattern">
+  Stale-while-revalidate is the strategy you'll use for 70% of GET requests in a typical web app. It hides backend latency from the user while keeping data eventually consistent. The catch: the user might see data they then disagree with after a moment's pause. Pair SWR with a subtle UI signal — a quick fade-in when content updates, a "refreshed at 2:34 PM" timestamp — so the user knows they're looking at cached-then-refreshed data, not state that mysteriously changed.
+</Callout>
+
+## Network-only: don't cache it
+
+Some requests must never be cached. Logins. Mutations. Analytics beacons. Anything that has side effects on the server or contains time-sensitive credentials.
+
+<Code lang="ts" file="sw.ts">{`self.addEventListener("fetch", (event) => {
+  if (event.request.method !== "GET") {
+    // POST, PUT, PATCH, DELETE — all network-only.
+    // Don't even call respondWith; let the browser handle it normally.
+    return;
+  }
+  if (event.request.url.includes("/analytics")) {
+    return; // Same — let it pass through.
+  }
+  // … other strategies for GETs
+});`}</Code>
+
+The cleanest way to do network-only is to _not call_ `respondWith` at all. The browser proceeds with its default network fetch and the SW is invisible to that request. This is faster than wrapping `fetch(event.request)` because it skips a layer.
+
+## Cache-only: the offline shell
+
+Cache-only is the right answer for resources you've explicitly pre-cached and that should never go to network — typically the app shell during an offline navigation.
+
+<Code lang="ts" file="sw.ts">{`async function cacheOnly(request: Request, cacheName: string) {
+  const cache = await caches.open(cacheName);
+  const cached = await cache.match(request);
+  // If somehow the precache is empty, this fails — but that means a worse bug
+  // happened during install, and showing a broken UI is honest.
+  return cached ?? Response.error();
+}`}</Code>
+
+The app-shell pattern: serve a single cached `/index.html` for every navigation request, let the React app inside render based on the URL. The shell is cache-only; everything inside it uses appropriate strategies.
+
+## Cache versioning and cleanup
+
+The clean way to evolve caches across SW versions: namespace by SW version, delete everything else in `activate`.
+
+<Code lang="ts" file="sw.ts">{`const SW_VERSION = "2025-12-15-3";
+const CACHES = {
+  shell: \`shell-\${SW_VERSION}\`,
+  assets: \`assets-\${SW_VERSION}\`,
+  api: \`api-\${SW_VERSION}\`,
+};
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    (async () => {
+      const wanted = new Set(Object.values(CACHES));
+      const all = await caches.keys();
+      await Promise.all(all.filter((k) => !wanted.has(k)).map((k) => caches.delete(k)));
+    })(),
+  );
+});`}</Code>
+
+The alternative — a single cache called `app-cache` that lives forever — works until you change your cache shape (you put a JSON body where you used to put HTML) and an old entry blows up the new code path. Versioning costs you one constant. Worth it.
+
+## Cache expiration
+
+The Cache Storage API has no built-in expiration. A response cached six months ago sits there until quota pressure evicts it. For SWR this is usually fine — the network refresh keeps things current. For caches you want to bound (offline article archive, image cache), you need to track entry age yourself or use Workbox's `ExpirationPlugin`, which writes timestamps to IndexedDB alongside each entry.
+
+The rough manual pattern:
+
+<Code lang="ts" file="sw.ts">{`async function cacheWithExpiry(
+  request: Request,
+  cacheName: string,
+  maxAgeMs: number,
+) {
+  const cache = await caches.open(cacheName);
+  const cached = await cache.match(request);
+  if (cached) {
+    const dateHeader = cached.headers.get("sw-cached-at");
+    const cachedAt = dateHeader ? Number(dateHeader) : 0;
+    if (Date.now() - cachedAt < maxAgeMs) return cached;
+    // Stale — fall through to network.
+  }
+  const response = await fetch(request);
+  if (response.ok) {
+    // Re-wrap to add our timestamp header without losing the body.
+    const headers = new Headers(response.headers);
+    headers.set("sw-cached-at", String(Date.now()));
+    const body = await response.clone().blob();
+    cache.put(request, new Response(body, { status: response.status, headers }));
+  }
+  return response;
+}`}</Code>
+
+That's roughly the implementation Workbox gives you for free. If you find yourself writing it twice, that's the signal to adopt Workbox.
+
+## Picking by request class — the heuristic
+
+If you have to pick a default for a new request class, this is the answer that's almost always right:
+
+- **Hashed static assets** (`*.[hash].{js,css,woff2,png}`) → cache-first
+- **HTML navigations** → network-first with short timeout (1-3s), cache fallback
+- **API GETs that drive the UI** → SWR
+- **API GETs that must be fresh** (account balance, lock status) → network-first with no fallback
+- **API POSTs / PUTs / DELETEs** → network-only (pair with background sync for offline)
+- **Images, fonts, third-party assets** → cache-first with size limits
+
+Memorize that table. Most strategy choices in production come down to it.
+
+<Reading url="https://developer.chrome.com/docs/workbox/caching-strategies-overview" title="Caching strategies overview — Chrome Developers" kind="docs" minutes={10} />
+<Reading url="https://web.dev/articles/stale-while-revalidate" title="Keeping things fresh with stale-while-revalidate" author="Jeff Posnick" kind="blog" minutes={8} />
+<Reading url="https://jakearchibald.com/2014/offline-cookbook/" title="The Offline Cookbook — strategy catalog" author="Jake Archibald" kind="blog" minutes={20} />
+
+**Remember this:** Strategy is not per-route, it's per request class. Memorize the five patterns and which class each fits. Workbox writes them so you don't have to, but you should be able to write each one from scratch.

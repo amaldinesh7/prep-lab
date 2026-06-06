@@ -1,0 +1,151 @@
+---
+title: Production gotchas
+---
+
+<SectionHeader kind="gotcha" number={7} title="Production gotchas" />
+
+These are the bugs every team running a SW in production hits. Each one cost someone an afternoon the first time. Reading this section in advance is the cheapest afternoon you'll ever save.
+
+## 1. The stale SW serving last week's code
+
+Symptom: you deploy a fix, you verify the CDN, you verify the build, your test users report the bug is fixed. A real user reports it still happening. You ask them to hard-refresh. They do. Still broken.
+
+What's happening: their tab is still controlled by the old SW. Hard-refresh doesn't kill the SW — it reloads the page, but the page is still controlled by whichever SW was in charge when the tab first loaded. The new SW is installed and waiting; it won't take over until every tab on your origin closes.
+
+Mitigations, in order of investment:
+
+- **Prompt-to-reload UI.** When a new SW is waiting, show a toast. User clicks, you `skipWaiting()` and reload. This is the production-grade fix.
+- **Periodic `registration.update()` from the page.** Forces the browser to re-check `sw.js` more often than its 24h default.
+- **`Cache-Control: max-age=0` on `sw.js` itself.** The browser ignores this past 24h, but for the first 24h after deploy it accelerates updates.
+- **Last resort: nuke from the SW.** A flag in your SW that says "if version > X, call `registration.unregister()` and reload." Use once when you've shipped something genuinely broken.
+
+The first one (prompt-to-reload) handles the 90% case. The rest are belt-and-suspenders.
+
+## 2. HTTPS-only (with the localhost exception)
+
+SWs only register on HTTPS origins. There's exactly one exception: `http://localhost` (and `http://127.0.0.1`). Anything else — `http://staging.example.com`, `http://192.168.x.x`, your colleague's machine over a LAN IP — will silently fail to register.
+
+The "silently" is the gotcha. `navigator.serviceWorker.register()` returns a rejected promise; if you didn't `await` it or didn't add an error handler, you get nothing. Your "why isn't my SW working on the staging server" debug session starts here.
+
+The why: a SW is a programmable proxy with full visibility into requests. On an insecure connection, a MITM can inject malicious JS that registers a malicious SW that owns your origin forever. The HTTPS requirement is non-negotiable for that reason. Localhost gets the exception because there's no meaningful MITM on `localhost`.
+
+Mitigation: every staging environment uses HTTPS. Use a self-signed cert + a system trust override, or use a free Let's Encrypt cert behind a real DNS name, or use Caddy/`mkcert` for local HTTPS. There's no halfway.
+
+## 3. Scope is bounded by the SW file's location
+
+A SW at `/static/js/sw.js` cannot, by default, control `/dashboard/*`. Its scope is bounded by its path — it can control its own directory and below, never above.
+
+The fix is the `Service-Worker-Allowed` HTTP response header on the SW script itself, which can widen the scope:
+
+```
+Service-Worker-Allowed: /
+```
+
+Combined with `register("/static/js/sw.js", { scope: "/" })`, this works. Without the header, the registration call rejects with a scope error.
+
+The simpler answer: serve the SW from the origin root. `vite-plugin-pwa` and Workbox's webpack plugin do this for you; they emit `sw.js` next to `index.html`. If you're hand-rolling, make sure your build output puts `sw.js` at the root.
+
+## 4. Iframes and cross-origin resources
+
+A SW only intercepts requests for resources from its own origin _and_ same-scope. It cannot:
+
+- Intercept requests inside a cross-origin iframe. Each origin has its own SW story.
+- Modify the response body of opaque cross-origin requests (`fetch(..., { mode: "no-cors" })`). You can cache them, but you can't read them.
+- See requests with `mode: "navigate"` to a cross-origin destination.
+
+The practical consequence: if your app embeds a third-party widget (Stripe Checkout, an OAuth iframe, an analytics tracker), the SW does not touch those requests. Your cache strategies apply only to first-party assets. If a third-party script ships an update and your "everything cache-first" rule is too eager, you've shot yourself in the foot — except no, you haven't, because the SW couldn't have cached it anyway. That's the only good news in this section.
+
+## 5. Quota errors with large caches
+
+`cache.put` can throw `QuotaExceededError` when storage pressure hits. Common triggers:
+
+- An expanding image cache without an `ExpirationPlugin` (or hand-rolled equivalent)
+- Pre-caching too much in `install`
+- A persistent IndexedDB alongside the cache, eating into the same quota
+
+Mitigations:
+
+- Cap cache sizes (Workbox's `ExpirationPlugin` with `maxEntries`)
+- Wrap every `cache.put` in a try/catch and log, don't throw
+- Use `navigator.storage.estimate()` to see live usage; alert if you cross 80% of quota
+- For genuinely large local data, request persistent storage explicitly with `navigator.storage.persist()` — Chromium grants more headroom; Safari is less generous but the call is still useful
+
+The pattern: never let a cache put failure break the user's request. The good response is already in your hand; cache it on a best-effort basis.
+
+## 6. skipWaiting + in-flight requests
+
+`skipWaiting()` in `install` is fast. It's also a foot-gun when an in-flight request is mid-flight and a new SW takes over.
+
+Concrete scenario:
+
+1. Page A loads, SW v1 is handling its `fetch("/api/long-running")`
+2. You deploy SW v2
+3. The new SW installs, calls `skipWaiting()`, activates
+4. The in-flight fetch's response handling crosses the SW boundary mid-flight
+5. Sometimes it lands cleanly. Sometimes the `Response` is unreadable because the SW that owns it is gone.
+
+The bug rate is low (browsers do their best to keep the response stream alive), but the failure mode is "the user's button click goes nowhere, with no error in the console." Worth designing around for any heavy SW protocol.
+
+The prompt-to-reload pattern fixes this: the user explicitly reloads, the old page (and its in-flight requests) dies, the new SW takes over a clean page. The flicker of a reload is a price worth paying for consistency.
+
+## 7. Devtools is your best friend
+
+Three settings in Chrome DevTools → Application → Service Workers that you should default to:
+
+- **"Update on reload"** — every page reload re-fetches `sw.js`, installs it, skips waiting, activates. Without this you can iterate on the SW for an hour without ever testing your changes.
+- **"Bypass for network"** — temporarily routes all requests around the SW. Use to test whether a bug is in the page or the SW.
+- **"Offline"** — simulates no network. Hit this regularly during development; if your app degrades surprisingly, you've found a missing offline path.
+
+Cmd+Shift+R (or Ctrl+Shift+R) is _not_ "kill the SW." It's "reload, bypassing cache." The SW still controls the page. Application → Service Workers → "Unregister" is the right button for a clean slate.
+
+## 8. The "this works in Chrome, not in Safari" pattern
+
+Half the SW features have uneven support. Quick reference:
+
+- **Background Sync** — Chromium only.
+- **Periodic Sync** — Chromium only, behind permission.
+- **Push notifications** — Safari supports them since iOS 16.4, but only for installed PWAs (home-screen icon). Regular browser tabs don't get push.
+- **Web Share Target** — Chromium only.
+- **Storage quotas** — Safari evicts after 7 days of inactivity.
+- **`navigator.storage.persist()`** — Chromium auto-grants in many cases; Safari prompts; Firefox prompts.
+
+The implication: write feature detection, ship app-level fallbacks, test on Safari (or BrowserStack) before you ship. The "works on my Mac in Chrome" definition of "shipped" is a recipe for one-star App Store reviews from iPad users.
+
+## 9. SW dies mid-task — `waitUntil` is your only handle
+
+A SW is an ephemeral worker. The browser kills it aggressively to save battery. The _only_ thing keeping a SW alive past its event handler is `event.waitUntil(promise)`. If you `await` something inside a handler without wrapping it in `waitUntil`, the browser is free to kill the worker the moment the synchronous part of the handler returns.
+
+This bites hardest in `sync` handlers and `message` handlers where you do async work. Wrap _everything_ async in `waitUntil`.
+
+<Code lang="ts" file="sw.ts">{`self.addEventListener("message", (event) => {
+  // WRONG — browser may kill worker before drain() finishes
+  // event.data.type === "drain" && drainOutbox();
+
+  // RIGHT — waitUntil keeps the worker alive
+  if (event.data?.type === "drain") {
+    event.waitUntil(drainOutbox());
+  }
+});`}</Code>
+
+## 10. CORS and opaque responses
+
+A cross-origin `fetch` without `mode: "cors"` returns an opaque response. You can cache it, you can return it from `respondWith`, but:
+
+- You can't read its body
+- You can't read its headers
+- Its `status` is always `0`
+- It takes a _suspicious amount_ of storage (browsers pad opaque responses to several MB to defeat fingerprinting)
+
+If you cache 50 opaque responses thinking they're 10KB each, you may have actually allocated 350MB of quota. Then `cache.put` starts failing for everything.
+
+The rule: cache same-origin and explicitly-CORS-enabled responses. Opaque responses pass through to the network unless you really know what you're doing.
+
+<Callout kind="gotcha">
+  The single worst gotcha: a "ghost SW" serving last week's bundle to users who keep your tab open. Mitigations: a prompt-to-reload UI on update, version your caches with a SW-version string, run `navigator.serviceWorker.getRegistration().then(r => r?.update())` periodically. The next worst: forgetting that Safari ships none of the cool stuff (no Background Sync, no Periodic Sync, push only for installed PWAs). Feature-detect and provide app-level fallbacks before you ship.
+</Callout>
+
+<Reading url="https://web.dev/articles/service-worker-mindset" title="Getting your head around service worker debugging" kind="blog" minutes={10} />
+<Reading url="https://developer.chrome.com/docs/devtools/progressive-web-apps" title="Debug PWAs in Chrome DevTools" kind="docs" minutes={8} />
+<Reading url="https://jakearchibald.com/2014/using-serviceworker-today/" title="Using ServiceWorker today (gotchas-rich post)" author="Jake Archibald" kind="blog" minutes={12} />
+
+**Remember this:** Stale SW > deploy success. Always. Build the prompt-to-reload UI before you ship a SW to users. Then turn on Update-on-reload in DevTools and never turn it off.

@@ -1,0 +1,60 @@
+---
+title: Why service workers
+---
+
+<SectionHeader kind="why" number={1} title="Why service workers" />
+
+For most of the web's history, the browser was a thin client. Open a tab, fetch HTML, render. Close the tab, the connection dies. If the network went away, so did the app. Native apps did not work like that, and users noticed.
+
+A service worker (SW) is the browser's answer. It's a script that lives outside any single page, sits between your app and the network, and keeps running after the tab is gone. Once you have a programmable proxy that the OS will wake up for you, a lot of "native-only" features stop being native-only.
+
+## The native-vs-web gap, closing
+
+Five years ago the gap was huge: native apps installed to the home screen, ran offline, received push notifications, and synced in the background. Web apps did none of that. Today the gap is mostly closed, and almost all of the closing is downstream of one primitive — the SW.
+
+- Offline reads and writes: cache + IndexedDB, both addressable from the SW.
+- Install to home screen: a manifest plus a registered SW makes a site "installable."
+- Push notifications: the Push API delivers a wake-up to a SW, which posts an OS notification.
+- Background sync: the browser wakes the SW when connectivity returns and runs your replay code.
+- Periodic sync: timed background refreshes (Chromium only, but it exists).
+
+None of those work without a SW. Strip the SW, and a progressive web app (PWA) collapses back to a regular tab.
+
+## "Offline works" is a UX foundation, not a feature
+
+Treat offline as a feature and you'll ship a banner that says "you're offline" and call it done. Treat it as a foundation and you make different choices: cache the app shell on first visit, store mutations locally and replay them, design every screen so it has _something_ to render with no network.
+
+The product win is not "works on a plane." It's the subway, the elevator, the conference Wi-Fi that drops every 90 seconds, the user who taps a link the instant their phone roams between cell towers. Those are the moments a non-offline app feels broken. An offline-first app feels solid. The cost difference at design time is modest. At rewrite-the-app time, it's enormous.
+
+For agentic and collaboration tools — the kind a startup is shipping in 2026 — this matters even more. Long-running agent tasks, shared documents, optimistic edits across collaborators: all of these benefit from a layer that's local-first, that survives a connection blip, that doesn't lose a user's words because the WebSocket died.
+
+## The SW is the browser's interceptor
+
+The mental model that unlocks everything: a SW is a proxy you wrote, in JavaScript, that the browser inserts between every request your page makes and the network. You see the request via a `fetch` event. You decide what to respond with — a cached `Response`, a fresh one off the network, a stitched-together hybrid, an opaque "you're offline" page.
+
+That single hook — _you can answer requests with anything_ — is what makes SW the foundation. Once you have it, the rest is patterns: which requests do you cache, when do you go to the network, how do you handle staleness, what do you do when the user comes back online.
+
+<Callout kind="why">
+  Service workers exist because the web needed a programmable proxy that outlives the tab. Every "native-feeling" web capability — offline, install, push, background sync — flows from that one primitive. For a startup shipping collaborative or agentic software, treating offline as a UX foundation (not a feature) is the difference between a product that survives a flaky subway and one that feels broken on every cell tower handoff.
+</Callout>
+
+## What "ship a SW" actually costs
+
+Not nothing. SWs introduce a second runtime in your app, with its own lifecycle, its own caches, its own ways to break in production. You'll spend an afternoon debugging a "ghost SW" serving last week's bundle. You'll write a versioning scheme for caches. You'll add an "Update on reload" toggle to your devtools muscle memory. The Tradeoffs and Gotchas sections cover the ugly parts in detail.
+
+The deal is straightforward: pay that cost once, and offline becomes a property of your app, not a feature you bolt on later. For most B2B SaaS dashboards, it's not worth it. For collaboration tools, mobile-first PWAs, anything users will open on a phone in the wild — it's table stakes.
+
+## What this module covers
+
+By the end:
+- You understand the SW lifecycle well enough to debug a stuck-in-waiting worker.
+- You can pick the right caching strategy for a given resource type without thinking about it.
+- You know when to roll raw SW code vs reach for Workbox.
+- You've shipped a small offline-first reader with background sync.
+- You've internalized the production gotchas before they bite you.
+
+<Reading url="https://web.dev/learn/pwa/service-workers" title="Service workers — web.dev PWA Learn" kind="docs" minutes={12} />
+<Reading url="https://developer.mozilla.org/en-US/docs/Web/API/Service_Worker_API" title="Service Worker API — MDN" kind="docs" minutes={10} />
+<Reading url="https://jakearchibald.com/2014/offline-cookbook/" title="The Offline Cookbook" author="Jake Archibald" kind="blog" minutes={20} />
+
+**Remember this:** A SW is a programmable proxy that outlives the tab. Every native-feeling web capability falls out of that one fact.
