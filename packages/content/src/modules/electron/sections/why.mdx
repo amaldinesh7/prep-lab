@@ -1,0 +1,65 @@
+---
+title: Why Electron
+---
+
+<SectionHeader kind="why" number={1} title="Why Electron" />
+
+Building a desktop app the "right" way used to mean three teams. A Swift team for macOS. A C# or C++ team for Windows. A GTK or Qt team for Linux, if you cared. Three codebases, three release cadences, three sets of bugs, three platforms where your designer's component spec landed three different ways. For a fifteen-person startup, that's a non-starter — desktop simply wasn't a product surface you could afford.
+
+Electron broke that constraint. Bundle Chromium + Node into a single binary, write your UI in HTML/CSS/JS, ship the same app on Mac, Windows, and Linux from one repo. Suddenly desktop is a frontend problem.
+
+## The promise, plainly
+
+You write a web app. The framework wraps it in a native window with a system menu bar, a tray icon, file-system access, and the ability to spawn child processes. The user double-clicks a `.app` or a `.exe` and gets something indistinguishable from a "real" desktop app — until you peek under the hood and find Chrome devtools attached.
+
+The leverage is enormous:
+
+- One React codebase, three OSes
+- Access to the full Node ecosystem from the same process tree
+- Auto-updates as a solved problem (`electron-updater` + S3 or GitHub releases)
+- Devtools, hot reload, the entire web tooling story — for desktop
+
+For a startup with a React team and zero appetite to hire native engineers, this is the only sensible answer in 2026. It's the answer VS Code, Slack, Discord, Notion, Linear, Figma's desktop wrapper, 1Password, Postman, Obsidian, and Cursor all picked. The shape of that list isn't an accident — those are exactly the products where shipping fast on three platforms mattered more than squeezing every byte and millisecond.
+
+## The "Electron is bloated" critique — fair but partial
+
+You will hear this critique within your first month. Sometimes from your CTO, sometimes from Hacker News, sometimes from a customer who runs a 4GB MacBook Air. The complaint goes: every Electron app ships its own copy of Chromium (~150MB), runs a separate Chrome instance, eats 300MB of RAM at idle, and feels sluggish on low-end hardware. A native Mac app of equivalent surface area might be 20MB and 80MB resident.
+
+All of that is true. Also true: most of your users have 16GB of RAM, your auto-update channel doesn't care about the 150MB any more than it cares about an unoptimized image, and the engineering cost of native parity would be three full-time hires you don't have.
+
+The honest position: Electron's footprint is real, and it's the price of cross-platform consistency from a web codebase. If you're shipping a low-frequency tool to mid-range developer machines, the price is fine. If you're shipping a menu-bar utility to every Mac at a Fortune 500 (where IT inventories binary size), you'd think harder. If you're shipping to mobile, you're not using Electron at all.
+
+The Tauri comparison later in this module is the honest answer to "can we get the cross-platform leverage without the Chromium tax?" — sometimes yes, sometimes no.
+
+## Where Electron is the right call
+
+Three signals that you're in Electron's sweet spot:
+
+1. **Your team is React-shaped.** You don't have Swift/C++ engineers and aren't hiring them. The fastest path to shipping desktop is reusing the web stack.
+2. **The app is a productivity tool, not a real-time game or a kernel-adjacent utility.** Editors, dashboards, chat clients, dev tools, notes apps — all of these run on Electron because the perf budget is generous enough.
+3. **Cross-platform consistency matters more than per-platform polish.** If your customer expects the Mac app to feel native and the Windows app to feel native and they expect those feels to differ, Electron is a bad fit. If they expect both to feel like your product, it's perfect.
+
+VS Code is the existence proof. Microsoft, the company that ships Visual Studio (a native Windows IDE), chose Electron for VS Code because the cross-platform leverage was worth more than the binary size. Their engineering blog is required reading on this — they've spent a decade making Electron fast.
+
+## Where Electron isn't the right call
+
+- Menu-bar utilities where 150MB of Chromium is the entire footprint. (Use Swift on Mac, Tauri elsewhere.)
+- Mobile. (React Native is the corresponding play — see the React Native module.)
+- Anything that needs to render native OS controls pixel-perfect (file pickers, system dialogs are fine — but a TableView that scrolls 100k rows? Use the platform.)
+- Apps that compete on RAM efficiency. If your pitch is "we use 5% less memory than the competitor," Electron is structurally wrong.
+
+## What this module assumes you'll join
+
+A startup with an Electron app means: a `main` process running Node, one or more `renderer` processes running Chromium, an IPC layer connecting them, a `preload.ts` enforcing security boundaries, an `electron-builder` config, code-signing keys in a CI secret store, and an auto-update channel pointed at S3 or GitHub releases. Every section that follows is a piece of that picture.
+
+By the end of this module you should be able to: open a packaged Electron app's source tree, find `main.ts` and `preload.ts`, follow the IPC handlers to the renderer code, identify whether the security checklist is actually enforced, and know what `electron-builder` is doing on Mac vs Windows.
+
+<Callout kind="why">
+  Electron exists because shipping cross-platform desktop apps used to require three teams. It traded a heavy runtime (bundled Chromium + Node) for the ability to ship from a single React codebase. For a startup, that trade is almost always correct — the engineering velocity dwarfs the binary-size cost. The "bloat" critique is real but rarely decisive.
+</Callout>
+
+<Reading url="https://www.electronjs.org/docs/latest/" title="Electron — Official Docs" kind="docs" minutes={8} />
+<Reading url="https://code.visualstudio.com/blogs/2021/10/11/vscode-electron-sandbox" title="VS Code — Migrating to Electron's process sandbox" kind="blog" minutes={12} />
+<Reading url="https://slack.engineering/growing-pains-migrating-slacks-desktop-app-to-browserview/" title="Slack Engineering — Migrating Slack's desktop app to BrowserView" kind="blog" minutes={10} />
+
+**Remember this:** Electron is the React team's answer to "ship a desktop app." The Chromium-shaped tax is real and rarely a dealbreaker. Pick it for productivity-shaped products on developer-shaped machines.

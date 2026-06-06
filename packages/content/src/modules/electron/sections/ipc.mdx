@@ -1,0 +1,198 @@
+---
+title: IPC patterns
+---
+
+<SectionHeader kind="concept" number={3} title="IPC patterns" />
+
+IPC is how the two processes talk. Everything else in your Electron app — opening a file, saving a document, getting a system notification, knowing whether the network is online — is an IPC call. Knowing the four canonical patterns means you can write features without inventing your own boundary every time.
+
+The patterns:
+
+1. **Renderer asks main for something** — `ipcRenderer.invoke` / `ipcMain.handle`. Request/response.
+2. **Main pushes to a renderer** — `webContents.send` / `ipcRenderer.on`. Event stream.
+3. **Renderer fires-and-forgets to main** — `ipcRenderer.send` / `ipcMain.on`. Avoid; use `invoke`.
+4. **Renderer-to-renderer** — route through main, or use `MessageChannelMain`.
+
+The first two cover 95% of real code. We'll spend most of our time there.
+
+## Request/response — `invoke` + `handle`
+
+This is the workhorse. Renderer wants something from main, awaits an answer. It's a promise; it can throw; you can `try/catch` it like any other async call.
+
+<Code lang="ts" file="src/main.ts">{`import { app, BrowserWindow, dialog, ipcMain } from "electron";
+import { readFile } from "node:fs/promises";
+
+ipcMain.handle("file:open", async () => {
+  const result = await dialog.showOpenDialog({
+    properties: ["openFile"],
+    filters: [{ name: "Markdown", extensions: ["md", "markdown"] }],
+  });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  const filePath = result.filePaths[0];
+  const contents = await readFile(filePath, "utf8");
+  return { filePath, contents };
+});`}</Code>
+
+<Code lang="ts" file="src/preload.ts">{`import { contextBridge, ipcRenderer } from "electron";
+
+contextBridge.exposeInMainWorld("api", {
+  openFile: () => ipcRenderer.invoke("file:open") as Promise<
+    { filePath: string; contents: string } | null
+  >,
+});`}</Code>
+
+<Code lang="tsx" file="src/renderer/Editor.tsx">{`export function OpenButton({ onLoad }: { onLoad: (path: string, contents: string) => void }) {
+  return (
+    <button onClick={async () => {
+      const result = await window.api.openFile();
+      if (result) onLoad(result.filePath, result.contents);
+    }}>
+      Open file...
+    </button>
+  );
+}`}</Code>
+
+Three things to note.
+
+**Channel names are strings.** Use a convention. `file:open`, `file:save`, `db:query`, `auth:login`. Colons aren't required — pick a separator and stick with it. Without discipline you end up with `openFile`, `open-file`, `FILE_OPEN`, and `file/open` in the same codebase.
+
+**`invoke` is a one-shot promise.** It resolves when `handle`'s callback returns. If your handler throws, `invoke`'s promise rejects with that error — the renderer's `try/catch` catches it just like any other async call. The error message is serialized; the stack trace is not preserved across the IPC boundary, which is a real debugging pain. Log generously in the main process.
+
+**Arguments and return values are structured-cloned.** Same algorithm as `postMessage`. You can pass plain objects, arrays, dates, typed arrays, even Blobs. You _cannot_ pass functions, class instances with methods, DOM nodes, or anything with a circular reference. If you `JSON.stringify` it cleanly, it crosses IPC cleanly.
+
+## Push from main to renderer — `webContents.send`
+
+Sometimes main needs to tell the renderer about something the user didn't ask for: a menu item was clicked, a file was opened from the OS file association, the auto-updater downloaded a new version, the deep-link handler caught a `myapp://` URL.
+
+<Code lang="ts" file="src/main.ts">{`import { app, BrowserWindow, Menu } from "electron";
+
+const template = [
+  {
+    label: "File",
+    submenu: [
+      {
+        label: "New Document",
+        accelerator: "CmdOrCtrl+N",
+        click: (_item: unknown, focusedWindow?: BrowserWindow) => {
+          focusedWindow?.webContents.send("menu:new-document");
+        },
+      },
+    ],
+  },
+] as const;
+
+Menu.setApplicationMenu(Menu.buildFromTemplate(template as any));`}</Code>
+
+<Code lang="ts" file="src/preload.ts">{`import { contextBridge, ipcRenderer } from "electron";
+
+contextBridge.exposeInMainWorld("api", {
+  onNewDocument: (handler: () => void) => {
+    const listener = () => handler();
+    ipcRenderer.on("menu:new-document", listener);
+    return () => ipcRenderer.off("menu:new-document", listener);
+  },
+});`}</Code>
+
+<Code lang="tsx" file="src/renderer/App.tsx">{`import { useEffect } from "react";
+import { useEditorStore } from "./store";
+
+export function App() {
+  const newDocument = useEditorStore((s) => s.newDocument);
+
+  useEffect(() => {
+    const unsubscribe = window.api.onNewDocument(newDocument);
+    return unsubscribe;
+  }, [newDocument]);
+
+  return /* ... */ null;
+}`}</Code>
+
+The pattern to internalize:
+
+1. The preload exposes a registration function, not the raw `on`. The caller passes a handler; the preload wraps it and returns an unsubscribe.
+2. Returning an unsubscribe lets the React component clean up in `useEffect`'s teardown — otherwise hot reload accumulates listeners and you spend an afternoon hunting "why does my app trigger this twice."
+3. The handler signature in preload _strips the IPC event arg_. Renderer code shouldn't see the `IpcRendererEvent` — it's a leaky detail.
+
+## The pattern to avoid — `ipcRenderer.send` + `ipcMain.on`
+
+`send`/`on` is fire-and-forget. The renderer can't know if the message was received, processed, or errored. It exists for historical reasons and one or two legitimate niche cases (broadcasts where you genuinely don't care). For everything that has an answer or could fail, use `invoke`/`handle`.
+
+If you inherit a codebase using `send` heavily, that's a refactor candidate. The conversion is mechanical: rename `send` → `invoke`, rename `on` → `handle`, return values from the handler instead of calling `event.reply`.
+
+## Context isolation — the why behind preload
+
+You may notice we keep going through `preload.ts` rather than calling `ipcRenderer.invoke` directly in renderer code. That's because **the renderer doesn't have access to `ipcRenderer` at all** in a securely-configured app. (See the security section.)
+
+`contextBridge.exposeInMainWorld("api", { ... })` is how you punch _specific_ functions through the isolation boundary. The renderer sees `window.api.openFile()` and nothing more. It cannot reach `ipcRenderer`. It cannot accidentally `invoke` a channel that doesn't exist. The preload is the typed surface area between the worlds.
+
+This is also where TypeScript ergonomics matter. You want one source of truth for "what's on `window.api`." A few options:
+
+**Hand-rolled with a shared type file.**
+
+<Code lang="ts" file="src/shared/api.ts">{`export interface AppApi {
+  openFile: () => Promise<{ filePath: string; contents: string } | null>;
+  saveFile: (filePath: string, contents: string) => Promise<void>;
+  onNewDocument: (handler: () => void) => () => void;
+}
+
+declare global {
+  interface Window { api: AppApi }
+}`}</Code>
+
+Import this file in both `preload.ts` (to type the implementation) and renderer code (to type `window.api`). The compiler enforces parity. This works, it's free of dependencies, and it's what most teams start with.
+
+**`electron-trpc` or `tipc`.** Same idea as tRPC for web: define a typed router on the main side, get end-to-end type inference on the renderer side, no `ipcMain.handle("file:open", ...)` boilerplate. Worth adopting once you have more than ten IPC handlers and you're tired of channel name typos. The setup cost is a few hours; the payoff is route-table-like discoverability.
+
+<Code lang="ts" file="src/main/router.ts">{`// Sketch of electron-trpc; refer to docs for the current API.
+import { initTRPC } from "@trpc/server";
+import { z } from "zod";
+
+const t = initTRPC.create();
+
+export const router = t.router({
+  file: t.router({
+    open: t.procedure.mutation(async () => {
+      // ...same logic as ipcMain.handle("file:open")
+      return { filePath: "", contents: "" };
+    }),
+    save: t.procedure
+      .input(z.object({ filePath: z.string(), contents: z.string() }))
+      .mutation(async ({ input }) => {
+        // ...
+      }),
+  }),
+});
+
+export type AppRouter = typeof router;`}</Code>
+
+The renderer then uses a typed client and gets autocomplete on every procedure. If you're starting a new Electron app in 2026 and the team has tRPC muscle memory, this is the path.
+
+## Streaming, large payloads, and the cloning tax
+
+Every IPC call serializes its arguments and return value via the structured-clone algorithm. For small JSON-shaped data, this is invisible. For large payloads — opening a 50MB log file, reading a hundred thousand DB rows, streaming a video — the clone cost shows up as a UI freeze on either side.
+
+The escape hatches, in order of how often you'll need them:
+
+1. **Stream to a file the renderer can read by URL.** Write to a temp file from main, send the path, let the renderer load it via `file://` or `<img src>`. The OS handles the bulk transfer.
+2. **`MessageChannelMain`.** Open a `MessagePort` between processes and send `Transferable` objects (ArrayBuffers transfer with zero copy). Real win for ~10MB+ binary payloads.
+3. **`net.fetch` from the main side.** If you're fetching from a remote endpoint, fetch in main and forward; or fetch in renderer and skip IPC entirely.
+
+For 99% of apps you'll never need these. But when your editor freezes for a second every time the user opens a large file, this is where you look.
+
+## Naming conventions and registration
+
+Two patterns help past 20 handlers:
+
+**Group handler registration.** Don't sprinkle `ipcMain.handle(...)` across `main.ts`. Have a `registerIpcHandlers()` function in `main/ipc.ts` that registers them all in one place. New devs grep there.
+
+**Namespace channel names.** `file:open`, `file:save`, `auth:login`, `auth:logout`, `db:query`. Visually scannable. Greppable. Avoids collisions across feature areas.
+
+<Callout kind="pattern">
+  The dominant production pattern: `ipcRenderer.invoke` for everything renderer-initiated, `webContents.send` for main-initiated pushes, `contextBridge` to expose a narrow typed `window.api`, shared TS types between main and renderer for parity. Once you outgrow hand-rolled, adopt `electron-trpc` for route-table ergonomics. Never use `nodeIntegration: true` to skip the bridge — that's the security antipattern the next section is entirely about.
+</Callout>
+
+<Reading url="https://www.electronjs.org/docs/latest/tutorial/ipc" title="Electron — IPC Patterns" kind="docs" minutes={12} />
+<Reading url="https://www.electronjs.org/docs/latest/tutorial/message-ports" title="Electron — Message Ports" kind="docs" minutes={8} />
+<Reading url="https://github.com/jsonnull/electron-trpc" title="electron-trpc — Typed IPC via tRPC" kind="docs" minutes={6} />
+
+**Remember this:** `invoke`/`handle` for requests, `webContents.send` for pushes, `contextBridge` to expose them, shared TS types to keep both sides honest. Avoid `send`/`on` for anything that could fail or has a return value.

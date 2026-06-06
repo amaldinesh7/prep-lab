@@ -1,0 +1,27 @@
+---
+title: Cheatsheet
+---
+
+<SectionHeader kind="cheatsheet" number={9} title="Cheatsheet" />
+
+Keep this open the first month you work on an Electron app.
+
+<Cheatsheet rows={[
+  { k: "Two processes", v: "main (Node, full OS access) + renderer (Chromium, sandboxed)" },
+  { k: "IPC request/response", v: "ipcMain.handle + ipcRenderer.invoke (await-able, errors propagate)" },
+  { k: "Main push to renderer", v: "webContents.send + ipcRenderer.on (event stream)" },
+  { k: "Safe API exposure", v: "contextBridge.exposeInMainWorld('api', { ...verbs })" },
+  { k: "Context isolation", v: "ALWAYS on (contextIsolation: true)" },
+  { k: "Node in renderer", v: "ALWAYS off (nodeIntegration: false)" },
+  { k: "Renderer sandbox", v: "ON (sandbox: true) — OS-level defense in depth" },
+  { k: "CSP header", v: "session.defaultSession.webRequest.onHeadersReceived — set Content-Security-Policy" },
+  { k: "Auto-updater", v: "electron-updater — verifies signatures, polls S3 or GitHub releases" },
+  { k: "Packager", v: "electron-builder (production default) or electron-forge (newer, Electron-team-maintained)" },
+  { k: "Mac signing", v: "Developer ID cert + hardenedRuntime + entitlements + Apple notarization (required)" },
+  { k: "Windows signing", v: "OV cert minimum; EV cert eliminates SmartScreen warnings (worth it for consumer apps)" },
+  { k: "Native module rebuild", v: "electron-builder install-app-deps (runs electron-rebuild for embedded Node ABI)" },
+  { k: "Alternative — smaller binary", v: "Tauri (Rust core, system webview, ~5-10MB installer, three rendering engines)" },
+  { k: "Famous Electron apps", v: "VS Code, Slack, Discord, Linear, Notion, 1Password, Postman, Obsidian, Cursor" }
+]} />
+
+**Remember this:** Two processes, IPC over `invoke`/`handle`, four security flags, signed binaries with verified auto-updates. Get those right and every other Electron concern is a 30-minute search away.

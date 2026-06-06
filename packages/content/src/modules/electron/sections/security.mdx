@@ -1,0 +1,179 @@
+---
+title: Security model
+---
+
+<SectionHeader kind="pattern" number={4} title="Security model" />
+
+Electron's security model is the single most consequential set of defaults you'll touch. Get the four flags right and you have the same threat surface as Chromium itself — which is one of the most-audited pieces of software on the planet. Get one wrong and you've built a remote code execution vector with your company's logo on it. There's no middle ground; you'll see this in the Electron docs themselves and in every postmortem Slack, Discord, and 1Password have published.
+
+The four flags, the checklist, and what each one actually buys you.
+
+## The four `webPreferences` flags
+
+Every `BrowserWindow` is configured by a `webPreferences` object. The four that matter for security:
+
+<Code lang="ts" file="src/main.ts">{`new BrowserWindow({
+  webPreferences: {
+    contextIsolation: true,   // ON — non-negotiable
+    nodeIntegration: false,   // OFF — non-negotiable
+    sandbox: true,            // ON — strongly recommended
+    webSecurity: true,        // ON — leave alone
+    preload: path.join(__dirname, "preload.js"),
+  },
+});`}</Code>
+
+These are _the_ defaults in Electron 20+. The historical risk is inheriting code from Electron 5 or 10 where defaults were laxer; verify every `BrowserWindow` construction in the codebase you join. A single window with `nodeIntegration: true` poisons the well.
+
+### `contextIsolation: true`
+
+**What it does.** Runs your preload script and the renderer page in _separate JavaScript contexts_. They share a DOM but not globals. The preload can't accidentally leak `ipcRenderer` to the page by assigning it to `window`; the only way to share is through `contextBridge.exposeInMainWorld`.
+
+**Why it matters.** Without context isolation, a single XSS in your renderer (an HTML injection in a chat message, a markdown renderer that doesn't escape a link) hands the attacker access to whatever your preload assigned to `window`. With it on, the attacker gets the DOM and nothing else.
+
+**The cost.** Marginal. You write `contextBridge.exposeInMainWorld("api", { ... })` instead of `window.api = { ... }`. That's it.
+
+### `nodeIntegration: false`
+
+**What it does.** The renderer's JavaScript context does not have `require`, `process`, `Buffer`, `__dirname`, or any Node global. It's a browser context — the same one a real browser tab has.
+
+**Why it matters.** If `nodeIntegration: true`, then a successful XSS lets the attacker do `require("child_process").exec("rm -rf ~")`. There's no defense in depth past that point. Every CVE in the Electron security advisory archive that wasn't a Chromium bug has, at its core, this flag set wrong.
+
+**The cost.** None. You shouldn't have Node code in your renderer anyway — that's what main and preload are for.
+
+### `sandbox: true`
+
+**What it does.** Enables Chromium's OS-level process sandbox on the renderer. On Linux this uses seccomp-bpf; on Mac it uses Apple's sandbox; on Windows it uses job objects and integrity levels. The renderer process cannot open arbitrary files, spawn subprocesses, or make arbitrary syscalls — even if an attacker achieves arbitrary code execution inside V8.
+
+**Why it matters.** Defense in depth. `nodeIntegration: false` keeps an attacker from calling `require("fs")` directly, but a sufficiently determined attacker might find a way to escape Chromium's JS sandbox (rare, expensive, but possible). The OS sandbox is the last line.
+
+**The cost.** Your preload's API surface is narrower. With `sandbox: true`, the preload only has access to a subset of Electron APIs (essentially `ipcRenderer` and a few odds and ends — no `fs`, no `child_process`, no direct Node modules). All real work has to happen in main, communicated via IPC. This is actually a good design constraint — it forces you to think clearly about where work lives. Some legacy codebases disable sandbox to share Node logic in preload; resist that.
+
+### `webSecurity: true`
+
+**What it does.** The browser security defaults — same-origin policy, mixed-content blocking, CSP enforcement. On by default; the only reason it's ever turned off is to load `file://` URLs that fetch from `https://` origins, which is a workaround for a legitimately tricky deployment, not a solution.
+
+**The cost.** Sometimes you have to put more thought into your dev-server URL or your asset paths. Don't turn it off.
+
+## The `preload.ts` as the controlled bridge
+
+`preload.ts` is the security-critical file. Treat it the way you'd treat the only public function on a sensitive internal service: every export is a security review.
+
+**Rules of preload hygiene:**
+
+1. **Expose verbs, not nouns.** `openFile()` is fine. `fs.readFile()` is a footgun. The renderer should ask "do the thing"; the main process owns the policy of how.
+2. **Validate inputs in main, not preload.** Preload should be a thin transport. Validation, authorization, rate limiting — all in `ipcMain.handle`. Preload is reachable via XSS; main is not.
+3. **Never expose `ipcRenderer` directly.** `exposeInMainWorld("ipc", ipcRenderer)` defeats the entire model. The renderer would be able to call any channel, including unregistered ones, and the attacker would just need to know channel names.
+4. **Don't put business logic in preload.** It runs in the renderer's process. Anything sensitive in preload is reachable.
+
+<Code lang="ts" file="src/preload.ts">{`import { contextBridge, ipcRenderer } from "electron";
+
+// GOOD — narrow, verb-shaped, validated in main.
+contextBridge.exposeInMainWorld("api", {
+  openFile: () => ipcRenderer.invoke("file:open"),
+  saveFile: (filePath: string, contents: string) =>
+    ipcRenderer.invoke("file:save", { filePath, contents }),
+});
+
+// BAD — never do any of these:
+// contextBridge.exposeInMainWorld("electron", { ipcRenderer });
+// contextBridge.exposeInMainWorld("fs", require("fs"));
+// contextBridge.exposeInMainWorld("exec", (cmd: string) => /* ... */);`}</Code>
+
+A useful mental check: if a future XSS in your renderer can call _anything_ on `window.api` with arbitrary arguments, would that lead to data loss, privilege escalation, or RCE? If yes, redesign. The renderer is _the_ untrusted process, even when it's loading your own React app.
+
+## Content Security Policy
+
+CSP is the cheap, high-value defense you should ship from day one. It tells the browser which origins it's allowed to load scripts, styles, images, fonts, and connections from. A correctly-set CSP prevents inline-script-based XSS even if your React app has a sanitization bug.
+
+Two ways to set CSP. The Electron docs recommend the HTTP header approach because `<meta>` CSP has a few capabilities it can't express (notably `report-uri`).
+
+<Code lang="ts" file="src/main.ts">{`import { session } from "electron";
+
+app.whenReady().then(() => {
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    callback({
+      responseHeaders: {
+        ...details.responseHeaders,
+        "Content-Security-Policy": [
+          "default-src 'self';",
+          "script-src 'self';",
+          "style-src 'self' 'unsafe-inline';",
+          "img-src 'self' data: https:;",
+          "connect-src 'self' https://api.yourdomain.com;",
+        ].join(" "),
+      },
+    });
+  });
+});`}</Code>
+
+The painful part of CSP is the first time you ship it. Some library injects an inline `<style>` and breaks. A third-party script's CDN isn't on the allowlist. You will iterate. Ship in `Content-Security-Policy-Report-Only` mode first if you're nervous, watch the violations, then promote to enforcement.
+
+## Navigation hardening
+
+A subtle attack vector: a link in your renderer that navigates the window to a remote URL. Now the attacker controls a page that's running inside your Electron app's session, with whatever stays in window context.
+
+Two handlers in main close this:
+
+<Code lang="ts" file="src/main.ts">{`import { app, shell } from "electron";
+
+app.on("web-contents-created", (_event, contents) => {
+  // 1. Block in-app navigation to anywhere that isn't our app.
+  contents.on("will-navigate", (event, url) => {
+    const parsed = new URL(url);
+    if (parsed.origin !== "https://app.yourdomain.com" && !url.startsWith("file://")) {
+      event.preventDefault();
+    }
+  });
+
+  // 2. window.open and target="_blank" — open in default browser, not in our app.
+  contents.setWindowOpenHandler(({ url }) => {
+    shell.openExternal(url);
+    return { action: "deny" };
+  });
+});`}</Code>
+
+Ship both. Forgetting `setWindowOpenHandler` is one of the most common security oversights — every `<a href target="_blank">` in your app opens a new BrowserWindow with default settings unless you intervene.
+
+## Auto-updates and signing
+
+The auto-updater is part of the security perimeter. If an attacker can convince your app that a malicious binary is a legitimate update, you've just shipped them a worm.
+
+`electron-updater` solves this with code-signature verification — the new binary must be signed with the same certificate as the running app, or it's rejected. This is why **you cannot ship a credible Electron app without code signing**. We go deep on this in the packaging section, but the security framing:
+
+- **Mac.** Notarization is mandatory. Apple's Gatekeeper refuses to launch unsigned apps. Even if a user downloads your app, they get the "can't be opened because the developer cannot be verified" dialog.
+- **Windows.** Unsigned apps trigger SmartScreen's "unrecognized app" warning. Most users will close the dialog. Buying a code-signing cert (~$100-500/yr depending on EV vs OV) is mandatory if you care about install rates.
+- **Auto-update.** `electron-updater` verifies signatures by default. _Do not disable this_. If you have signing problems, fix the signing problems.
+
+## The security checklist (the one Electron's docs ship)
+
+Every Electron security audit walks this checklist. Memorize it; it's the highest-leverage knowledge in this module.
+
+1. Only load secure content (`https://`, not `http://`).
+2. Disable Node integration in all renderers that display remote content.
+3. Enable context isolation in all renderers.
+4. Enable sandbox in all renderers.
+5. Use `ses.setPermissionRequestHandler()` in sessions that load remote content.
+6. Do not disable `webSecurity`.
+7. Define a Content Security Policy.
+8. Do not enable `allowRunningInsecureContent`.
+9. Do not enable experimental features.
+10. Do not use `enableBlinkFeatures`.
+11. `<webview>`: don't use unless you must; if you must, verify all options.
+12. Verify webContents on `will-navigate`.
+13. Disable or limit creation of new windows.
+14. Don't use `shell.openExternal` with untrusted content.
+15. Use a current version of Electron (Electron upstreams Chromium CVE fixes).
+16. Validate the sender of all IPC messages (`event.senderFrame.url`).
+
+Number 15 deserves emphasis. Electron releases happen ~quarterly and include the latest Chromium security patches. **An Electron app on a version more than 6 months behind is shipping known-exploitable Chromium bugs.** Bump regularly. Treat Electron versions like you'd treat your Node version — keep it on a supported branch.
+
+<Callout kind="pattern">
+  The security model is four flags and a checklist. `contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`, `webSecurity: true`. A typed `contextBridge` for the bridge. CSP headers. Navigation hardening. Signed binaries with signature-verified auto-updates. Skip any of these and the next CVE has your name on it. None of them are expensive; all of them are non-negotiable in production.
+</Callout>
+
+<Reading url="https://www.electronjs.org/docs/latest/tutorial/security" title="Electron — Security Checklist (the canonical reference)" kind="docs" minutes={20} />
+<Reading url="https://www.electronjs.org/docs/latest/tutorial/context-isolation" title="Electron — Context Isolation" kind="docs" minutes={8} />
+<Reading url="https://github.com/doyensec/electronegativity" title="Electronegativity — static analyzer for Electron security issues" kind="docs" minutes={6} />
+<Reading url="https://blog.doyensec.com/2025/01/14/electron-deeplink-rce.html" title="Doyensec — Real-world Electron RCE writeup" kind="blog" minutes={12} />
+
+**Remember this:** Four flags, one bridge, one CSP, one signing identity. The defaults are good in modern Electron — the failure mode is inheriting an old codebase where someone disabled one to fix a five-year-old bug. Audit every `webPreferences` block in week one.

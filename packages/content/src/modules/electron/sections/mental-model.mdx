@@ -1,0 +1,162 @@
+---
+title: Main vs renderer processes
+---
+
+<SectionHeader kind="concept" number={2} title="Main vs renderer processes" />
+
+The single most important thing to internalize about Electron is that your app is _two programs running side by side_. One is a Node process. The other is a Chromium process. They share no memory and no global scope. Every interesting thing you do in Electron is a consequence of that split.
+
+If your mental model is "it's a website with extra APIs," you'll write insecure code that crashes in production. If your mental model is "two processes that talk over a wire," you'll write code that ships.
+
+## The two processes
+
+**The main process.**
+
+- One per app. Spawned when the user double-clicks the binary.
+- Runs Node.js. Full access to `fs`, `child_process`, `net`, native modules, the OS.
+- Owns the application lifecycle: app menus, dock/taskbar interactions, window creation, system tray, global shortcuts, the auto-updater.
+- Crashes the main process, the app dies.
+
+**The renderer process.**
+
+- One per `BrowserWindow` (or `<webview>`, or `BrowserView`). A typical app has at least one; many have several.
+- Runs Chromium. Same engine, same V8, same DOM and CSS as the browser you're reading this in.
+- _Sandboxed_ by default in any sanely-configured app. Cannot touch the filesystem. Cannot spawn processes. Cannot `require("fs")`.
+- This is where your React app lives.
+
+A useful analogy: the main process is your "backend." The renderer is your "frontend." Just like a real backend and frontend can only talk over HTTP, main and renderer can only talk over IPC. (Inter-process communication — IPC for short, which we'll use from here.)
+
+## Why the split exists
+
+The split isn't an Electron quirk. It's Chromium's architecture. Every Chrome tab is a renderer process. Tabs don't share memory with each other or with the browser shell. This is what keeps a runaway page on one tab from taking down your whole browser, and what keeps an exploited renderer from reading your password manager's tab.
+
+Electron inherits all of that. Two reasons it matters:
+
+1. **Security.** A renderer is the part of your app that's most likely to be compromised — it loads remote content, runs JS from a CDN, renders HTML the user pasted in. Keeping it sandboxed means an attacker who pops the renderer doesn't get arbitrary code execution on the user's machine. They get a sandboxed Chrome tab. That's a recoverable bug, not a company-ending CVE.
+2. **Stability.** A crash in the renderer (DOM corruption, OOM in V8, an exception in React's reconciler) takes down one window. The main process and other windows keep running. The app menu still works. The user can hit Cmd-R to reload.
+
+If you've ever wondered why Chrome's "Aw, snap!" page exists, this is why. Same architecture, same payoff.
+
+## A minimal three-file app
+
+Here is the smallest interesting Electron app. Three files, all of them load-bearing.
+
+<Code lang="ts" file="src/main.ts">{`import { app, BrowserWindow } from "electron";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+function createWindow() {
+  const win = new BrowserWindow({
+    width: 1200,
+    height: 800,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,    // ON — see security section
+      nodeIntegration: false,    // OFF — see security section
+      sandbox: true,             // ON — see security section
+    },
+  });
+
+  // In dev, point at the Vite dev server; in prod, load the built HTML.
+  if (process.env.VITE_DEV_SERVER_URL) {
+    win.loadURL(process.env.VITE_DEV_SERVER_URL);
+  } else {
+    win.loadFile(path.join(__dirname, "../renderer/index.html"));
+  }
+}
+
+app.whenReady().then(createWindow);
+
+app.on("window-all-closed", () => {
+  // macOS apps stay alive when all windows close; everyone else quits.
+  if (process.platform !== "darwin") app.quit();
+});
+
+app.on("activate", () => {
+  // macOS dock click — recreate a window if none exist.
+  if (BrowserWindow.getAllWindows().length === 0) createWindow();
+});`}</Code>
+
+<Code lang="ts" file="src/preload.ts">{`import { contextBridge, ipcRenderer } from "electron";
+
+// The ONLY way the renderer talks to the main process.
+// Anything you expose here is what the renderer can call.
+contextBridge.exposeInMainWorld("api", {
+  ping: () => ipcRenderer.invoke("ping"),
+  onMenuAction: (handler: (action: string) => void) => {
+    const listener = (_: unknown, action: string) => handler(action);
+    ipcRenderer.on("menu-action", listener);
+    return () => ipcRenderer.off("menu-action", listener);
+  },
+});`}</Code>
+
+<Code lang="tsx" file="src/renderer/App.tsx">{`// Renderer code looks like any React app.
+// The "api" global comes from preload.ts above.
+declare global {
+  interface Window {
+    api: {
+      ping: () => Promise<string>;
+      onMenuAction: (handler: (action: string) => void) => () => void;
+    };
+  }
+}
+
+export function App() {
+  return (
+    <button onClick={async () => {
+      const response = await window.api.ping();
+      console.log(response); // "pong"
+    }}>
+      Ping the main process
+    </button>
+  );
+}`}</Code>
+
+Three details to internalize.
+
+**The renderer is just a React app.** Once `preload.ts` has done its job, your React code is unaware it's in Electron. You import from React, you mount with `createRoot`, you write components. The only Electron-ness is the `window.api` object — and that's a deliberate, narrow surface.
+
+**`preload.ts` runs in a privileged twilight zone.** It executes _in the renderer process_ but with access to a small set of Electron APIs (notably `ipcRenderer` and `contextBridge`). It's the bridge between the sandboxed renderer and the main process. We come back to it in the security section because it's the entire point of the security model.
+
+**The main process is a long-running Node script.** It listens for app events (`ready`, `window-all-closed`, `activate`), spawns windows, registers IPC handlers, and runs the auto-updater. It doesn't render anything. It doesn't import React. It doesn't have a DOM.
+
+## Multiple windows, multiple renderers
+
+A real app often has several windows: a main window, a settings window, maybe a quick-capture window or a notification panel. Each is its own `BrowserWindow`, which means each is its own renderer process.
+
+<Code lang="ts" file="src/main.ts">{`function createSettingsWindow() {
+  const settings = new BrowserWindow({
+    width: 600, height: 400, parent: mainWindow, modal: false,
+    webPreferences: { preload: preloadPath, contextIsolation: true, sandbox: true },
+  });
+  settings.loadFile("settings.html");
+}`}</Code>
+
+This is where the "they share no memory" rule starts to bite. If your main window's React state has the user's current document and the settings window needs to read it, you can't just import the same Zustand store. You have to either:
+
+1. Route the state through the main process (treat main as a shared state authority), or
+2. Use a cross-process state channel (some teams build this on top of IPC; others use `electron-store` to persist to disk and reload).
+
+Most production apps end up with **main as the single source of truth for cross-window state**. Windows are views over main's state, not independent state holders.
+
+## What lives where — the working rule
+
+When you're staring at an Electron codebase wondering "where does this code go," use this rule:
+
+- **Main process** — anything that touches the filesystem, the OS, the network, the menu bar, the dock, native modules, system notifications, the auto-updater, app lifecycle, or any state that more than one window needs.
+- **Renderer process** — UI, React, your design system, in-memory window-local state, anything you'd write in a normal SPA.
+- **Preload** — the explicit, audited list of capabilities you're willing to hand from main to renderer. Nothing else.
+
+Get this rule wrong in either direction and you'll feel it. Filesystem access in the renderer means either an insecure app or a confusing one (it'll work in dev, fail when packaged). UI logic in the main process means you're round-tripping over IPC for every state change, which feels laggy.
+
+<Callout kind="concept">
+  Electron is two processes. Main is your Node backend; renderer is your Chromium frontend; preload is the audited bridge between them. Internalize that, and every other Electron concept — IPC, security, packaging — is a consequence. Get it wrong, and everything from data flow to auto-updates feels like fighting the framework.
+</Callout>
+
+<Reading url="https://www.electronjs.org/docs/latest/tutorial/process-model" title="Electron — Process Model" kind="docs" minutes={10} />
+<Reading url="https://www.electronjs.org/docs/latest/tutorial/quick-start" title="Electron — Quick Start (the whole flow)" kind="docs" minutes={8} />
+<Reading url="https://www.electronjs.org/docs/latest/tutorial/sandbox" title="Electron — Process Sandboxing" kind="docs" minutes={9} />
+
+**Remember this:** Main is Node. Renderer is Chromium. They talk over IPC. Preload is the bridge. Every other Electron pattern is a consequence of that shape.

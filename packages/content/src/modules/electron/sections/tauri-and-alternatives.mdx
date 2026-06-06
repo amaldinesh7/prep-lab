@@ -1,0 +1,113 @@
+---
+title: Tauri and alternatives
+---
+
+<SectionHeader kind="tradeoff" number={5} title="Tauri and alternatives" />
+
+Electron is the default. It's not the only choice, and the alternatives are credible enough in 2026 that you'll see them in interview questions, RFCs, and the "should we rewrite?" thread that appears in every Electron team's Slack every six months. Here's how to think about it.
+
+## The core tradeoff
+
+Electron's defining choice is **bundle your own browser**. Every Mac, Windows, and Linux user gets the same Chromium version because you ship it. That means:
+
+- Your app renders identically on every OS — pixel-for-pixel, JS-for-JS.
+- You can rely on the latest web platform features (CSS subgrid, `:has()`, view transitions) regardless of what's installed.
+- Your binary is ~150MB before you write a line of code.
+- Your RAM footprint is "Chrome plus your app," because that is literally what's running.
+
+The alternatives all share one structural decision: **use the system's webview instead of bundling Chromium**. Smaller binary, smaller RAM, but rendering depends on what the OS ships.
+
+That tradeoff — _bundle Chromium for consistency, or use the system webview for footprint_ — is the entire alternatives landscape. Once you grasp it, every specific framework slots into place.
+
+## Tauri — the serious alternative
+
+Tauri is the most-discussed Electron alternative because it's the most polished and the one with real adoption in 2026.
+
+**The shape:**
+
+- The "backend" is Rust instead of Node. (Tauri 2.x added mobile, JavaScript backends via tauri-plugin-javascript, and Python via separate work, but Rust is the canonical path.)
+- The "frontend" is whatever web framework you want — React, Vue, Svelte, Solid — loaded into the system webview.
+- The webview is **platform-dependent**: WebView2 (Chromium-based, ships with Windows 11) on Windows, WKWebView (Safari/WebKit) on macOS, WebKitGTK on Linux.
+
+**What you get:**
+
+- A 5-10MB installer. (Yes, _megabytes_, not hundreds of megabytes.)
+- A 50-100MB RAM footprint at idle, vs 300-500MB for Electron.
+- Rust for system-level code. Faster than Node for CPU-bound work, fewer dependencies, no V8 in the backend.
+- A real security model from the ground up: Tauri's IPC layer uses an allowlist (`tauri.conf.json`) of which APIs the frontend can call, enforced by the Rust core.
+
+**What you pay:**
+
+- **Rendering differs across platforms.** Safari on Mac, Edge on Windows, WebKitGTK on Linux. Three browsers, three sets of CSS quirks. The big ones: WebKit on Mac doesn't support some Chrome-only CSS, font rendering looks different, devtools are different. WebKitGTK on Linux is the weakest of the three and ships in different versions across distros. If pixel-perfect cross-platform is your design language, this is a real problem.
+- **Rust learning curve.** Your team writes Rust for filesystem access, OS integrations, native modules, the auto-updater plugin. If your team is React-only, that's a real cost. If you have one engineer who's curious about Rust, it's a fun project.
+- **Ecosystem maturity.** Plugin coverage is good but not Electron-good. Some niche needs (specific OS integrations, certain enterprise SSO flows) have an Electron module and no Tauri equivalent.
+- **WebView2 is a Windows install dependency.** Windows 11 ships it; Windows 10 may need a runtime download. Tauri handles this gracefully but it's a step in the install flow.
+
+**Pick Tauri when:**
+
+- Binary size and RAM are part of your pitch. (Menu-bar utilities, tooling sidekicks, anything where users compare you to a native equivalent.)
+- You have or want Rust in the stack.
+- You can live with three rendering engines or your design language is conservative enough to not care.
+- You're starting fresh — porting a mature Electron app to Tauri is months of work because every IPC handler is a Rust rewrite.
+
+**Stick with Electron when:**
+
+- You ship a complex, design-system-heavy UI where rendering parity matters.
+- Your team is React-only and adding Rust is a hiring problem.
+- You depend on a niche Electron module without a Tauri equivalent.
+- You need the latest web platform features unconditionally (Safari/WebKit lag on some features by 6-12 months).
+- You have a mature Electron codebase that works.
+
+The honest summary: Tauri is a credible choice for new projects with the right team shape. It is not a "rewrite your Electron app over a quarter" project — that's almost always the wrong call.
+
+## Wails — the Go alternative
+
+Same shape as Tauri, with Go as the backend instead of Rust. Uses system webviews on each platform.
+
+- Backend in Go, frontend in any web framework.
+- Smaller and lighter than Electron, similar to Tauri.
+- Ecosystem and tooling are less mature than Tauri.
+
+**Pick Wails when:** your team has Go and would prefer Go to Rust. The shape of the choice (system webview, smaller binary, cross-platform rendering quirks) is identical to Tauri's.
+
+## Neutralino — the truly minimal one
+
+Neutralino takes the "use the system webview" idea further: no bundled runtime at all, ~2MB binary, JavaScript backend (V8 via the OS or Node alongside). Mostly aimed at small utilities, not full apps. Worth knowing exists, rarely the right answer for a startup product.
+
+## React Native for desktop — the Microsoft path
+
+Microsoft maintains `react-native-windows` and `react-native-macos`. The pitch: actual native UI rendered by RN, not a webview. Performance and OS integration are best-in-class. Cost: you're now writing React Native, not React DOM, with all the platform-fork stress (`.windows.tsx` files, native module work for both targets). Real story for VS Live Share, Office, and a few internal Microsoft tools. Niche elsewhere.
+
+## NW.js — the historical context
+
+NW.js (formerly node-webkit) predates Electron and shares its architecture (Chromium + Node bundled). Slack famously started on it before switching to Electron. NW.js still exists, has a smaller community, and offers a slightly different process model (a single shared Node context, optionally). You'll see it in older codebases. For new projects, Electron's mindshare wins by a mile.
+
+## When Electron is still the right pick
+
+After the alternatives roundtable, here's what keeps Electron in pole position for most startups in 2026:
+
+1. **Rendering consistency.** Three rendering engines (Tauri/Wails) means three sets of bugs in design-system-heavy UIs. One Chromium means one set.
+2. **Ecosystem maturity.** Native modules, plugins, IPC patterns, packaging tooling, code-signing flows — all of it has more StackOverflow answers, more battle-tested patterns, more "Slack ran into this in 2019" postmortems.
+3. **Hiring.** Every JS/TS engineer can ramp on Electron. Tauri requires Rust comfort or willingness to learn. Wails needs Go. RN-desktop needs RN.
+4. **VS Code is the proof.** Microsoft, with literally infinite native engineering resources, picked Electron. Their app is fast, their codebase is open source, and their engineering blog is a goldmine. If Electron weren't good enough, they'd have replaced it.
+
+## The decision tree
+
+A practical heuristic when someone asks "should we use Tauri instead?":
+
+- New project, footprint-sensitive (utilities, tools), team open to Rust → Tauri.
+- New project, design-system-heavy, team is React-only, footprint doesn't define the product → Electron.
+- Existing Electron app that works → Stay. The rewrite math is almost never positive.
+- Mobile is also a target → React Native (separate stack, not in the alternatives roundtable here).
+- Maximum perf, maximum native feel, willing to invest → Native (Swift on Mac, WinUI on Windows). This is the path Linear is rumored to be exploring for v2 of their desktop story; it's not a JS-team decision.
+
+<Callout kind="tradeoff">
+  Electron's defining bet is "bundle the browser." Tauri's is "use the system's." Bundling buys you rendering consistency and ecosystem maturity; not bundling buys you binary size and RAM. For most startups in 2026, consistency + ecosystem outweighs footprint, and Electron stays the default. For utilities or apps where binary size is part of the pitch, Tauri is genuinely the better choice — accept the three rendering engines and embrace Rust.
+</Callout>
+
+<Reading url="https://tauri.app/start/" title="Tauri — Getting Started" kind="docs" minutes={10} />
+<Reading url="https://tauri.app/concept/architecture/" title="Tauri — Architecture" kind="docs" minutes={8} />
+<Reading url="https://wails.io/docs/introduction" title="Wails — Introduction" kind="docs" minutes={6} />
+<Reading url="https://felixrieseberg.com/the-mountain-of-rust-electron-tauri/" title="Felix Rieseberg — Electron vs Tauri, honest take" kind="blog" minutes={10} />
+
+**Remember this:** The choice is "bundle Chromium" (Electron, NW.js) vs "system webview" (Tauri, Wails, Neutralino). Bundling wins on rendering consistency and ecosystem; not-bundling wins on size and RAM. Pick based on what your product cares about, not on Twitter consensus.

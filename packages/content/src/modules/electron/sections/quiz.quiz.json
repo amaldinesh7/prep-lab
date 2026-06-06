@@ -1,0 +1,64 @@
+{
+  "questions": [
+    {
+      "id": "q1",
+      "prompt": "In a sanely-configured modern Electron app, can the renderer process require('fs') and read arbitrary files?",
+      "options": [
+        { "id": "a", "label": "Yes — the renderer is a Node.js context with full filesystem access" },
+        { "id": "b", "label": "Yes, but only inside the app bundle, not anywhere else on disk" },
+        { "id": "c", "label": "No — with contextIsolation: true and nodeIntegration: false (the modern defaults), the renderer has no Node globals; filesystem access must be brokered through IPC to the main process" },
+        { "id": "d", "label": "Only if the renderer is loaded from a file:// URL" }
+      ],
+      "correct": "c",
+      "explanation": "Modern Electron defaults run the renderer as a sandboxed Chromium tab with no Node access. Filesystem operations are proxied through preload + IPC to the main process. Enabling nodeIntegration: true is the canonical 'CVE waiting to ship' antipattern."
+    },
+    {
+      "id": "q2",
+      "prompt": "What's the safest, most type-friendly pattern for exposing a function to the renderer that fetches a database row?",
+      "options": [
+        { "id": "a", "label": "Set window.db = require('better-sqlite3') in preload and call directly from renderer" },
+        { "id": "b", "label": "contextBridge.exposeInMainWorld('db', { getRow }) where getRow uses ipcRenderer.invoke, with a corresponding ipcMain.handle that validates input and queries the DB" },
+        { "id": "c", "label": "ipcRenderer.send('get-row', id) from the renderer and ipcMain.on(...) in main, posting the result back via webContents.send" },
+        { "id": "d", "label": "Open a WebSocket from renderer to main on localhost" }
+      ],
+      "correct": "b",
+      "explanation": "contextBridge exposes a narrow API surface across the context-isolation boundary, invoke/handle gives you request/response with proper error propagation, and the DB code stays in main where it belongs. Option (a) breaks the security model; (c) is fire-and-forget with no return value or error path; (d) is wildly over-engineered."
+    },
+    {
+      "id": "q3",
+      "prompt": "What's Tauri's primary structural advantage over Electron?",
+      "options": [
+        { "id": "a", "label": "Better TypeScript ergonomics" },
+        { "id": "b", "label": "Smaller binaries and lower RAM, because it uses the system webview instead of bundling Chromium" },
+        { "id": "c", "label": "More mature ecosystem and plugin coverage" },
+        { "id": "d", "label": "Better support for cross-platform UI consistency" }
+      ],
+      "correct": "b",
+      "explanation": "Tauri bundles a Rust core and loads your frontend into the OS's webview (WebView2 on Windows, WKWebView on Mac, WebKitGTK on Linux). That's a 5-10MB installer vs Electron's 100+MB, and ~50MB RAM idle vs ~300MB. The tradeoff is three different rendering engines and worse cross-platform consistency — Electron's strength."
+    },
+    {
+      "id": "q4",
+      "prompt": "Which platform requires code signing as an effectively non-negotiable step before users can install your app without warnings?",
+      "options": [
+        { "id": "a", "label": "Linux — every distro enforces signing" },
+        { "id": "b", "label": "macOS — Apple's Gatekeeper requires Developer ID signing plus notarization, otherwise users see 'cannot be opened because the developer cannot be verified'" },
+        { "id": "c", "label": "Windows — without signing, the .exe simply won't run" },
+        { "id": "d", "label": "None — Electron handles all of this automatically" }
+      ],
+      "correct": "b",
+      "explanation": "Mac is the strictest: notarization is mandatory in practice. Windows lets unsigned apps run but triggers SmartScreen warnings (strongly recommended to sign with an EV cert). Linux has no equivalent gatekeeper. Saying 'Electron handles it' is wrong — you configure signing in electron-builder and supply the certs yourself."
+    },
+    {
+      "id": "q5",
+      "prompt": "You inherit a codebase. One BrowserWindow has webPreferences: { nodeIntegration: true, contextIsolation: false }. What's the correct framing?",
+      "options": [
+        { "id": "a", "label": "Acceptable — it lets your renderer code use Node directly, which is convenient" },
+        { "id": "b", "label": "Fine if the renderer only loads local content, since there's no XSS vector" },
+        { "id": "c", "label": "A critical security mistake — any XSS in that renderer becomes arbitrary code execution on the user's machine. Fix in week one" },
+        { "id": "d", "label": "Only a problem if the app loads remote content; locally bundled UIs are immune" }
+      ],
+      "correct": "c",
+      "explanation": "Even a renderer that loads only local content can have XSS bugs — a markdown renderer that doesn't escape a link, a chat message that becomes innerHTML, a clipboard paste handler. With nodeIntegration: true, every one of those becomes RCE. The Electron security checklist puts this at #1 for a reason."
+    }
+  ]
+}

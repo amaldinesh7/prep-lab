@@ -1,0 +1,158 @@
+---
+title: Production gotchas
+---
+
+<SectionHeader kind="gotcha" number={7} title="Production gotchas" />
+
+Every team running Electron in production hits these. They're not bugs in Electron — they're the consequences of how it works, surfacing under conditions that don't exist on `localhost`. Knowing them saves an outage each.
+
+## 1. `nodeIntegration: true` in production is a CVE waiting to ship
+
+The single most consequential mistake. Inheriting a codebase from 2017 means inheriting `nodeIntegration: true` on the main window, because that was the default. Every CVE in the Electron advisory archive that wasn't a Chromium bug has, at its root, this flag set wrong.
+
+The check is two minutes:
+
+<Code lang="bash">{`# In any Electron repo, grep every BrowserWindow construction.
+rg -n "new BrowserWindow|webPreferences" --type ts --type js`}</Code>
+
+For each match, verify: `contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`. If any window disagrees, fix it the week you join. The "we'll get to it" version of this conversation ends with a security disclosure email.
+
+A subtler version: `nodeIntegrationInSubFrames: true` or `nodeIntegrationInWorker: true`. Same problem, narrower scope, just as bad. Sweep these too.
+
+## 2. Mac notarization rejections — the entitlements maze
+
+You wire up signing, you set `notarize: true`, you push a build, and Apple rejects with a message like "The binary uses an SDK older than the 10.9 SDK" or "The executable does not have the hardened runtime enabled." The actual cause is rarely what the message says.
+
+The common failure modes:
+
+- **Missing entitlements for JIT.** V8 needs `com.apple.security.cs.allow-jit`. Without it, your app launches and immediately crashes on the first JS execution _in the notarized build_. (Dev runs fine because dev isn't hardened.)
+- **A bundled binary isn't signed.** `electron-builder` signs your app's main executable, but a native module (sqlite3, node-pty, an embedded CLI) inside `Resources/` might not get signed. The notarization service walks the whole bundle and rejects on any unsigned Mach-O.
+- **An ad-hoc test build leaked through.** A binary signed with `-` (the ad-hoc identity) instead of your Developer ID. Common when a developer runs `npm run package` locally and pushes the artifact.
+
+The fix loop: read the notarization log (Apple emails it, or `xcrun notarytool log <id>`), find the offending binary, sign it explicitly in your build pipeline. Each rejection takes 10-30 minutes to discover. Plan time for this on your first signed release.
+
+## 3. Windows code-signing cert costs and SmartScreen
+
+A standard OV (Organization Validation) cert from Sectigo/SSL.com is $100-200/yr. Cheap. Useless for the first 500-2000 installs, because SmartScreen's "Windows protected your PC" dialog will fire until your binary builds reputation, and your install-success rate cratrers.
+
+EV (Extended Validation) certs eliminate the warning immediately. They cost $300-700/yr, require an HSM (USB token or cloud HSM), and complicate CI. They're worth it for any consumer-facing app where install completion is a metric.
+
+The trap: starting with OV because it's cheap, then realizing six months in that install-completion data justifies EV, and now you need to migrate code-signing identities — which means migrating the auto-update signature verification, which means a manual reinstall for every user on the old cert. Plan the cert choice up front.
+
+## 4. `BrowserWindow` leaks — windows that don't get garbage collected
+
+Common pattern: a developer creates a window, closes it, opens a new one, and the old one stays in memory. Symptoms: process count grows over a long session, RAM creeps up, devtools shows orphaned BrowserWindows.
+
+The mechanics: a `BrowserWindow` is released when (a) the user closes it _and_ (b) you drop your last reference to it in the main process. Most leaks are case (b) — you stored the window in a module-scope variable and never null'd it.
+
+<Code lang="ts" file="src/main.ts">{`let settingsWindow: BrowserWindow | null = null;
+
+function openSettings() {
+  if (settingsWindow) {
+    settingsWindow.focus();
+    return;
+  }
+  settingsWindow = new BrowserWindow({ /* ... */ });
+
+  // CRITICAL: null the reference when the window is closed.
+  settingsWindow.on("closed", () => {
+    settingsWindow = null;
+  });
+
+  settingsWindow.loadFile("settings.html");
+}`}</Code>
+
+Forgetting the `"closed"` handler is the leak. The window object stays alive in your closure, the Chromium process stays alive too, and your task manager fills up with zombie helpers.
+
+Audit pattern: every `new BrowserWindow` in the codebase should have a corresponding `closed` handler that nulls the reference. Set this as a code review rule and you avoid the whole class.
+
+## 5. Auto-update race conditions
+
+`autoUpdater.downloadUpdate()` runs in the background. The user can quit the app mid-download. Default behavior in some configurations: the partially-downloaded file stays in `userData`, and the next launch refuses to apply it because the hash doesn't match.
+
+A worse race: the user quits while `quitAndInstall()` is mid-flight. The new binary is being copied over the old one when the OS terminates the app. On Mac you can end up with a half-overwritten `.app` bundle that refuses to launch. On Windows, NSIS handles this more gracefully but not perfectly.
+
+Defensive patterns:
+
+<Code lang="ts" file="src/main/updater.ts">{`import { app } from "electron";
+import { autoUpdater } from "electron-updater";
+
+let updateDownloaded = false;
+
+autoUpdater.on("update-downloaded", () => {
+  updateDownloaded = true;
+});
+
+app.on("before-quit", (e) => {
+  if (updateDownloaded) {
+    e.preventDefault();
+    autoUpdater.quitAndInstall(true /* silent */, true /* forceRunAfter */);
+  }
+});`}</Code>
+
+The pattern: don't call `quitAndInstall` immediately on download. Defer to the user's natural quit, intercept it, and run install during the quit handler. The OS expects the app to exit; the updater hands control to the installer; on next launch the new binary runs.
+
+## 6. Native module mismatch — works in dev, crashes when packaged
+
+If you use `better-sqlite3`, `node-pty`, `keytar`, `sharp`, or any native module, you've got the version-mismatch landmine.
+
+The shape: native modules ship as `.node` files compiled against a specific Node ABI. Your dev environment uses your system's Node (say, ABI version `108`). Electron embeds a _different_ Node — call it ABI `116`. When you `npm install better-sqlite3`, npm fetches the prebuilt binary for `108`. It works in `npm test`. It crashes on launch when packaged because the embedded Node expects `116`.
+
+The fix: `electron-rebuild` (or its modern replacement, the `postinstall` script in modern starters) rebuilds native modules against Electron's ABI.
+
+<Code lang="json" file="package.json">{`{
+  "scripts": {
+    "postinstall": "electron-builder install-app-deps"
+  }
+}`}</Code>
+
+`install-app-deps` reads your installed Electron version, figures out the right ABI, and rebuilds. Add it to `postinstall`; every fresh `bun install` or `npm install` will produce a working tree.
+
+CI gotcha: the rebuild happens on your build machine, against that machine's architecture. Building on `ubuntu-latest` produces Linux x64 `.node` files; building on `macos-latest` produces Mac ones. This is why the CI matrix from the packaging section runs three separate jobs — each rebuilds for its own platform.
+
+## 7. The `userData` path confusion
+
+`app.getPath("userData")` is where you store user-scoped data: settings, caches, downloaded updates, SQLite databases. Three things bite:
+
+1. **In dev, `userData` is the same as in production** by default. Your dev experiments stomp on real user data if you're not careful. Use `app.setPath("userData", path.join(app.getPath("appData"), "YourApp-dev"))` in dev.
+2. **Sandboxed builds (Mac App Store) have a different `userData` than direct-download builds.** The same app installed two ways won't share state. Most teams just don't ship to MAS for this reason.
+3. **Custom protocols can read `file://` URLs into `userData`** if you let them. Restrict scheme registration to known paths.
+
+## 8. The window-controls/menu cross-platform mismatch
+
+Mac has a unified menu bar at the top of the screen, owned by the OS. Windows has an in-window menu, traditionally. Linux is whatever the WM does.
+
+If you put your menu logic in the renderer (a custom HTML menu bar at the top of the window), Mac users get a duplicate menu — one at the top of the screen (Electron's default) and one inside the window (yours). The fix is to use Electron's `Menu.setApplicationMenu` for the system menu and conditionally hide your in-window one on `process.platform === "darwin"`.
+
+If you build a custom frameless window with `frame: false` (so your renderer owns window controls), Windows and Linux users won't have minimize/maximize/close buttons until you render them. There's no native Electron API for "draw the Windows close button" — you draw the SVG. `electron-traffic-light-position` and similar libraries help with the Mac side (positioning the traffic lights inside the custom titlebar).
+
+## 9. Forgetting the senderFrame check on IPC handlers
+
+Security checklist item #16 from the security section. Even with all four flags set, an attacker who hijacks a renderer can call any registered IPC handler. Validation in main is your defense.
+
+<Code lang="ts" file="src/main/ipc.ts">{`ipcMain.handle("file:open", async (event) => {
+  // Optional but recommended: verify the call came from your own window.
+  if (event.senderFrame.url.startsWith("https://malicious.example.com")) {
+    throw new Error("Forbidden");
+  }
+  // ... actual handler
+});`}</Code>
+
+For apps that only load `file://` and `https://yourapp.example.com`, this check is straightforward. For apps with embedded webviews or remote content, it's essential.
+
+## 10. Electron version pinning and Chromium CVEs
+
+Electron releases every 8 weeks, bringing the latest Chromium with it. The version you ship is the Chromium version your users get, and Chromium ships ~150 CVE fixes a year. If your Electron version is six months old, you're exposing your users to known-exploitable bugs.
+
+Production teams treat Electron upgrades like Node upgrades: tracked, scheduled, with a staging period for the renderer-side breakage that always happens (a deprecated Chrome API, a behavior change in V8, a font-rendering tweak). One engineer per quarter owns the upgrade. Skipping a quarter is fine; skipping a year is not.
+
+<Callout kind="gotcha">
+  The single worst Electron gotcha is _inherited_: a codebase from before security defaults tightened, with `nodeIntegration: true` somewhere, unsigned binaries, no notarization, and an Electron version two years out of date. Fixing this is a quarter of work. Knowing what to look for in week one is the difference between catching it then or after the first security disclosure.
+</Callout>
+
+<Reading url="https://www.electronjs.org/docs/latest/tutorial/security#checklist-security-recommendations" title="Electron — Security Checklist (revisit it quarterly)" kind="docs" minutes={15} />
+<Reading url="https://felixrieseberg.com/electron-apps-and-the-burden-of-the-bundle/" title="Felix Rieseberg — Electron Apps and the Burden of the Bundle" kind="blog" minutes={10} />
+<Reading url="https://www.electronjs.org/blog/statement-run-as-node-cves" title="Electron Blog — runAsNode CVEs (production case study)" kind="blog" minutes={8} />
+<Reading url="https://github.com/electron/electron/blob/main/docs/tutorial/native-code-and-electron.md" title="Electron — Native code in Electron" kind="docs" minutes={10} />
+
+**Remember this:** Audit `webPreferences` everywhere in week one. Set up `electron-rebuild` so native modules work in packaged builds. Run `electron-builder` with notarization and signing from day one — retrofitting it later is harder. Upgrade Electron quarterly; you're shipping Chromium CVE fixes whether you mean to or not.

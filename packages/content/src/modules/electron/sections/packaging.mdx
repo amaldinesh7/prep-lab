@@ -1,0 +1,217 @@
+---
+title: Packaging and distribution
+---
+
+<SectionHeader kind="concept" number={6} title="Packaging and distribution" />
+
+A working app on `npm run dev` and a shippable signed installer with a working auto-update channel are weeks apart. Packaging is where Electron projects spend a surprising amount of their first quarter — not because it's hard, but because there are six platform variants, two competing packagers, and three places signing can break. The good news: once it's working, it stays working.
+
+## Two packagers — `electron-builder` vs `electron-forge`
+
+These are the two real options. You'll see both in the wild.
+
+**`electron-builder`** is the older, more configuration-driven choice. One config file (`electron-builder.json` or a `build` key in `package.json`), and it handles installer creation for every platform, code signing, auto-update artifact generation, and notarization. The Electron community defaults to it; Discord, Notion, Linear, and most production apps you'd recognize use it. The downsides: dense config, sometimes magical behavior, less integrated with dev tooling.
+
+**`electron-forge`** is maintained by the Electron team itself. It wraps `electron-packager` plus a set of "makers" (per-platform installer generators) and "publishers" (S3, GitHub, etc.). More opinionated, more tightly integrated, simpler API. Less battle-tested at scale than `electron-builder`. Modern starter templates often default to Forge.
+
+The honest recommendation for 2026: **start with `electron-builder` for production apps** because the config patterns are well-known, every problem you'll hit has been hit by ten teams before you, and `electron-updater` (its companion library) is the most-deployed auto-update solution. If you're prototyping or doing something simple, Forge is fine and the DX is nicer.
+
+## A minimal `electron-builder` config
+
+This is roughly what a real config looks like once you've made the obvious choices.
+
+<Code lang="json" file="electron-builder.json">{`{
+  "appId": "com.yourcompany.yourapp",
+  "productName": "YourApp",
+  "directories": {
+    "output": "release",
+    "buildResources": "build"
+  },
+  "files": [
+    "dist/**/*",
+    "package.json"
+  ],
+  "extraResources": [
+    "resources/**/*"
+  ],
+  "mac": {
+    "category": "public.app-category.productivity",
+    "hardenedRuntime": true,
+    "gatekeeperAssess": false,
+    "entitlements": "build/entitlements.mac.plist",
+    "entitlementsInherit": "build/entitlements.mac.plist",
+    "notarize": true,
+    "target": [
+      { "target": "dmg", "arch": ["x64", "arm64"] },
+      { "target": "zip", "arch": ["x64", "arm64"] }
+    ]
+  },
+  "win": {
+    "target": [
+      { "target": "nsis", "arch": ["x64"] }
+    ],
+    "signtoolOptions": {
+      "publisherName": "Your Company, Inc.",
+      "signingHashAlgorithms": ["sha256"]
+    }
+  },
+  "linux": {
+    "target": ["AppImage", "deb"],
+    "category": "Office"
+  },
+  "publish": [
+    {
+      "provider": "s3",
+      "bucket": "yourapp-updates",
+      "region": "us-east-1",
+      "path": "/desktop"
+    }
+  ]
+}`}</Code>
+
+A walkthrough of the non-obvious parts.
+
+**`files`** is what ends up inside the packaged app. Almost always `dist/**` (your bundled main + preload + renderer) plus `package.json`. Common foot-bullet: forgetting to bundle dependencies into `dist` and assuming `node_modules` ships — it does, but only `dependencies`, not `devDependencies`, and only if not marked external in your bundler.
+
+**`mac.hardenedRuntime: true`** plus `entitlements` is the configuration Apple's notarization service requires. If either is wrong, notarization rejects the build with a famously unhelpful error message.
+
+**`mac.target` with both `x64` and `arm64`** produces a universal binary, or two separate binaries. For Apple Silicon users, _native arm64 builds matter_ — the Rosetta-translated x64 builds are 1.5-3x slower in Electron. Always ship both.
+
+**`publish` is where your auto-update artifacts go.** S3 and GitHub are the two common backends. The packager uploads the installer, plus a `latest-mac.yml` / `latest.yml` / `latest-linux.yml` metadata file that `electron-updater` polls.
+
+## Code signing — the part everyone underestimates
+
+Signing transforms "a binary that runs" into "a binary the OS will let users install without a scary warning." It is not optional past your first internal beta. The mechanics differ per platform.
+
+### Mac signing + notarization
+
+Two-step process.
+
+1. **Sign with a Developer ID Application certificate.** You get this by enrolling in the Apple Developer Program ($99/yr). The certificate goes into your CI's secret store; `electron-builder` reads it via env vars (`CSC_LINK` and `CSC_KEY_PASSWORD` for an exported `.p12`).
+2. **Notarize.** Upload the signed binary to Apple's notarization service. Apple scans it, signs it back with a Gatekeeper-accepted ticket, you staple the ticket to the binary. `electron-builder`'s `notarize: true` handles the upload-and-wait flow if you provide `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, and `APPLE_TEAM_ID` env vars.
+
+Notarization takes 5-30 minutes. If it fails, the error is usually about hardened runtime entitlements — your app tried to use a capability (JIT, microphone, network) without declaring it in the entitlements plist. The fix is to add the entitlement and re-notarize.
+
+<Code lang="xml" file="build/entitlements.mac.plist">{`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Allow Electron's V8 to JIT-compile JavaScript. -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <!-- Allow loading unsigned dylibs (some native modules). Only if needed. -->
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <!-- Network access, if you make outbound requests. -->
+  <key>com.apple.security.network.client</key>
+  <true/>
+</dict>
+</plist>`}</Code>
+
+### Windows signing
+
+Buy a code-signing certificate from a CA (DigiCert, Sectigo, SSL.com — ~$100-500/yr for OV, ~$300-700/yr for EV). The EV cert (Extended Validation) is what eliminates SmartScreen warnings; without EV, your first few hundred users still see a "Windows protected your PC" dialog until you build "reputation" with Microsoft, which is opaque and frustrating.
+
+The certificate is delivered as a `.pfx` (or stored in an HSM for EV). `electron-builder` reads `CSC_LINK` and `CSC_KEY_PASSWORD` for `.pfx`; EV signing usually requires a hardware token (which means signing on a dedicated build machine, not in CI — annoying, but real).
+
+### Linux signing
+
+Linux doesn't have a Gatekeeper-equivalent. `AppImage` and `deb` artifacts work unsigned. If you publish to a distribution channel (Snap, Flatpak, your own apt repo), each has its own signing story. For most teams, the Linux story is "AppImage on GitHub releases, hope for the best."
+
+## Auto-updates with `electron-updater`
+
+The companion to `electron-builder`. Lives in the main process, polls your update channel, downloads new versions, verifies signatures, and prompts to restart.
+
+<Code lang="ts" file="src/main/updater.ts">{`import { autoUpdater } from "electron-updater";
+import log from "electron-log";
+
+autoUpdater.logger = log;
+log.transports.file.level = "info";
+
+export function setupUpdater() {
+  autoUpdater.checkForUpdatesAndNotify();
+
+  // Check again every hour for long-running sessions.
+  setInterval(() => autoUpdater.checkForUpdatesAndNotify(), 60 * 60 * 1000);
+
+  autoUpdater.on("update-downloaded", () => {
+    // Defer install to next quit, or prompt now — your call.
+    // autoUpdater.quitAndInstall();
+  });
+}`}</Code>
+
+Three details that bite teams:
+
+1. **Updates only run from packaged builds.** In `npm run dev`, `checkForUpdatesAndNotify` no-ops. Test against a packaged build pushed to a staging update channel.
+2. **`electron-updater` verifies signatures.** If your dev cert and your release cert differ, the update will download and then refuse to install. Either sign with the same identity for both, or use a separate test channel.
+3. **`quitAndInstall` vs deferred install.** Calling it immediately interrupts the user. Most apps download silently and install on next quit, with a non-blocking "update ready" indicator. The race condition where the user quits mid-download is real — read the gotchas section.
+
+## Cross-platform builds in CI
+
+You cannot build a signed Mac DMG on Linux. You cannot build a signed Windows installer on Mac unless you're using ev_codesigning hosted services. The pragmatic CI setup is a matrix.
+
+<Code lang="yaml" file=".github/workflows/release.yml">{`name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: \${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - name: Package
+        env:
+          # Mac
+          CSC_LINK: \${{ secrets.MAC_CERTS_P12 }}
+          CSC_KEY_PASSWORD: \${{ secrets.MAC_CERTS_P12_PASSWORD }}
+          APPLE_ID: \${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: \${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: \${{ secrets.APPLE_TEAM_ID }}
+          # Windows (when not using EV/HSM)
+          WIN_CSC_LINK: \${{ secrets.WIN_CERT_PFX }}
+          WIN_CSC_KEY_PASSWORD: \${{ secrets.WIN_CERT_PASSWORD }}
+          # Publish target
+          AWS_ACCESS_KEY_ID: \${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: \${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: bunx electron-builder --publish always`}</Code>
+
+The matrix runs three parallel jobs. Each builds for its native OS. `electron-builder --publish always` uploads to S3 (or GitHub releases, per your config) and generates the metadata files. After all three jobs complete, the channel has a new version and apps phone home to update.
+
+**EV signing throws a wrench in this.** EV certs typically need an HSM, which doesn't sit in GitHub Actions. Common workarounds: self-hosted Windows runner with the USB token plugged in, or a cloud signing service (DigiCert Software Trust Manager, AWS CloudHSM with KSP). Plan for this when you upgrade from OV to EV.
+
+## Update channels and staged rollouts
+
+Most apps have at least two channels:
+
+- **`stable`** — what most users get. Slower release cadence (weeks to months).
+- **`beta`** or **`canary`** — opt-in for early users. Updates land here first; bugs surface before stable users see them.
+
+`electron-updater` supports per-channel feeds via the `channel` property in the build config. You publish to `latest.yml` for stable, `beta.yml` for beta, and the running app picks based on a setting the user (or your remote config) controls. Most production teams add this within the first six months; doing it from day one saves a future migration.
+
+## What gets packaged — the bundling sub-problem
+
+Modern Electron apps run their main, preload, and renderer code through a bundler. Two popular setups:
+
+- **`electron-vite`** — Vite for all three contexts (main, preload, renderer), with sensible defaults. The de facto modern starter.
+- **`electron-forge` with Webpack template** — official, slightly older feel.
+
+The bundler step matters for packaging because it determines what `electron-builder`'s `files` glob picks up. The pattern: bundle into `dist/main`, `dist/preload`, `dist/renderer`; tell `electron-builder` to include `dist/**`; mark native modules as external in the bundler so they get installed by npm/bun and copied as-is.
+
+<Callout kind="concept">
+  Production packaging is `electron-builder` + `electron-updater` + signed certs on Mac (notarized via Apple) and Windows (EV preferred). A GitHub Actions matrix runs the three platform builds in parallel and publishes to S3 or GitHub releases. The setup takes a week; once it works, you forget it exists. The cost of skipping any of it shows up later — unsigned downloads get blocked, auto-updates silently fail signature verification, x64-only Mac builds run slowly on Apple Silicon.
+</Callout>
+
+<Reading url="https://www.electron.build/" title="electron-builder — Documentation" kind="docs" minutes={15} />
+<Reading url="https://www.electronforge.io/" title="Electron Forge — Documentation" kind="docs" minutes={10} />
+<Reading url="https://www.electronjs.org/docs/latest/tutorial/code-signing" title="Electron — Code Signing" kind="docs" minutes={8} />
+<Reading url="https://github.com/electron-userland/electron-builder/blob/master/docs/auto-update.md" title="electron-updater — Auto-update Reference" kind="docs" minutes={10} />
+
+**Remember this:** `electron-builder` + `electron-updater`, signed and notarized, published from a CI matrix to S3 or GitHub. Mac universal binaries (x64 + arm64). Windows EV cert if you can afford it. The first release is painful; every release after that is mechanical.
