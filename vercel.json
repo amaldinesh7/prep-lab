@@ -1,0 +1,15 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "bun install",
+  "buildCommand": "bun run --filter @prep-lab/web build",
+  "outputDirectory": "apps/web/dist",
+  "framework": null,
+  "functions": {
+    "api/[[...path]].ts": {
+      "includeFiles": "packages/content/src/modules/**"
+    }
+  },
+  "rewrites": [
+    { "source": "/((?!api/).*)", "destination": "/index.html" }
+  ]
+}

@@ -8,3 +8,5 @@ bun.lock
 drizzle/meta/
 **/drizzle/meta/
 apps/web/vite.config.js
+.vercel/
+
