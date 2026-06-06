@@ -17,6 +17,7 @@
 }
 
 @theme {
+  --breakpoint-3xl: 1800px;
   --color-bg: var(--bg);
   --color-paper: var(--paper);
   --color-surface: var(--surface);

@@ -11,7 +11,7 @@ function romanise(n: number): string {
 export function Sidebar() {
   const q = useQuery({ queryKey: ["modules"], queryFn: () => api.modules.list({}) });
   return (
-    <aside className="px-6 py-7 sticky top-0 h-screen overflow-y-auto border-r border-[var(--border)] w-[264px] shrink-0">
+    <aside className="px-6 2xl:px-7 3xl:px-8 py-7 2xl:py-8 sticky top-0 h-screen overflow-y-auto border-r border-[var(--border)] w-full shrink-0">
       <div className="flex items-center justify-between pb-5 mb-6 border-b border-[var(--border)]">
         <div className="flex flex-col gap-1">
           <div className="text-[15px] font-semibold flex items-baseline gap-2">
@@ -29,15 +29,18 @@ export function Sidebar() {
       </NavSection>
 
       <NavSection label="Frontend track">
-        {q.data?.map((m, i) => (
-          <NavLink key={m.id} to="/modules/$moduleSlug" params={{ moduleSlug: m.slug }}>
-            <span className="font-mono text-[11px] text-[var(--text-faint)] mr-2.5 inline-block min-w-[22px]">{romanise(i + 1)}.</span>
-            <span>{m.title}</span>
-            <span className="ml-auto font-mono text-[10px] text-[var(--text-faint)]">
-              {m.totalSections === 0 ? "—" : Math.round((m.completedSections / m.totalSections) * 100)}
-            </span>
-          </NavLink>
-        ))}
+        {q.data?.map((m, i) => {
+          const pct = m.totalSections === 0 ? 0 : Math.round((m.completedSections / m.totalSections) * 100);
+          return (
+            <NavLink key={m.id} to="/modules/$moduleSlug" params={{ moduleSlug: m.slug }}>
+              <span className="font-mono text-[11px] text-[var(--text-faint)] mr-2.5 inline-block min-w-[22px] shrink-0">{romanise(i + 1)}.</span>
+              <span className="truncate">{m.title}</span>
+              {m.completedSections > 0 && (
+                <span className="ml-auto pl-2 font-mono text-[10px] text-[var(--text-faint)] tabular-nums shrink-0">{pct}%</span>
+              )}
+            </NavLink>
+          );
+        })}
       </NavSection>
     </aside>
   );
@@ -57,7 +60,7 @@ function NavLink({ to, params, children }: { to: string; params?: Record<string,
     <Link
       to={to as never}
       params={params as never}
-      className="flex items-baseline py-1 text-[14px] text-[var(--text-muted)] hover:text-[var(--text)]"
+      className="flex items-baseline py-1 text-[14px] text-[var(--text-muted)] hover:text-[var(--text)] min-w-0"
       activeProps={{ className: "text-[var(--text)] font-medium" }}
     >
       {children}
