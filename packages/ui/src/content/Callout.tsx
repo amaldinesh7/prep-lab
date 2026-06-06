@@ -12,7 +12,7 @@ const styles: Record<Kind, { bar: string; bg: string; label: string; labelText: 
 export function Callout({ kind, label, children }: { kind: Kind; label?: string; children: ReactNode }) {
   const s = styles[kind];
   return (
-    <div className={`my-5 max-w-[64ch] px-5.5 py-4 border-l-[3px] ${s.bar} ${s.bg}`}>
+    <div className={`my-5 max-w-[64ch] px-5.5 py-4 rounded-r-[var(--radius-md)] border-l-[3px] ${s.bar} ${s.bg}`}>
       <div className={`font-mono text-[10px] uppercase tracking-widest font-semibold mb-2 ${s.labelText}`}>{label ?? s.label}</div>
       <div className="text-[14.5px] leading-[1.6]">{children}</div>
     </div>

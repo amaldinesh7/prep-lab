@@ -22,7 +22,7 @@ export const Route = createFileRoute("/modules/$moduleSlug/")({
               <Link
                 to="/modules/$moduleSlug/$sectionSlug"
                 params={{ moduleSlug: data.slug, sectionSlug: s.slug }}
-                className="block hover:bg-[var(--surface)]"
+                className="block rounded-[var(--radius-md)] px-3 -mx-3 transition-colors duration-150 ease-out hover:bg-[var(--surface)]"
               >
                 <SectionHeader kind={s.kind} number={i + 1} title={s.title} />
               </Link>

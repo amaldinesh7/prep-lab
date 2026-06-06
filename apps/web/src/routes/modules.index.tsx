@@ -18,7 +18,7 @@ export const Route = createFileRoute("/modules/")({
                 <Link
                   to="/modules/$moduleSlug"
                   params={{ moduleSlug: m.slug }}
-                  className="grid grid-cols-[56px_minmax(0,1fr)_104px] gap-5 px-5 py-4 border border-[var(--border)] bg-[var(--paper)] items-baseline transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--surface)]"
+                  className="grid grid-cols-[56px_minmax(0,1fr)_104px] gap-5 px-5 py-4 rounded-[var(--radius-md)] border border-[var(--border)] bg-[var(--paper)] items-baseline transition-colors duration-150 ease-out hover:bg-[var(--surface)]"
                 >
                   <span className="font-mono text-[13px] text-[var(--text-faint)] tabular-nums">
                     {String(m.orderIndex).padStart(2, "0")}
@@ -27,8 +27,8 @@ export const Route = createFileRoute("/modules/")({
                     <div className="font-medium text-[17px] text-[var(--text)] truncate">{m.title}</div>
                     <div className="text-[13.5px] text-[var(--text-muted)] mt-1 leading-snug">{m.summary}</div>
                     <div className="flex items-center gap-2 mt-3">
-                      <div className="flex-1 h-1 bg-[var(--surface)] border border-[var(--border)] overflow-hidden">
-                        <div className="h-full bg-[var(--teal)] transition-[width] duration-300" style={{ width: `${pct}%` }} />
+                      <div className="flex-1 h-1 bg-[var(--surface)] border border-[var(--border)] overflow-hidden rounded-full">
+                        <div className="h-full bg-[var(--brand)] transition-[width] duration-300 ease-out" style={{ width: `${pct}%` }} />
                       </div>
                       <span className="font-mono text-[10px] text-[var(--text-faint)] uppercase tracking-widest min-w-[34px] text-right">{pct}%</span>
                     </div>

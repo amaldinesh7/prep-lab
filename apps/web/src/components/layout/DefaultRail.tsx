@@ -162,10 +162,13 @@ function NotesRail() {
   );
 }
 
-function RailBlock({ label, children }: { label: string; children: React.ReactNode }) {
+function RailBlock({ label, accent = "--brand", children }: { label: string; accent?: string; children: React.ReactNode }) {
   return (
     <div className="mb-7">
-      <div className="text-[10px] uppercase tracking-widest text-[var(--text-faint)] mb-2.5 font-semibold font-mono">{label}</div>
+      <div className="flex items-center gap-2 mb-2.5">
+        <span aria-hidden className="w-[6px] h-[6px] rounded-[1px] shrink-0" style={{ backgroundColor: `var(${accent})` }} />
+        <span className="text-[10px] uppercase tracking-widest font-semibold font-mono" style={{ color: `var(${accent})` }}>{label}</span>
+      </div>
       {children}
     </div>
   );

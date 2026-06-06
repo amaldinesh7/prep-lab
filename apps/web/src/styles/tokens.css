@@ -16,8 +16,15 @@
   --violet: #6d28d9;  --violet-soft: #ddd6fe;  --violet-bg: #f5f3ff;
   --indigo: #4338ca;  --indigo-soft: #c7d2fe;  --indigo-bg: #eef2ff;
 
+  --brand: var(--indigo);
+  --brand-soft: var(--indigo-soft);
+  --brand-bg: var(--indigo-bg);
+
   --radius: 2px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
   --ease-out: cubic-bezier(0.2, 0, 0, 1);
+  --ease-soft: cubic-bezier(0.22, 0.61, 0.36, 1);
   --t-fast: 120ms; --t-default: 180ms; --t-slow: 240ms;
 }
 
@@ -38,4 +45,8 @@ html[data-theme="dark"] {
   --emerald: #6ee7b7; --emerald-soft: #064e3b; --emerald-bg: #0a2920;
   --violet: #c4b5fd;  --violet-soft: #4c1d95;  --violet-bg: #1f1730;
   --indigo: #a5b4fc;  --indigo-soft: #3730a3;  --indigo-bg: #1a1a3d;
+
+  --brand: var(--indigo);
+  --brand-soft: var(--indigo-soft);
+  --brand-bg: var(--indigo-bg);
 }

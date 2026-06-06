@@ -19,11 +19,11 @@ export function AppShell({ children }: { children: ReactNode }) {
       >
         <Sidebar />
         <main className="bg-[var(--paper)] xl:border-r xl:border-[var(--border)] min-w-0">
-          <div className="mx-auto w-full max-w-[720px] 2xl:max-w-[760px] 3xl:max-w-[800px] px-12 2xl:px-16 3xl:px-20 pt-12 2xl:pt-16 pb-24">
+          <div className="mx-auto w-full max-w-[720px] 2xl:max-w-[760px] 3xl:max-w-[800px] px-12 2xl:px-16 3xl:px-20 pt-16 2xl:pt-20 pb-28">
             {children}
           </div>
         </main>
-        <aside className="hidden xl:block sticky top-0 h-screen overflow-y-auto bg-[var(--bg)] px-6 2xl:px-7 3xl:px-8 py-7 2xl:py-8">
+        <aside className="hidden xl:block sticky top-0 h-screen overflow-y-auto bg-[var(--bg)] px-6 2xl:px-7 3xl:px-8 py-8">
           {rail ?? <DefaultRail />}
         </aside>
       </div>

@@ -7,6 +7,7 @@ export interface SectionTypeStyle {
   bar: string;
   headingBar: string;
   dot: string;
+  accentVar: string;
 }
 
 export const sectionTypeStyles: Record<SectionKind, SectionTypeStyle> = {
@@ -14,9 +15,10 @@ export const sectionTypeStyles: Record<SectionKind, SectionTypeStyle> = {
     label: "Concept",
     numChip: "bg-[var(--surface)] text-[var(--text)] border-[var(--border)]",
     typeText: "text-[var(--text-faint)]",
-    bar: "bg-[var(--border)]",
+    bar: "bg-[var(--border-strong)]",
     headingBar: "border-[var(--text-muted)]",
     dot: "bg-[var(--text-muted)]",
+    accentVar: "--text-muted",
   },
   why: {
     label: "Why",
@@ -25,6 +27,7 @@ export const sectionTypeStyles: Record<SectionKind, SectionTypeStyle> = {
     bar: "bg-[var(--teal-soft)]",
     headingBar: "border-[var(--teal)]",
     dot: "bg-[var(--teal)]",
+    accentVar: "--teal",
   },
   pattern: {
     label: "Production pattern",
@@ -33,6 +36,7 @@ export const sectionTypeStyles: Record<SectionKind, SectionTypeStyle> = {
     bar: "bg-[var(--teal-soft)]",
     headingBar: "border-[var(--teal)]",
     dot: "bg-[var(--teal)]",
+    accentVar: "--teal",
   },
   tradeoff: {
     label: "Tradeoff",
@@ -41,6 +45,7 @@ export const sectionTypeStyles: Record<SectionKind, SectionTypeStyle> = {
     bar: "bg-[var(--amber-soft)]",
     headingBar: "border-[var(--amber)]",
     dot: "bg-[var(--amber)]",
+    accentVar: "--amber",
   },
   gotcha: {
     label: "Gotcha",
@@ -49,14 +54,16 @@ export const sectionTypeStyles: Record<SectionKind, SectionTypeStyle> = {
     bar: "bg-[var(--rose-soft)]",
     headingBar: "border-[var(--rose)]",
     dot: "bg-[var(--rose)]",
+    accentVar: "--rose",
   },
   reading: {
     label: "Readings",
     numChip: "bg-[var(--surface)] text-[var(--text-muted)] border-[var(--border)]",
     typeText: "text-[var(--text-muted)]",
-    bar: "bg-[var(--border)]",
+    bar: "bg-[var(--border-strong)]",
     headingBar: "border-[var(--text-muted)]",
     dot: "bg-[var(--text-muted)]",
+    accentVar: "--text-muted",
   },
   mini_project: {
     label: "Mini-project",
@@ -65,6 +72,7 @@ export const sectionTypeStyles: Record<SectionKind, SectionTypeStyle> = {
     bar: "bg-[var(--emerald-soft)]",
     headingBar: "border-[var(--emerald)]",
     dot: "bg-[var(--emerald)]",
+    accentVar: "--emerald",
   },
   challenge: {
     label: "Challenge",
@@ -73,6 +81,7 @@ export const sectionTypeStyles: Record<SectionKind, SectionTypeStyle> = {
     bar: "bg-[var(--emerald-soft)]",
     headingBar: "border-[var(--emerald)]",
     dot: "bg-[var(--emerald)]",
+    accentVar: "--emerald",
   },
   quiz: {
     label: "Self-check",
@@ -81,6 +90,7 @@ export const sectionTypeStyles: Record<SectionKind, SectionTypeStyle> = {
     bar: "bg-[var(--indigo-soft)]",
     headingBar: "border-[var(--indigo)]",
     dot: "bg-[var(--indigo)]",
+    accentVar: "--indigo",
   },
   cheatsheet: {
     label: "Cheatsheet",
@@ -89,5 +99,6 @@ export const sectionTypeStyles: Record<SectionKind, SectionTypeStyle> = {
     bar: "bg-[var(--violet-soft)]",
     headingBar: "border-[var(--violet)]",
     dot: "bg-[var(--violet)]",
+    accentVar: "--violet",
   },
 };

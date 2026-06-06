@@ -24,10 +24,10 @@ export const Route = createFileRoute("/")({
               moduleSlug: summary.data.lastVisited.moduleSlug,
               sectionSlug: summary.data.lastVisited.sectionSlug,
             }}
-            className="block border border-[var(--border)] bg-[var(--paper)] p-6 mb-12 transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--surface)]"
+            className="block rounded-[var(--radius-lg)] border border-[var(--brand-soft)] bg-[var(--brand-bg)] p-6 mb-12 transition-colors duration-150 ease-out hover:border-[var(--brand)]"
           >
-            <div className="font-mono text-[11px] text-[var(--text-faint)] uppercase tracking-widest mb-3 flex items-center gap-2">
-              <span className="w-1.5 h-1.5 bg-[var(--teal)] inline-block" />
+            <div className="font-mono text-[11px] text-[var(--brand)] uppercase tracking-widest mb-3 flex items-center gap-2">
+              <span className="w-1.5 h-1.5 bg-[var(--brand)] inline-block rounded-[1px]" />
               Resume →
             </div>
             <div className="text-[22px] font-semibold leading-tight">{summary.data.lastVisited.sectionSlug}</div>
@@ -46,7 +46,7 @@ export const Route = createFileRoute("/")({
                 <Link
                   to="/modules/$moduleSlug"
                   params={{ moduleSlug: m.slug }}
-                  className="grid grid-cols-[minmax(0,1fr)_120px] gap-5 px-5 py-4 border border-[var(--border)] bg-[var(--paper)] items-center transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--surface)]"
+                  className="grid grid-cols-[minmax(0,1fr)_120px] gap-5 px-5 py-4 rounded-[var(--radius-md)] border border-[var(--border)] bg-[var(--paper)] items-center transition-colors duration-150 ease-out hover:bg-[var(--surface)]"
                 >
                   <div className="min-w-0">
                     <div className="font-medium text-[16px] text-[var(--text)]">{m.title}</div>
@@ -56,8 +56,8 @@ export const Route = createFileRoute("/")({
                     <div className="font-mono text-[13px] text-[var(--text)] tabular-nums">
                       {m.completedSections}<span className="text-[var(--text-faint)]"> / {m.totalSections}</span>
                     </div>
-                    <div className="h-1 mt-2 bg-[var(--surface)] border border-[var(--border)] overflow-hidden">
-                      <div className="h-full bg-[var(--teal)] transition-[width] duration-300" style={{ width: `${pct}%` }} />
+                    <div className="h-1 mt-2 bg-[var(--surface)] border border-[var(--border)] overflow-hidden rounded-full">
+                      <div className="h-full bg-[var(--brand)] transition-[width] duration-300 ease-out" style={{ width: `${pct}%` }} />
                     </div>
                   </div>
                 </Link>

@@ -11,13 +11,15 @@ function romanise(n: number): string {
 export function Sidebar() {
   const q = useQuery({ queryKey: ["modules"], queryFn: () => api.modules.list({}) });
   return (
-    <aside className="px-6 2xl:px-7 3xl:px-8 py-7 2xl:py-8 sticky top-0 h-screen overflow-y-auto border-r border-[var(--border)] w-full shrink-0">
-      <div className="flex items-center justify-between pb-5 mb-6 border-b border-[var(--border)]">
+    <aside className="px-6 2xl:px-7 3xl:px-8 py-8 sticky top-0 h-screen overflow-y-auto border-r border-[var(--border)] w-full shrink-0">
+      <div className="flex items-center justify-between pb-5 mb-7 border-b border-[var(--border)]">
         <div className="flex flex-col gap-1">
-          <div className="text-[15px] font-semibold flex items-baseline gap-2">
-            prep-lab <span className="font-mono text-[11px] text-[var(--text-faint)]">v0.1</span>
+          <div className="text-[15px] font-semibold flex items-center gap-2">
+            <span aria-hidden className="w-[7px] h-[7px] bg-[var(--brand)] rounded-[1px] inline-block" />
+            <span className="leading-none">prep-lab</span>
+            <span className="font-mono text-[11px] text-[var(--text-faint)] leading-none">v0.1</span>
           </div>
-          <div className="text-[11px] font-mono text-[var(--text-faint)] uppercase tracking-wider">Frontend curriculum</div>
+          <div className="text-[11px] font-mono text-[var(--text-faint)] uppercase tracking-wider pl-[15px]">Frontend curriculum</div>
         </div>
         <ThemeToggle />
       </div>
@@ -33,7 +35,7 @@ export function Sidebar() {
           const pct = m.totalSections === 0 ? 0 : Math.round((m.completedSections / m.totalSections) * 100);
           return (
             <NavLink key={m.id} to="/modules/$moduleSlug" params={{ moduleSlug: m.slug }}>
-              <span className="font-mono text-[11px] text-[var(--text-faint)] mr-2.5 inline-block min-w-[22px] shrink-0">{romanise(i + 1)}.</span>
+              <span className="font-mono text-[11px] text-[var(--text-faint)] group-data-[status=active]:text-[var(--brand)] mr-2.5 inline-block min-w-[22px] shrink-0 transition-colors duration-150 ease-out">{romanise(i + 1)}.</span>
               <span className="truncate">{m.title}</span>
               {m.completedSections > 0 && (
                 <span className="ml-auto pl-2 font-mono text-[10px] text-[var(--text-faint)] tabular-nums shrink-0">{pct}%</span>
@@ -48,9 +50,9 @@ export function Sidebar() {
 
 function NavSection({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="mb-7">
-      <div className="text-[10px] uppercase tracking-[0.14em] text-[var(--text-faint)] font-mono font-semibold mb-3">{label}</div>
-      <div className="flex flex-col">{children}</div>
+    <div className="mb-8">
+      <div className="text-[10px] uppercase tracking-[0.14em] text-[var(--brand)] font-mono font-semibold mb-3 pl-3">{label}</div>
+      <div className="flex flex-col -mx-1">{children}</div>
     </div>
   );
 }
@@ -60,8 +62,14 @@ function NavLink({ to, params, children }: { to: string; params?: Record<string,
     <Link
       to={to as never}
       params={params as never}
-      className="flex items-baseline py-1 text-[14px] text-[var(--text-muted)] hover:text-[var(--text)] min-w-0"
-      activeProps={{ className: "text-[var(--text)] font-medium" }}
+      className="
+        group relative flex items-baseline pl-3 pr-2 py-1.5 mx-1 rounded-[var(--radius-md)]
+        text-[14px] text-[var(--text-muted)] min-w-0
+        transition-colors duration-150 ease-out
+        hover:text-[var(--text)] hover:bg-[var(--surface)]
+        before:absolute before:left-0 before:top-[6px] before:bottom-[6px] before:w-[2px] before:bg-transparent before:rounded-full before:transition-colors before:duration-150 before:ease-out
+        data-[status=active]:text-[var(--text)] data-[status=active]:font-medium data-[status=active]:before:bg-[var(--brand)]
+      "
     >
       {children}
     </Link>
